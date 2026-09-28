@@ -212,6 +212,20 @@ func (r *Router) touch(key, uid string, now time.Time) {
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
 }
 
+// GetBind 检查会话是否已存在有效绑定（未过期）。存在返回 (uid, true)，不存在返回 ("", false)。
+// 与 Resolve/ResolveForModel 不同，GetBind 在未命中时不执行哈希回退分配。
+func (r *Router) GetBind(key string) (string, bool) {
+	now := time.Now()
+	r.mu.RLock()
+	e, found := r.entries[key]
+	r.mu.RUnlock()
+	if !found || expired(e, now, r.cfg.TTL) {
+		return "", false
+	}
+	r.touch(key, e.uid, now)
+	return e.uid, true
+}
+
 // Bind 显式把会话 key 绑定到 uid（幂等覆盖旧值），并异步镜像到 redisstore。
 // 供"粘性跟随最终成功号"用：请求成功返回前，把会话重绑到实际成功的账号，让多轮对话下一跳稳定
 // 收敛到"对该会话持续成功的号"（对齐 antigravity 语义）。空 key 直接返回（无会话则不绑）。

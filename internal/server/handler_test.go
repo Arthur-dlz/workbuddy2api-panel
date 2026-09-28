@@ -539,6 +539,124 @@ func TestChatStickyFullFallsBackToRotation(t *testing.T) {
 	p.Release("bad")
 }
 
+// TestSessionAdmissionAndSticky [AC-4] 会话准入绑定与 Prompt Cache 保护测试
+// 验证：
+// 1) 带有 conversation_id 的新会话请求通过 PickAdmission 准入路由到最早到期的账号；
+// 2) 会话建立绑定；
+// 3) 随后的连续对话坚决复用原账号（100% Prompt Cache 保护），且流式请求期间在途预占生效并在结束后释放。
+func TestSessionAdmissionAndSticky(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:   time.Minute,
+		Store: st,
+		Available: func() []string {
+			return []string{"acct-expiring", "acct-later", "acct-newer"}
+		},
+	})
+	p := pool.New("")
+	p.SetPreferExpiring(true)
+	acctExpiring := &auth.Auth{UID: "acct-expiring", AccessToken: "at-expiring", ExpiresAt: 9999999999}
+	acctLater := &auth.Auth{UID: "acct-later", AccessToken: "at-later", ExpiresAt: 9999999999}
+	p.Add(acctExpiring)
+	p.Add(acctLater)
+
+	now := time.Now()
+	// acct-expiring: 到期剩余 20 积分，2 小时后到期
+	p.SetCreditsDetailed("acct-expiring", 20, 20, 20, now.Add(2*time.Hour), 20)
+	// acct-later: 到期剩余 100 积分，48 小时后到期
+	p.SetCreditsDetailed("acct-later", 100, 100, 100, now.Add(48*time.Hour), 100)
+
+	var mu sync.Mutex
+	var routedAccounts []string
+	var inFlightRemExpiring int64
+
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		if authz == "Bearer at-expiring" {
+			routedAccounts = append(routedAccounts, "acct-expiring")
+			inFlightRemExpiring = p.ApparentEarliestRemaining("acct-expiring")
+		} else if authz == "Bearer at-later" {
+			routedAccounts = append(routedAccounts, "acct-later")
+		} else if authz == "Bearer at-newer" {
+			routedAccounts = append(routedAccounts, "acct-newer")
+		}
+		return 200, sseOK, true
+	})
+
+	h := NewHandler(Config{
+		Pool:         p,
+		Upstream:     up,
+		Session:      sess,
+		SoftCooldown: time.Minute,
+	})
+
+	convID := "conv-test-ac4"
+	reqBody := `{"model":"glm-5.2","messages":[{"role":"user","content":"hello"}],"metadata":{"conversation_id":"` + convID + `"}}`
+
+	// ── 第 1 次请求：新会话通过 PickAdmission 选中最早到期账号 acct-expiring 并绑定 ──
+	req1 := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(reqBody))
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, req1)
+	if rec1.Code != http.StatusOK {
+		t.Fatalf("request 1 code=%d body=%s", rec1.Code, rec1.Body)
+	}
+
+	mu.Lock()
+	if len(routedAccounts) != 1 || routedAccounts[0] != "acct-expiring" {
+		mu.Unlock()
+		t.Fatalf("request 1 should route to acct-expiring, got %v", routedAccounts)
+	}
+	// 在途预占 5.0 积分：在流式执行期间视在额度应由 20 变为 15
+	if inFlightRemExpiring != 15 {
+		mu.Unlock()
+		t.Fatalf("in-flight reservation for acct-expiring want 15, got %d", inFlightRemExpiring)
+	}
+	mu.Unlock()
+
+	// 检查会话已绑定到 acct-expiring
+	if uid, ok := st.lastUID(convID); !ok || uid != "acct-expiring" {
+		t.Fatalf("session binding after request 1 want acct-expiring, got %s (ok=%v)", uid, ok)
+	}
+
+	// 请求结束后，在途额度应在 defer 中释放回 20
+	if rem := p.ApparentEarliestRemaining("acct-expiring"); rem != 20 {
+		t.Fatalf("apparent remaining after request 1 should be restored to 20, got %d", rem)
+	}
+
+	// 此时即便添加一个更新、到期更早的账号，已有会话也绝不漂移
+	acctNewer := &auth.Auth{UID: "acct-newer", AccessToken: "at-newer", ExpiresAt: 9999999999}
+	p.Add(acctNewer)
+	p.SetCreditsDetailed("acct-newer", 50, 50, 50, now.Add(1*time.Hour), 50)
+
+	// ── 第 2 次请求：同一 conversation_id，坚决复用原账号 acct-expiring ──
+	req2 := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(reqBody))
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("request 2 code=%d body=%s", rec2.Code, rec2.Body)
+	}
+
+	// ── 第 3 次请求：同一 conversation_id，依然坚决复用原账号 acct-expiring ──
+	req3 := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(reqBody))
+	rec3 := httptest.NewRecorder()
+	h.ServeHTTP(rec3, req3)
+	if rec3.Code != http.StatusOK {
+		t.Fatalf("request 3 code=%d body=%s", rec3.Code, rec3.Body)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(routedAccounts) != 3 {
+		t.Fatalf("total requests want 3, got %d", len(routedAccounts))
+	}
+	for i, acct := range routedAccounts {
+		if acct != "acct-expiring" {
+			t.Errorf("request %d routed to %s, want acct-expiring", i+1, acct)
+		}
+	}
+}
+
 func TestChatHardCreditCooldownUntilNextDay4AM(t *testing.T) {
 	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
 		if authz == "Bearer at-bad" {

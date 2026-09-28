@@ -237,6 +237,55 @@ func (p *Pool) NoteModelCost(uid, model string, credit float64, tokens int) {
 	p.dirty.Store(true) // 账本已持久化：写入口统一置脏
 }
 
+// ReserveCredits 在途乐观预占额度（多轮会话/流式请求准入时调用）。
+// 线程安全，累加 reservedCredits。
+func (p *Pool) ReserveCredits(uid string, amount float64) {
+	if uid == "" || amount <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.reservedCredits += amount
+	}
+}
+
+// ReleaseCredits 释放预占额度（流式传输结束或异常退出时调用）。
+// 线程安全，扣减 reservedCredits，下限钳 0。
+func (p *Pool) ReleaseCredits(uid string, amount float64) {
+	if uid == "" || amount <= 0 {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		e.reservedCredits -= amount
+		if e.reservedCredits < 0 {
+			e.reservedCredits = 0
+		}
+	}
+}
+
+// ApparentEarliestRemaining 返回指定账号当前的视在最早到期剩余积分。
+func (p *Pool) ApparentEarliestRemaining(uid string) int64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.ApparentEarliestRemaining()
+	}
+	return 0
+}
+
+// ReservedCredits 返回指定账号当前在途预占额度（供测试与观测）。
+func (p *Pool) ReservedCredits(uid string) float64 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	if e, ok := p.byUID[uid]; ok {
+		return e.reservedCredits
+	}
+	return 0
+}
+
 // RecordTokenUsage 记录一次实际发起的聊天账号尝试及上游返回的 usage 增量。
 // usage 字段缺失时仍累计请求次数，但只累计明确存在的 token 字段。
 func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {

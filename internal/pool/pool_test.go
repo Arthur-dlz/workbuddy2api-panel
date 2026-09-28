@@ -1823,3 +1823,109 @@ func TestCreditExpirySnapshotConsumptionAndClear(t *testing.T) {
 		t.Fatalf("zero refresh did not clear snapshot=%+v", st)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Package 1: ASK-DLZ 到期优先调度核心测试 (AC-1, AC-2, AC-3)
+// ---------------------------------------------------------------------------
+
+// TestAnchorClustering [AC-1] 基准锚点聚类与传递性测试
+// 场景：三个账号 A (到期 0h, 剩余 10)、B (到期 8h, 剩余 50)、C (到期 16h, 剩余 100)。
+// 期望：A 与 B 均在 Bucket 0 (<12h)，B 额度大于 A，因此 B 先于 A；C 在 Bucket 1，排在最后。整体次序为：B -> A -> C。
+func TestAnchorClustering(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "a"})
+	p.Add(&auth.Auth{UID: "b"})
+	p.Add(&auth.Auth{UID: "c"})
+
+	now := time.Now()
+	tMin := now.Add(time.Hour)
+	p.SetCreditsDetailed("a", 10, 10, 10, tMin, 10)
+	p.SetCreditsDetailed("b", 50, 50, 50, tMin.Add(8*time.Hour), 50)
+	p.SetCreditsDetailed("c", 100, 100, 100, tMin.Add(16*time.Hour), 100)
+
+	tried := make(map[string]bool)
+	pick1 := p.PickAdmissionExcluding(tried, "", "", 0)
+	if pick1 == nil || pick1.UID != "b" {
+		t.Fatalf("pick 1 want b, got %+v", pick1)
+	}
+	tried[pick1.UID] = true
+
+	pick2 := p.PickAdmissionExcluding(tried, "", "", 0)
+	if pick2 == nil || pick2.UID != "a" {
+		t.Fatalf("pick 2 want a, got %+v", pick2)
+	}
+	tried[pick2.UID] = true
+
+	pick3 := p.PickAdmissionExcluding(tried, "", "", 0)
+	if pick3 == nil || pick3.UID != "c" {
+		t.Fatalf("pick 3 want c, got %+v", pick3)
+	}
+}
+
+// TestDustFiltering [AC-2] 碎屑额度过滤测试 (Dust Floor)
+// 场景：账号 A 剩余 0.8 到期积分，账号 B 剩余 20 到期积分。多轮会话准入 (minCredits=5)。
+// 期望：账号 A 被判定为碎屑，不被新会话选中；新会话分配给账号 B。
+func TestDustFiltering(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "a"})
+	p.Add(&auth.Auth{UID: "b"})
+
+	now := time.Now()
+	// A 剩余 1 到期积分 (早于 B 到期: 1h vs 14h), B 剩余 20 到期积分
+	p.SetCreditsDetailed("a", 1, 1, 1, now.Add(time.Hour), 1)
+	p.SetCreditsDetailed("b", 20, 20, 20, now.Add(14*time.Hour), 20)
+
+	// 若无门槛限制 (minCredits=0)，A 处在更早的 Bucket 0 会优先选中 A
+	gotNoLimit := p.PickAdmission("", "", 0)
+	if gotNoLimit == nil || gotNoLimit.UID != "a" {
+		t.Fatalf("without dust filter, want a, got %+v", gotNoLimit)
+	}
+
+	// 准入门槛 minCredits=5：A (剩余 1 < 5) 被判定为碎屑过滤，分配给 B (剩余 20 >= 5)
+	got := p.PickAdmission("", "", 5)
+	if got == nil || got.UID != "b" {
+		t.Fatalf("with minCredits=5, want b, got %+v", got)
+	}
+}
+
+// TestInFlightReservation [AC-3] 在途预占与平滑注水测试 (In-flight Reservation)
+// 场景：账号 A 初始剩余 10 到期积分，账号 B 剩余 8 到期积分。
+// 期望：会话 1 到来分配给 A，预占 5 积分，A 视在剩余变为 5；紧接着会话 2 到来（会话 1 流式尚未结束），因 B 视在剩余 8 > A 视在剩余 5，会话 2 自动分配给 B。
+func TestInFlightReservation(t *testing.T) {
+	withNoPickGap(t)
+	p := New("")
+	p.Add(&auth.Auth{UID: "a"})
+	p.Add(&auth.Auth{UID: "b"})
+
+	now := time.Now()
+	expiry := now.Add(2 * time.Hour)
+	p.SetCreditsDetailed("a", 10, 10, 10, expiry, 10)
+	p.SetCreditsDetailed("b", 8, 8, 8, expiry, 8)
+
+	// 会话 1 到来：A 剩余 10 > B 剩余 8，分配给 A
+	p1 := p.PickAdmission("", "", 5)
+	if p1 == nil || p1.UID != "a" {
+		t.Fatalf("session 1 want a, got %+v", p1)
+	}
+
+	// 预占 5 积分，A 视在剩余变为 5
+	p.ReserveCredits("a", 5.0)
+	if remA := p.ApparentEarliestRemaining("a"); remA != 5 {
+		t.Fatalf("apparent remaining for a want 5, got %d", remA)
+	}
+
+	// 会话 2 到来 (会话 1 流式尚未结束)：
+	// B 视在剩余 8 > A 视在剩余 5，会话 2 自动分配给 B
+	p2 := p.PickAdmission("", "", 5)
+	if p2 == nil || p2.UID != "b" {
+		t.Fatalf("session 2 want b, got %+v", p2)
+	}
+
+	// 会话 1 流式完成释放预占，A 视在剩余恢复
+	p.ReleaseCredits("a", 5.0)
+	if remA := p.ApparentEarliestRemaining("a"); remA != 10 {
+		t.Fatalf("apparent remaining after release want 10, got %d", remA)
+	}
+}

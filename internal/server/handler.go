@@ -941,10 +941,21 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	sessKey := session.ExtractKey(body)
 	stickyUID := ""
 	if h.cfg.Session != nil && sessKey != "" {
-		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
-		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, bareModel); ok {
+		if uid, ok := h.cfg.Session.GetBind(sessKey); ok {
 			stickyUID = uid
+		} else if h.cfg.Pool != nil {
+			acct := h.cfg.Pool.PickAdmission(bareModel, realm, 5)
+			if acct == nil {
+				acct = h.cfg.Pool.PickForModel(bareModel)
+			}
+			if acct != nil {
+				h.cfg.Session.Bind(sessKey, acct.UID)
+				stickyUID = acct.UID
+			}
+		} else {
+			if uid, ok := h.cfg.Session.ResolveForModel(sessKey, bareModel); ok {
+				stickyUID = uid
+			}
 		}
 	}
 
@@ -960,17 +971,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 同理）。11133「模型不支持图片」指向的前提。
 	reqHasImage := hasImagePart(body)
 
-	// 在途租约：成功选中即占名额；函数出口（含成功 return 与 panic）统一释放。
+	// 在途租约与额度预占：成功选中即占名额与在途额度；函数出口（含成功 return 与 panic）统一释放。
 	var heldUID string
+	var reservedUID string
 	defer func() {
-		if heldUID != "" {
+		if heldUID != "" && h.cfg.Pool != nil {
 			h.cfg.Pool.Release(heldUID)
+		}
+		if reservedUID != "" && h.cfg.Pool != nil {
+			h.cfg.Pool.ReleaseCredits(reservedUID, 5.0)
 		}
 	}()
 	releaseHeld := func() {
-		if heldUID != "" {
+		if heldUID != "" && h.cfg.Pool != nil {
 			h.cfg.Pool.Release(heldUID)
 			heldUID = ""
+		}
+		if reservedUID != "" && h.cfg.Pool != nil {
+			h.cfg.Pool.ReleaseCredits(reservedUID, 5.0)
+			reservedUID = ""
 		}
 	}
 	// unbindSticky 解绑当前会话粘性号（stickyUID 非空时）。供「粘性号不可用/被抢」与 fail 共用。
@@ -1154,6 +1173,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue // 最后一个名额被并发抢走 → 换号
 		}
 		heldUID = acct.UID
+		if h.cfg.Pool != nil {
+			h.cfg.Pool.ReserveCredits(acct.UID, 5.0)
+			reservedUID = acct.UID
+		}
 
 		// token 临近过期 → 先 refresh（失败冷却换号）
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {

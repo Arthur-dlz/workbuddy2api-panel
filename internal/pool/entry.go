@@ -230,6 +230,20 @@ type entry struct {
 	modelCost map[string]modelCostEntry
 	// inFlight 单账号在途请求数（运行态，不持久化）。用 atomic 避免 Pick 热路径拿写锁。
 	inFlight atomic.Int64
+	// reservedCredits 在途乐观预占额度（运行态，不持久化）。由准入选号预占，流式结束释放。
+	reservedCredits float64
+}
+
+// ApparentEarliestRemaining 返回账号当前的视在最早到期剩余积分（扣除在途预占并四舍五入后钳 0）。
+func (e *entry) ApparentEarliestRemaining() int64 {
+	if e == nil {
+		return 0
+	}
+	rem := e.creditsEarliestRemaining - int64(e.reservedCredits+0.5)
+	if rem < 0 {
+		return 0
+	}
+	return rem
 }
 
 // modelCostOf 返回该账号在指定 model 上的有效成本观测；无观测或观测过期返回 ok=false。

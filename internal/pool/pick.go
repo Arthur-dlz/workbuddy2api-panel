@@ -14,34 +14,52 @@ import (
 // Pick 单一选号入口（无请求级轮换、无 realm 过滤，模型感知缺省账号级）。
 // 需要请求级轮换（tried）或分池（realm）时用 PickExcludingForRealm。
 func (p *Pool) Pick() *auth.Auth {
-	return p.pick(nil, "", "")
+	return p.pick(nil, "", "", 0)
 }
 
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
 // 挑选策略：healthy 账号中按权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	return p.pick(tried, "", "")
+	return p.pick(tried, "", "", 0)
 }
 
 // PickExcludingForModel 模型感知选号：等同 PickExcluding，但对「6004 模型级冷却中的
 // 账号」进行模型豁免——请求模型与其 trigger 模型不同时视为可用（issue #31）。
 // reqModel 为空时即普通 PickExcluding（不影响既有调用语义）。
 func (p *Pool) PickExcludingForModel(tried map[string]bool, reqModel string) *auth.Auth {
-	return p.pick(tried, reqModel, "")
+	return p.pick(tried, reqModel, "", 0)
+}
+
+// PickForModel 模型感知选号便捷入口（无排除列表、无 realm 过滤）。
+func (p *Pool) PickForModel(reqModel string) *auth.Auth {
+	return p.pick(nil, reqModel, "", 0)
 }
 
 // PickExcludingForRealm 模型感知 + 分池选号：候选集先按 Realm()==realm 过滤
 // （realm 空 = 不过滤，退化为 PickExcludingForModel），再按模型健康口径判定。
 // 供 handler 在 global/cn 双域下分流（global 模型请求只路由 global 账号）。
 func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm string) *auth.Auth {
-	return p.pick(tried, reqModel, realm)
+	return p.pick(tried, reqModel, realm, 0)
+}
+
+// PickAdmission 会话准入选号：带最低积分门槛的选号入口。
+// 优先选择最早到期且视在可用积分 >= minCredits 的账号；
+// 若无符合门槛的到期优先账号，回退到普通选号逻辑。
+func (p *Pool) PickAdmission(reqModel, realm string, minCredits int64) *auth.Auth {
+	return p.pick(nil, reqModel, realm, minCredits)
+}
+
+// PickAdmissionExcluding 会话准入选号（带已尝试 uid 排除）：请求级重试时使用。
+func (p *Pool) PickAdmissionExcluding(tried map[string]bool, reqModel, realm string, minCredits int64) *auth.Auth {
+	return p.pick(tried, reqModel, realm, minCredits)
 }
 
 // pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
-func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+// minCredits > 0 时对到期优先候选执行碎屑过滤（剔除视在积分不足门槛的账号）。
+func (p *Pool) pick(tried map[string]bool, reqModel, realm string, minCredits int64) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -190,35 +208,77 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 		cands = cands[:5]
 	}
 	var e *entry
-	// 最早到期优先（WorkDaddy 口径）：只在成本层内、配置窗口内存在有效批次的账号中
-	// 排序；同到期时间按该批次剩余积分降序。防并发撞号仍优先过滤 minPickGap 内的账号，
-	// 优先级候选全部刚被用时才从中选最早者，避免把请求硬撞到同一账号。
+	// 最早到期优先（WorkDaddy 口径）：基准锚点聚类与分桶排序（12h 分桶 + 视在剩余额度优先）。
+	// 准入会话指定 minCredits > 0 时过滤碎屑号（apparentRemaining < minCredits）。
 	if p.preferExpiring {
-		priority := make([]*entry, 0, len(candsAll))
+		var qualifying []*entry
 		for _, c := range candsAll {
 			if c.creditsExpiring <= 0 || c.creditsEarliestRemaining <= 0 ||
 				c.creditsEarliestExpiry.IsZero() || !c.creditsEarliestExpiry.After(now) {
 				continue
 			}
-			priority = append(priority, c)
+			apparent := c.ApparentEarliestRemaining()
+			if apparent <= 0 {
+				continue
+			}
+			if minCredits > 0 && apparent < minCredits {
+				continue
+			}
+			qualifying = append(qualifying, c)
 		}
-		sort.SliceStable(priority, func(i, j int) bool {
-			if !priority[i].creditsEarliestExpiry.Equal(priority[j].creditsEarliestExpiry) {
-				return priority[i].creditsEarliestExpiry.Before(priority[j].creditsEarliestExpiry)
+		if len(qualifying) > 0 {
+			tMin := qualifying[0].creditsEarliestExpiry
+			for _, c := range qualifying[1:] {
+				if c.creditsEarliestExpiry.Before(tMin) {
+					tMin = c.creditsEarliestExpiry
+				}
 			}
-			if priority[i].creditsEarliestRemaining != priority[j].creditsEarliestRemaining {
-				return priority[i].creditsEarliestRemaining > priority[j].creditsEarliestRemaining
+
+			type priorityItem struct {
+				entry             *entry
+				bucket            int64
+				apparentRemaining int64
 			}
-			return priority[i].a.UID < priority[j].a.UID
-		})
-		for _, c := range priority {
-			if now.Sub(c.lastUsed) >= minPickGap {
-				e = c
-				break
+			items := make([]priorityItem, len(qualifying))
+			const bucketSize = 12 * time.Hour
+			for i, c := range qualifying {
+				diff := c.creditsEarliestExpiry.Sub(tMin)
+				var b int64
+				if diff > 0 {
+					b = int64(diff / bucketSize)
+				}
+				items[i] = priorityItem{
+					entry:             c,
+					bucket:            b,
+					apparentRemaining: c.ApparentEarliestRemaining(),
+				}
 			}
-		}
-		if e == nil && len(priority) > 0 {
-			e = priority[0]
+
+			sort.SliceStable(items, func(i, j int) bool {
+				if items[i].bucket != items[j].bucket {
+					return items[i].bucket < items[j].bucket
+				}
+				if items[i].apparentRemaining != items[j].apparentRemaining {
+					return items[i].apparentRemaining > items[j].apparentRemaining
+				}
+				if items[i].entry.creditsExpiring != items[j].entry.creditsExpiring {
+					return items[i].entry.creditsExpiring > items[j].entry.creditsExpiring
+				}
+				if !items[i].entry.creditsEarliestExpiry.Equal(items[j].entry.creditsEarliestExpiry) {
+					return items[i].entry.creditsEarliestExpiry.Before(items[j].entry.creditsEarliestExpiry)
+				}
+				return items[i].entry.a.UID < items[j].entry.a.UID
+			})
+
+			for _, it := range items {
+				if now.Sub(it.entry.lastUsed) >= minPickGap {
+					e = it.entry
+					break
+				}
+			}
+			if e == nil {
+				e = items[0].entry
+			}
 		}
 	}
 	if e == nil {

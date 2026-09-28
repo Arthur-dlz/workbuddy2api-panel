@@ -349,3 +349,31 @@ func TestExtractKeyMultimodalContent(t *testing.T) {
 		t.Error("pure-image url changes must keep same derived key")
 	}
 }
+
+func TestGetBind(t *testing.T) {
+	st := newCountingStore()
+	r := routerWith(st, []string{"a1", "a2"}, time.Minute)
+
+	// 未绑定时，GetBind 应返回 false，且不触发哈希分配
+	if uid, ok := r.GetBind("c1"); ok || uid != "" {
+		t.Fatalf("unbound key should return false, got (%s, %v)", uid, ok)
+	}
+	if r.Count() != 0 {
+		t.Fatalf("count should be 0, got %d", r.Count())
+	}
+
+	// 手动绑定后，GetBind 应返回绑定的 uid
+	r.Bind("c1", "a1")
+	if uid, ok := r.GetBind("c1"); !ok || uid != "a1" {
+		t.Fatalf("bound key want a1, got (%s, %v)", uid, ok)
+	}
+
+	// 过期后，GetBind 应返回 false
+	rExpired := routerWith(newCountingStore(), []string{"a1"}, 10*time.Millisecond)
+	rExpired.Bind("c2", "a1")
+	time.Sleep(20 * time.Millisecond)
+	if uid, ok := rExpired.GetBind("c2"); ok || uid != "" {
+		t.Fatalf("expired key should return false, got (%s, %v)", uid, ok)
+	}
+}
+
