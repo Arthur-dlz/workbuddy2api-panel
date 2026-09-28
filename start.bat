@@ -12,14 +12,14 @@ if "%ERRORLEVEL%"=="0" (
     exit /b 0
 )
 
-echo 正在后台静默启动 WorkBuddy Gateway (托盘模式)...
-if exist "workbuddy-gateway-tray.exe" (
+echo 正在后台启动 WorkBuddy Gateway (托盘模式)...
+if exist "%~dp0workbuddy-gateway-tray.exe" (
     start "" "%~dp0workbuddy-gateway-tray.exe"
 ) else (
     start "" "%~dp0workbuddy-gateway.exe"
 )
 
-ping 127.0.0.1 -n 2 >nul
+ping 127.0.0.1 -n 3 >nul
 echo 正在打开控制面板...
 start http://127.0.0.1:9527/panel/
 exit /b 0
