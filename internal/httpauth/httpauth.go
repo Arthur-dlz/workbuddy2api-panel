@@ -41,3 +41,16 @@ func digest(s string) []byte {
 	sum := sha256.Sum256([]byte(s))
 	return sum[:]
 }
+
+// ExtractToken 从 Authorization 头中提取 Bearer 令牌（去前缀），若不存在返回空串。
+func ExtractToken(r *http.Request) string {
+	authz := r.Header.Get("Authorization")
+	if strings.HasPrefix(authz, bearerPrefix) {
+		return strings.TrimSpace(authz[len(bearerPrefix):])
+	}
+	if strings.HasPrefix(strings.ToLower(authz), "bearer ") {
+		return strings.TrimSpace(authz[7:])
+	}
+	return ""
+}
+

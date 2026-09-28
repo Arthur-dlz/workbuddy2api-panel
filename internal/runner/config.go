@@ -1,5 +1,5 @@
 // config.go 加载 JSON 配置 + 环境变量覆盖。
-package main
+package runner
 
 import (
 	"crypto/rand"
@@ -8,19 +8,25 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/prompt"
 )
 
 // Config 顶层配置。
 type Config struct {
-	Listen    string `json:"listen"`     // ":7863"
-	APIKey    string `json:"api_key"`    // 空 = 不鉴权
-	AuthDir   string `json:"auth_dir"`   // ./auths
-	StateFile string `json:"state_file"` // ./data/state.json
+	Listen    string            `json:"listen"`     // ":9527"
+	Port      int               `json:"port"`       // 9527 (方便用户直填端口号)
+	APIKey    string            `json:"api_key"`    // 空 = 不鉴权
+	AuthDir     string                `json:"auth_dir"`               // ./auths
+	StateFile   string                `json:"state_file"`             // ./data/state.json
+	Models      map[string]string     `json:"models"`                 // 模型别名字典 (如 deepseek-chat -> tencent-code-v3)
+	ModelRoutes []livecfg.ModelRoute  `json:"model_routes,omitempty"` // 中转站级模型路由规则
+	Tokens      []livecfg.TokenConfig `json:"tokens,omitempty"`       // 多 API 令牌配置
 
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。
@@ -182,9 +188,14 @@ type Config struct {
 func Default() *Config {
 	c := &Config{
 		Listen:    ":7863",
+		Port:      7863,
 		APIKey:    "",
 		AuthDir:   "./auths",
 		StateFile: "./data/state.json",
+		Models: map[string]string{
+			"deepseek-chat":     "deepseek-v4-pro",
+			"deepseek-reasoner": "deepseek-v4-pro",
+		},
 	}
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
@@ -291,6 +302,8 @@ func WriteDefault(path string) (string, error) {
 	}
 	key := "sk-" + base64.RawURLEncoding.EncodeToString(raw)
 	c := Default()
+	c.Port = 9527
+	c.Listen = ":9527"
 	c.APIKey = key
 	_ = c.normalize() // Default() 全合法，normalize 仅补齐 header/idle 超时的展示值
 	out, err := json.MarshalIndent(c, "", "  ")
@@ -317,6 +330,12 @@ func WriteDefault(path string) (string, error) {
 func applyEnv(c *Config) {
 	if v := os.Getenv("WB2A_LISTEN"); v != "" {
 		c.Listen = v
+	}
+	if v := os.Getenv("WB2A_PORT"); v != "" {
+		if p, err := strconv.Atoi(v); err == nil {
+			c.Port = p
+			c.Listen = fmt.Sprintf(":%d", p)
+		}
 	}
 	if v := os.Getenv("WB2A_API_KEY"); v != "" {
 		c.APIKey = v
@@ -481,8 +500,57 @@ func (c *Config) normalize() error {
 	if c.Upstream.IdleTimeoutSeconds <= 0 {
 		c.Upstream.IdleTimeoutSeconds = 300
 	}
+	if c.Port > 0 {
+		if c.Listen == "" || c.Listen == ":7863" {
+			c.Listen = fmt.Sprintf(":%d", c.Port)
+		}
+	} else if c.Listen != "" {
+		if idx := strings.LastIndex(c.Listen, ":"); idx >= 0 {
+			if p, err := strconv.Atoi(c.Listen[idx+1:]); err == nil {
+				c.Port = p
+			}
+		}
+	}
 	if !strings.HasPrefix(c.Listen, ":") && !strings.Contains(c.Listen, ":") {
 		c.Listen = ":" + c.Listen
+	}
+	if c.Models == nil {
+		c.Models = map[string]string{
+			"deepseek-chat":     "deepseek-v4-pro",
+			"deepseek-reasoner": "deepseek-v4-pro",
+		}
+	}
+	if c.ModelRoutes == nil {
+		c.ModelRoutes = make([]livecfg.ModelRoute, 0, len(c.Models))
+		var keys []string
+		for alias := range c.Models {
+			keys = append(keys, alias)
+		}
+		sort.Strings(keys)
+		for _, alias := range keys {
+			target := c.Models[alias]
+			isReasoner := strings.Contains(strings.ToLower(alias), "reasoner") ||
+				strings.Contains(strings.ToLower(alias), "-r1")
+			c.ModelRoutes = append(c.ModelRoutes, livecfg.ModelRoute{
+				ID:        alias,
+				Target:    target,
+				Enabled:   true,
+				Reasoning: isReasoner,
+				Effort:    "medium",
+			})
+		}
+	} else {
+		c.Models = make(map[string]string)
+		for _, r := range c.ModelRoutes {
+			if r.Enabled && r.Target != "" {
+				c.Models[r.ID] = r.Target
+			}
+		}
+	}
+	if c.APIKey != "" && len(c.Tokens) == 0 {
+		c.Tokens = []livecfg.TokenConfig{
+			{Key: c.APIKey, Name: "默认主密钥", Enabled: true, Models: []string{"*"}},
+		}
 	}
 	// 空数组与 null 反序列化后覆盖掉 Default() 的排程值（键缺席才保留），在此补齐。
 	// 空 = 未配置 → 回落默认；「禁用」一律走 *_enabled=false，两者互不混淆。

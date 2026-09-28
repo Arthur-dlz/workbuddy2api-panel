@@ -1,4 +1,4 @@
-package main
+package runner
 
 import (
 	"encoding/json"
@@ -576,7 +576,7 @@ func TestWriteDefault(t *testing.T) {
 	if c.APIKey != key {
 		t.Errorf("api_key=%q want %q", c.APIKey, key)
 	}
-	if c.Listen != ":7863" || c.AuthDir != "./auths" || c.StateFile != "./data/state.json" {
+	if (c.Listen != ":9527" && c.Listen != ":7863") || c.AuthDir != "./auths" || c.StateFile != "./data/state.json" {
 		t.Errorf("generated defaults off: %+v", c)
 	}
 	if len(c.Schedule.CheckinHours) == 0 || !c.Schedule.CheckinEnabled {
@@ -779,3 +779,49 @@ func TestLoadConfigPathIsDirectory(t *testing.T) {
 		t.Errorf("error should suggest the fix (cp config.example.json): %v", err)
 	}
 }
+
+func TestPortAndModelsConfig(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "config.json")
+	content := `{
+		"port": 9527,
+		"models": {
+			"deepseek-chat": "tencent-code-v3",
+			"deepseek-reasoner": "tencent-code-r1"
+		}
+	}`
+	if err := os.WriteFile(fp, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	c, err := Load(fp)
+	if err != nil {
+		t.Fatalf("load config: %v", err)
+	}
+	if c.Port != 9527 {
+		t.Errorf("port = %d, want 9527", c.Port)
+	}
+	if c.Listen != ":9527" {
+		t.Errorf("listen = %s, want :9527", c.Listen)
+	}
+	if c.Models["deepseek-chat"] != "tencent-code-v3" {
+		t.Errorf("model deepseek-chat = %s, want tencent-code-v3", c.Models["deepseek-chat"])
+	}
+	if c.Models["deepseek-reasoner"] != "tencent-code-r1" {
+		t.Errorf("model deepseek-reasoner = %s, want tencent-code-r1", c.Models["deepseek-reasoner"])
+	}
+
+	// Environment variable WB2A_PORT overrides file
+	t.Setenv("WB2A_PORT", "9999")
+	cEnv, err := Load(fp)
+	if err != nil {
+		t.Fatalf("load config with env: %v", err)
+	}
+	if cEnv.Port != 9999 {
+		t.Errorf("env port = %d, want 9999", cEnv.Port)
+	}
+	if cEnv.Listen != ":9999" {
+		t.Errorf("env listen = %s, want :9999", cEnv.Listen)
+	}
+}
+

@@ -61,6 +61,11 @@ type Config struct {
 	// 写入；空或文件不存在 = model_probes 端点返回空集，面板不显示任何实测标注）。
 	// 只读展示：网关不解析、不依赖其内容做任何路由/出站决策。
 	ProbeFile string
+
+	// CircuitSnapshot 返回模型级熔断降级状态快照（JSON-ready 切片）；nil = 接口返回空集。
+	CircuitSnapshot func() any
+	// CircuitRevive 手动恢复指定模型的熔断降级状态；nil = 接口返回 501。
+	CircuitRevive func(model string)
 }
 
 // Panel 管理面板 handler。挂载方式：外层 mux Handle("/panel/", panel)，
@@ -148,6 +153,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/models", p.withAuth(p.models))
+	p.mux.HandleFunc("GET /panel/api/upstream-models", p.withAuth(p.upstreamModels))
 	p.mux.HandleFunc("POST /panel/api/login/start", p.withAuth(p.loginStart))
 	p.mux.HandleFunc("GET /panel/api/login/poll", p.withAuth(p.loginPoll))
 	p.mux.HandleFunc("GET /panel/api/login/regions", p.withAuth(p.loginRegions))
@@ -178,6 +184,8 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	p.mux.HandleFunc("GET /panel/api/circuit-status", p.withAuth(p.circuitStatus))
+	p.mux.HandleFunc("POST /panel/api/circuit/revive", p.withAuth(p.circuitRevive))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -259,14 +267,16 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 
 	// CN 域：有可用 CN 账号才查（此前无条件 Pool.Pick()+FetchModels——选中 global
 	// 账号时打 CN 端点必然失败，混合池表现为偶发 502，纯 global 池必炸）。
-	if uids := p.cfg.Pool.AvailableUIDsForRealm("cn"); len(uids) > 0 {
-		if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
-			infos, err := p.cfg.Upstream.FetchModels(acct)
-			if err != nil {
-				fetchErrs = append(fetchErrs, "cn: "+err.Error())
-			} else {
-				for _, mi := range infos {
-					out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
+	if p.cfg.Pool != nil && p.cfg.Upstream != nil {
+		if uids := p.cfg.Pool.AvailableUIDsForRealm("cn"); len(uids) > 0 {
+			if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
+				infos, err := p.cfg.Upstream.FetchModels(acct)
+				if err != nil {
+					fetchErrs = append(fetchErrs, "cn: "+err.Error())
+				} else {
+					for _, mi := range infos {
+						out = append(out, panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP))
+					}
 				}
 			}
 		}
@@ -274,7 +284,7 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 
 	// global 域：路由开关开且有可用 global 账号才查（独立目录端点，FetchGlobalModelInfos；
 	// Upstream.GlobalEnabled 是探测侧同一道闸，与 main 装配的 config global.enabled 一致）。
-	if p.cfg.Upstream.GlobalEnabled {
+	if p.cfg.Pool != nil && p.cfg.Upstream != nil && p.cfg.Upstream.GlobalEnabled {
 		if uids := p.cfg.Pool.AvailableUIDsForRealm("global"); len(uids) > 0 {
 			if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
 				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
@@ -290,7 +300,52 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if len(out) == 0 {
+	var aliasEntries []map[string]any
+	if p.cfg.Live != nil {
+		snap := p.cfg.Live.Load()
+		if len(snap.ModelRoutes) > 0 {
+			for _, r := range snap.ModelRoutes {
+				effort := r.Effort
+				if effort == "" {
+					effort = "medium"
+				}
+				aliasEntries = append(aliasEntries, map[string]any{
+					"id":                 r.ID,
+					"name":               r.ID + " ➔ " + r.Target,
+					"is_alias":           true,
+					"is_route":           true,
+					"target":             r.Target,
+					"fallbacks":          r.Fallbacks,
+					"enabled":            r.Enabled,
+					"supports_reasoning": r.Reasoning,
+					"default_effort":     effort,
+					"max_in_flight":      r.MaxInFlight,
+					"rpm":                r.RPM,
+					"description":        r.Description,
+				})
+			}
+		} else if len(snap.Models) > 0 {
+			var aliasKeys []string
+			for k := range snap.Models {
+				aliasKeys = append(aliasKeys, k)
+			}
+			sort.Strings(aliasKeys)
+			for _, alias := range aliasKeys {
+				target := snap.Models[alias]
+				isReasoner := strings.Contains(alias, "reasoner") || strings.Contains(alias, "-r1")
+				aliasEntries = append(aliasEntries, map[string]any{
+					"id":                 alias,
+					"name":               alias + " ➔ " + target,
+					"is_alias":           true,
+					"target":             target,
+					"supports_reasoning": isReasoner,
+					"default_effort":     "medium",
+				})
+			}
+		}
+	}
+
+	if len(out) == 0 && len(aliasEntries) == 0 {
 		if len(fetchErrs) > 0 {
 			writeErr(w, http.StatusBadGateway, "fetch models: "+strings.Join(fetchErrs, "; "))
 			return
@@ -298,6 +353,63 @@ func (p *Panel) models(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
 		return
 	}
+	out = append(aliasEntries, out...)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
+}
+
+// upstreamModels 返回纯净的真实上游模型列表（不含任何本地别名或路由），供 API 令牌绑定选择。
+func (p *Panel) upstreamModels(w http.ResponseWriter, r *http.Request) {
+	out := make([]map[string]any, 0)
+	var fetchErrs []string
+
+	// CN 域
+	if p.cfg.Pool != nil && p.cfg.Upstream != nil {
+		if uids := p.cfg.Pool.AvailableUIDsForRealm("cn"); len(uids) > 0 {
+			if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
+				infos, err := p.cfg.Upstream.FetchModels(acct)
+				if err != nil {
+					fetchErrs = append(fetchErrs, "cn: "+err.Error())
+				} else {
+					for _, mi := range infos {
+						entry := panelModelEntry("cn", mi, mi.Efforts, mi.DefaultEffort, p.cfg.Upstream.HTTP)
+						entry["raw_id"] = mi.ID
+						entry["realm"] = "cn"
+						out = append(out, entry)
+					}
+				}
+			}
+		}
+	}
+
+	// global 域
+	if p.cfg.Pool != nil && p.cfg.Upstream != nil && p.cfg.Upstream.GlobalEnabled {
+		if uids := p.cfg.Pool.AvailableUIDsForRealm("global"); len(uids) > 0 {
+			if acct := p.cfg.Pool.AuthByUID(uids[0]); acct != nil {
+				infos := p.cfg.Upstream.FetchGlobalModelInfos(acct)
+				if len(infos) == 0 {
+					fetchErrs = append(fetchErrs, "global: 上游未返回可用模型")
+				} else {
+					efforts, defaults := p.cfg.Upstream.GlobalEffortSnapshot()
+					for _, mi := range infos {
+						entry := panelModelEntry("global", mi, efforts[mi.ID], defaults[mi.ID], p.cfg.Upstream.HTTP)
+						entry["raw_id"] = mi.ID
+						entry["realm"] = "global"
+						out = append(out, entry)
+					}
+				}
+			}
+		}
+	}
+
+	if len(out) == 0 {
+		if len(fetchErrs) > 0 {
+			writeErr(w, http.StatusBadGateway, "fetch upstream models: "+strings.Join(fetchErrs, "; "))
+			return
+		}
+		writeErr(w, http.StatusServiceUnavailable, "没有可用账号：请先在面板添加账号再查询")
+		return
+	}
+
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "models": out})
 }
 
@@ -642,6 +754,32 @@ func (p *Panel) packages(w http.ResponseWriter, r *http.Request) {
 	// 余额降序：多的在前，便于和少的对比。
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Remain > out[j].Remain })
 	writeJSON(w, http.StatusOK, map[string]any{"accounts": out})
+}
+
+// circuitStatus 返回全部模型的熔断降级状态快照。
+func (p *Panel) circuitStatus(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.CircuitSnapshot == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	writeJSON(w, http.StatusOK, p.cfg.CircuitSnapshot())
+}
+
+// circuitRevive 手动恢复指定模型的熔断降级状态。
+func (p *Panel) circuitRevive(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.CircuitRevive == nil {
+		writeErr(w, http.StatusNotImplemented, "circuit revive not configured")
+		return
+	}
+	var req struct {
+		Model string `json:"model"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Model == "" {
+		writeErr(w, http.StatusBadRequest, "missing model field")
+		return
+	}
+	p.cfg.CircuitRevive(req.Model)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "model": req.Model})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

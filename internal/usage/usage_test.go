@@ -12,11 +12,11 @@ import (
 func TestAddAndTotals(t *testing.T) {
 	r := New("")
 	now := time.Now()
-	r.Add(now, "cn", "uid1", "glm-5.2", Delta{PromptTokens: 100, HasPromptTokens: true, CompletionTokens: 50, HasCompletion: true, LatencyMs: 200, HasLatency: true}, true)
+	r.Add(now, "cn", "uid1", "glm-5.2", "master", Delta{PromptTokens: 100, HasPromptTokens: true, CompletionTokens: 50, HasCompletion: true, LatencyMs: 200, HasLatency: true}, true)
 	// 失败尝试：无 usage → 只计请求数与失败数，token 不加。
-	r.Add(now, "global", "uid1", "claude-4.6", Delta{}, false)
+	r.Add(now, "global", "uid1", "claude-4.6", "master", Delta{}, false)
 	// 上游没给 total 时用 pt+ct 兜底，保证总量口径连续。
-	r.Add(now, "cn", "uid1", "glm-5.2", Delta{PromptTokens: 10, HasPromptTokens: true, CompletionTokens: 5, HasCompletion: true}, true)
+	r.Add(now, "cn", "uid1", "glm-5.2", "master", Delta{PromptTokens: 10, HasPromptTokens: true, CompletionTokens: 5, HasCompletion: true}, true)
 
 	s := r.Snapshot(24, nil)
 	if s.Totals.Requests != 3 || s.Totals.Errors != 1 {
@@ -44,9 +44,9 @@ func TestAddAndTotals(t *testing.T) {
 func TestRollupIdempotent(t *testing.T) {
 	r := New("")
 	old := time.Now().AddDate(0, 0, -100) // 100 天前，超出 90 天小时保留
-	r.Add(old, "cn", "u", "m", Delta{PromptTokens: 7, HasPromptTokens: true}, true)
-	r.Add(old, "cn", "u", "m", Delta{PromptTokens: 7, HasPromptTokens: true}, true)
-	r.Add(time.Now(), "cn", "u", "m", Delta{PromptTokens: 1, HasPromptTokens: true}, true)
+	r.Add(old, "cn", "u", "m", "master", Delta{PromptTokens: 7, HasPromptTokens: true}, true)
+	r.Add(old, "cn", "u", "m", "master", Delta{PromptTokens: 7, HasPromptTokens: true}, true)
+	r.Add(time.Now(), "cn", "u", "m", "master", Delta{PromptTokens: 1, HasPromptTokens: true}, true)
 
 	r.Rollup(time.Now())
 	after := r.Snapshot(24, nil)
@@ -76,7 +76,7 @@ func TestRollupIdempotent(t *testing.T) {
 func TestFlushLoadRoundtrip(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "usage.json")
 	r1 := New(path)
-	r1.Add(time.Now(), "cn", "u1", "glm-5.2", Delta{PromptTokens: 42, HasPromptTokens: true, TotalTokens: 42, HasTotal: true}, true)
+	r1.Add(time.Now(), "cn", "u1", "glm-5.2", "master", Delta{PromptTokens: 42, HasPromptTokens: true, TotalTokens: 42, HasTotal: true}, true)
 	r1.Save()
 
 	r2 := New(path)
@@ -96,8 +96,8 @@ func TestFlushLoadRoundtrip(t *testing.T) {
 func TestSnapshotWindowFilter(t *testing.T) {
 	r := New("")
 	now := time.Now()
-	r.Add(now.Add(-48*time.Hour), "cn", "u", "m", Delta{PromptTokens: 5, HasPromptTokens: true}, true) // 窗口(24h)外
-	r.Add(now, "cn", "u", "m", Delta{PromptTokens: 3, HasPromptTokens: true}, true)                    // 窗口内
+	r.Add(now.Add(-48*time.Hour), "cn", "u", "m", "master", Delta{PromptTokens: 5, HasPromptTokens: true}, true) // 窗口(24h)外
+	r.Add(now, "cn", "u", "m", "master", Delta{PromptTokens: 3, HasPromptTokens: true}, true)                    // 窗口内
 	s := r.Snapshot(24, nil)
 	if s.Totals.Requests != 1 || s.Totals.PromptTokens != 3 {
 		t.Fatalf("24h 窗口 totals = %d/%d, want 1/3（48h 前的数据应被过滤）", s.Totals.Requests, s.Totals.PromptTokens)
@@ -124,7 +124,7 @@ func TestLifecycleFlush(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "usage.json")
 	r := New(path)
 	r.Start()
-	r.Add(time.Now(), "cn", "u", "m", Delta{PromptTokens: 9, HasPromptTokens: true}, true)
+	r.Add(time.Now(), "cn", "u", "m", "master", Delta{PromptTokens: 9, HasPromptTokens: true}, true)
 	r.Stop()
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("Stop 后应有落盘文件: %v", err)

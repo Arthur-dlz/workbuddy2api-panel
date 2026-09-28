@@ -799,7 +799,22 @@ func TestChatHTTP4xxClientDoesNotPenalize(t *testing.T) {
 }
 
 func TestModelsEndpoint(t *testing.T) {
-	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: upstream.New()})
+	dynamicModelsCache.Lock()
+	dynamicModelsCache.ids = nil
+	dynamicModelsCache.fetched = time.Time{}
+	dynamicModelsCache.lastFail = time.Time{}
+	dynamicModelsCache.Unlock()
+
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, `{"code":0,"data":{"models":[
+			{"id":"glm-5.2","maxInputTokens":131072,"maxOutputTokens":8192},
+			{"id":"model-b","maxInputTokens":65536,"maxOutputTokens":4096},
+			{"id":"model-c","maxInputTokens":65536,"maxOutputTokens":4096},
+			{"id":"model-d","maxInputTokens":65536,"maxOutputTokens":4096},
+			{"id":"model-e","maxInputTokens":65536,"maxOutputTokens":4096}
+		],"agents":[{"name":"cli","models":["glm-5.2","model-b","model-c","model-d","model-e"]}]}}`, false
+	})
+	h := NewHandler(Config{Pool: testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at", ExpiresAt: 9999999999}), Upstream: up})
 	req := httptest.NewRequest("GET", "/v1/models", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)

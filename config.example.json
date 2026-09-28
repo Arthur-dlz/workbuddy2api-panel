@@ -1,6 +1,87 @@
 {
-  "listen": ":7863",
-  "api_key": "test_key",
+  "port": 9527,
+  "listen": ":9527",
+  "api_key": "sk-local-workbuddy-key-2026",
+  "models": {
+    "deepseek-chat": "deepseek-v4-pro",
+    "deepseek-reasoner": "deepseek-v4-pro"
+  },
+  "model_routes": [
+    {
+      "id": "deepseek-chat",
+      "target": "deepseek-v4-pro",
+      "fallbacks": ["deepseek-v4.1-flash"],
+      "enabled": true,
+      "reasoning": false,
+      "effort": "medium",
+      "max_in_flight": 5,
+      "rpm": 60,
+      "description": "DeepSeek 旗舰对话（映射至腾讯官方 deepseek-v4-pro）"
+    },
+    {
+      "id": "deepseek-reasoner",
+      "target": "deepseek-v4-pro",
+      "fallbacks": ["hy4-preview"],
+      "enabled": true,
+      "reasoning": true,
+      "effort": "high",
+      "max_in_flight": 3,
+      "rpm": 30,
+      "description": "DeepSeek 深度思考（映射至腾讯官方 deepseek-v4-pro 开启思维链）"
+    },
+    {
+      "id": "kimi-code",
+      "target": "kimi-k3-1",
+      "fallbacks": ["kimi-k2.8-preview"],
+      "enabled": true,
+      "reasoning": true,
+      "effort": "high",
+      "max_in_flight": 3,
+      "rpm": 30,
+      "description": "Kimi 代码与长程推理（映射至腾讯官方 kimi-k3-1 1M）"
+    },
+    {
+      "id": "glm-flagship",
+      "target": "glm-5.3",
+      "fallbacks": ["glm-5.2"],
+      "enabled": true,
+      "reasoning": true,
+      "effort": "high",
+      "max_in_flight": 3,
+      "rpm": 30,
+      "description": "智谱 GLM 旗舰（映射至腾讯官方 glm-5.3 1M）"
+    }
+  ],
+  "tokens": [
+    {
+      "key": "sk-local-workbuddy-key-2026",
+      "name": "主管理令牌 (全部模型)",
+      "enabled": true,
+      "models": ["*"],
+      "rpm": 0
+    },
+    {
+      "key": "sk-wb-deepseek-pro",
+      "name": "WorkBuddy-DeepSeek-Pro",
+      "bind_model": "deepseek-v4-pro",
+      "enabled": true,
+      "rpm": 60
+    },
+    {
+      "key": "sk-wb-kimi-k3",
+      "name": "WorkBuddy-Kimi-K3",
+      "bind_model": "kimi-k3-1",
+      "enabled": true,
+      "rpm": 60
+    },
+    {
+      "key": "sk-wb-glm-53",
+      "name": "WorkBuddy-GLM-5.3",
+      "bind_model": "glm-5.3",
+      "enabled": true,
+      "rpm": 60
+    }
+  ],
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
   "panel": {

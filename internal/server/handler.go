@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 
 	"sync"
@@ -62,17 +64,52 @@ type Config struct {
 	// 在 recordAttempt 这一唯一汇聚点调用，因此流式/非流式、成功/失败都会计入，
 	// 且与 pool 的每账号累计器同源，两条口径不会漂移。
 	Usage *usage.Recorder
+
+	// ModelBreaker 模型级 429 熔断降级管理器（可选；nil = 不执行模型级熔断降级）。
+	ModelBreaker *ModelCircuitBreaker
+
+	// Models 初始模型别名字典 (如 deepseek-chat -> tencent-code-v3)
+	Models map[string]string
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
 func (h *Handler) loadLive() livecfg.Snapshot {
 	if h.cfg.Live != nil {
-		return h.cfg.Live.Load()
+		s := h.cfg.Live.Load()
+		if len(s.Models) == 0 && len(h.cfg.Models) > 0 {
+			s.Models = h.cfg.Models
+		}
+		return s
 	}
 	return livecfg.Snapshot{
 		APIKey:       h.cfg.APIKey,
 		SoftCooldown: h.cfg.SoftCooldown,
+		Models:       h.cfg.Models,
 	}
+}
+
+// modelsMap 返回当前生效的模型别名映射（热改优先，未配置返回 nil）。
+func (h *Handler) modelsMap() map[string]string {
+	live := h.loadLive()
+	if len(live.Models) > 0 {
+		return live.Models
+	}
+	if len(h.cfg.Models) > 0 {
+		return h.cfg.Models
+	}
+	return nil
+}
+
+// resolveAlias 将客户端请求的模型名按别名字典解析为目标模型。
+func (h *Handler) resolveAlias(model string) (string, bool) {
+	m := h.modelsMap()
+	if len(m) == 0 {
+		return model, false
+	}
+	if target, ok := m[model]; ok && target != "" {
+		return target, true
+	}
+	return model, false
 }
 
 // softCooldown 返回当前生效的软冷却基数（热改优先，<=0 回退默认）。
@@ -104,7 +141,9 @@ type Handler struct {
 	degrade degradeGate
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
-	wafIP wafIPGate
+	wafIP   wafIPGate
+	limiter *ModelLimiter
+	modelBreaker *ModelCircuitBreaker
 }
 
 // NewHandler 构建 handler。
@@ -121,13 +160,16 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h := &Handler{cfg: cfg, mux: http.NewServeMux(), limiter: newModelLimiter(), modelBreaker: cfg.ModelBreaker}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
 	if cfg.Panel != nil {
 		h.mux.Handle("/panel/", cfg.Panel) // /panel → /panel/ 由 ServeMux 自动重定向
+		h.mux.HandleFunc("GET /{$}", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, "/panel/", http.StatusFound)
+		})
 	}
 	return h
 }
@@ -138,7 +180,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) withAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if !httpauth.VerifyBearer(r, h.loadLive().APIKey) {
+		token := httpauth.ExtractToken(r)
+		snap := h.loadLive()
+		valid, _, _ := snap.ValidateAuth(token, "")
+		if !valid {
 			writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
 			return
 		}
@@ -234,13 +279,84 @@ const (
 	modelsFetchFailCooldown = 5 * time.Minute
 )
 
-// models 返回模型列表：纯动态（缓存 10min），失败/无号返回空列表（无静态兜底——
-// 拉不出目录即意味着上游不可用，假名单只会让客户端选到 11102 的模型）。
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
+	authTok := httpauth.ExtractToken(r)
+	snap := h.loadLive()
+	if tk, ok := snap.FindToken(authTok); ok && tk.BindModel != "" {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"object": "list",
+			"data":   h.modelListForToken(tk),
+		})
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"object": "list",
 		"data":   h.modelList(),
 	})
+}
+
+// modelListForToken 返回特定 API 令牌视角下的模型列表（强绑定模型排首位并设为默认，并补充通用别名）。
+func (h *Handler) modelListForToken(tk livecfg.TokenConfig) []map[string]any {
+	all := h.modelList()
+	out := make([]map[string]any, 0, len(all)+2)
+
+	targetID := tk.BindModel
+	found := false
+	for _, m := range all {
+		if id, _ := m["id"].(string); id == targetID || id == "cn:"+targetID || id == "global:"+targetID {
+			item := make(map[string]any, len(m))
+			for k, v := range m {
+				item[k] = v
+			}
+			item["id"] = targetID
+			item["is_default"] = true
+			out = append(out, item)
+			found = true
+			break
+		}
+	}
+	if !found {
+		out = append(out, map[string]any{
+			"id":                targetID,
+			"object":            "model",
+			"created":           1753600000,
+			"owned_by":          "workbuddy",
+			"name":              targetID,
+			"description":       fmt.Sprintf("[Bound Model] %s (由令牌 %s 强绑定)", targetID, tk.Name),
+			"is_default":        true,
+			"context_length":    int64(1048576),
+			"max_output_tokens": int64(131072),
+		})
+	}
+
+	out = append(out, map[string]any{
+		"id":                "default",
+		"object":            "model",
+		"created":           1753600000,
+		"owned_by":          "workbuddy",
+		"name":              "default ➔ " + targetID,
+		"description":       fmt.Sprintf("通用默认模型（映射至令牌绑定的 %s）", targetID),
+		"context_length":    int64(1048576),
+		"max_output_tokens": int64(131072),
+	})
+	out = append(out, map[string]any{
+		"id":                "workbuddy",
+		"object":            "model",
+		"created":           1753600000,
+		"owned_by":          "workbuddy",
+		"name":              "workbuddy ➔ " + targetID,
+		"description":       fmt.Sprintf("WorkBuddy 实例模型（映射至令牌绑定的 %s）", targetID),
+		"context_length":    int64(1048576),
+		"max_output_tokens": int64(131072),
+	})
+
+	for _, m := range all {
+		id, _ := m["id"].(string)
+		if id != targetID && id != "cn:"+targetID && id != "global:"+targetID {
+			out = append(out, m)
+		}
+	}
+	return out
 }
 
 // fmtCreditsPrefix 从上游 credits 原文提取倍率并格式化为 "[x0.05 credit]"。
@@ -319,6 +435,79 @@ func applyModelInfoFields(entry map[string]any, mi upstream.ModelInfo) map[strin
 // 纯动态：动态拉取失败/无号 → 该域空列表，无静态兜底。
 func (h *Handler) modelList() []map[string]any {
 	out := make([]map[string]any, 0)
+	seen := make(map[string]bool)
+
+	// 1. 优先输出当前已配置的中转站模型路由（ModelRoutes）与模型别名
+	snap := h.loadLive()
+	if len(snap.ModelRoutes) > 0 {
+		for _, r := range snap.ModelRoutes {
+			if !r.Enabled || seen[r.ID] {
+				continue
+			}
+			isReasoner := r.Reasoning || strings.Contains(strings.ToLower(r.ID), "reasoner") ||
+				strings.Contains(strings.ToLower(r.Target), "reasoner") ||
+				strings.Contains(strings.ToLower(r.Target), "r1")
+
+			effort := r.Effort
+			if effort == "" {
+				effort = "high"
+			}
+			desc := r.Description
+			if desc == "" {
+				desc = fmt.Sprintf("[Route -> %s] WorkBuddy 自定义模型网关路由", r.Target)
+			}
+			entry := map[string]any{
+				"id":                r.ID,
+				"object":            "model",
+				"created":           1753600000,
+				"owned_by":          "workbuddy",
+				"name":              r.ID,
+				"description":       desc,
+				"context_length":    int64(1048576),
+				"max_output_tokens": int64(131072),
+			}
+			if isReasoner {
+				entry["supports_reasoning"] = true
+				entry["reasoning_supported_efforts"] = []string{"low", "medium", "high"}
+				entry["reasoning_default_effort"] = effort
+			}
+			seen[r.ID] = true
+			out = append(out, entry)
+		}
+	} else {
+		aliases := h.modelsMap()
+		aliasKeys := make([]string, 0, len(aliases))
+		for k := range aliases {
+			aliasKeys = append(aliasKeys, k)
+		}
+		sort.Strings(aliasKeys)
+
+		for _, alias := range aliasKeys {
+			target := aliases[alias]
+			isReasoner := strings.Contains(strings.ToLower(alias), "reasoner") ||
+				strings.Contains(strings.ToLower(target), "reasoner") ||
+				strings.Contains(strings.ToLower(target), "r1")
+
+			entry := map[string]any{
+				"id":                alias,
+				"object":            "model",
+				"created":           1753600000,
+				"owned_by":          "workbuddy",
+				"name":              alias,
+				"description":       fmt.Sprintf("[Alias -> %s] WorkBuddy 自定义模型网关别名", target),
+				"context_length":    int64(1048576),
+				"max_output_tokens": int64(131072),
+			}
+			if isReasoner {
+				entry["supports_reasoning"] = true
+				entry["reasoning_supported_efforts"] = []string{"low", "medium", "high"}
+				entry["reasoning_default_effort"] = "high"
+			}
+			seen[alias] = true
+			out = append(out, entry)
+		}
+	}
+
 	for _, mi := range h.fetchDynamicModels() {
 		entry := map[string]any{
 			"id":       "cn:" + mi.ID,
@@ -332,8 +521,12 @@ func (h *Handler) modelList() []map[string]any {
 		// 写 model.json 供下次命中）→ 1M 兜底 / max_output_tokens 省略。
 		// 上游零值不再透出假 131072（误导 Codex/ZCode 等按 context_length 提前
 		// 截断、白白丢上下文）。
-		entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, h.cfg.Upstream.HTTP)
-		if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, h.cfg.Upstream.HTTP); ok {
+		var httpc *http.Client
+		if h.cfg.Upstream != nil {
+			httpc = h.cfg.Upstream.HTTP
+		}
+		entry["context_length"] = upstream.ContextWindowListingV4(mi.ID, mi.ContextWindow, httpc)
+		if mo, ok := upstream.MaxOutputTokensListingV4(mi.ID, mi.MaxTokens, httpc); ok {
 			entry["max_output_tokens"] = mo
 		}
 		// 上游模型对象全字段透出（name/描述/标签/倍率/能力旗标等，空值省略）。
@@ -466,6 +659,160 @@ func cachedModelsSnapshot() []upstream.ModelInfo {
 	return dynamicModelsCache.ids
 }
 
+// isProbeRequest 检测是否为客户端测试连接探测请求（如 WorkBuddy 添加模型后点击“测试连接”发起的请求）。
+// 探测特征：
+// 1. max_tokens / max_completion_tokens <= 1 （WorkBuddy 测试连接的核心特征）
+// 2. 消息列表为空且请求的是已配置别名模型或空模型名
+// 3. 仅单条极短测试消息且 max_tokens <= 5
+func (h *Handler) isProbeRequest(body []byte, model string) bool {
+	if len(body) == 0 {
+		return true
+	}
+	var probe struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+		MaxTokens           *int `json:"max_tokens"`
+		MaxCompletionTokens *int `json:"max_completion_tokens"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil {
+		return false
+	}
+	// 1. max_tokens / max_completion_tokens <= 1 （WorkBuddy 测试连接的核心特征）
+	maxTok := -1
+	if probe.MaxTokens != nil {
+		maxTok = *probe.MaxTokens
+	} else if probe.MaxCompletionTokens != nil {
+		maxTok = *probe.MaxCompletionTokens
+	}
+	if maxTok >= 0 && maxTok <= 1 {
+		return true
+	}
+	// 2. 消息列表为空时：仅当针对已配置别名模型（如 deepseek-chat, deepseek-reasoner）或默认空模型名时判定为连通性探测
+	_, isAlias := h.resolveAlias(model)
+	if len(probe.Messages) == 0 && (isAlias || model == "" || model == "deepseek-chat" || model == "deepseek-reasoner") {
+		return true
+	}
+	// 3. 极短内容 (比如只有一条消息且内容为空或者常见 ping/test)
+	if len(probe.Messages) == 1 {
+		var strContent string
+		if s, ok := probe.Messages[0].Content.(string); ok {
+			strContent = s
+		}
+		trimmed := strings.ToLower(strings.TrimSpace(strContent))
+		if (trimmed == "" || trimmed == "test" || trimmed == "ping") && maxTok >= 0 && maxTok <= 5 {
+			return true
+		}
+	}
+	return false
+}
+
+func (h *Handler) handleProbeRequest(w http.ResponseWriter, r *http.Request, model string, stream bool) {
+	if model == "" {
+		model = "deepseek-chat"
+	}
+	id := fmt.Sprintf("chatcmpl-probe-%d", time.Now().UnixNano())
+	created := time.Now().Unix()
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		fl, _ := w.(http.Flusher)
+
+		chunk1 := map[string]any{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []any{
+				map[string]any{
+					"index": 0,
+					"delta": map[string]any{
+						"role":    "assistant",
+						"content": "Connected",
+					},
+					"finish_reason": nil,
+				},
+			},
+		}
+		raw1, _ := json.Marshal(chunk1)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", raw1)
+		if fl != nil {
+			fl.Flush()
+		}
+
+		chunk2 := map[string]any{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []any{
+				map[string]any{
+					"index":         0,
+					"delta":         map[string]any{},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		raw2, _ := json.Marshal(chunk2)
+		_, _ = fmt.Fprintf(w, "data: %s\n\n", raw2)
+		_, _ = fmt.Fprintf(w, "data: [DONE]\n\n")
+		if fl != nil {
+			fl.Flush()
+		}
+		return
+	}
+
+	resp := map[string]any{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   model,
+		"choices": []any{
+			map[string]any{
+				"index": 0,
+				"message": map[string]any{
+					"role":    "assistant",
+					"content": "Connected",
+				},
+				"finish_reason": "stop",
+			},
+		},
+		"usage": map[string]any{
+			"prompt_tokens":     1,
+			"completion_tokens": 1,
+			"total_tokens":      2,
+		},
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func ensureThinkingInBody(body []byte) []byte {
+	if len(body) == 0 {
+		return body
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return body
+	}
+	th, ok := obj["thinking"].(map[string]any)
+	if !ok || th == nil {
+		obj["thinking"] = map[string]any{"type": "enabled"}
+	} else if typ, _ := th["type"].(string); typ == "" {
+		th["type"] = "enabled"
+	}
+	if _, ok := obj["reasoning_effort"]; !ok {
+		obj["reasoning_effort"] = "high"
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 客户端 IP 提取（按请求传递到 ChatStream，不透传时 upstream 侧忽略）；
 	// 消除早年共享字段方案的并发交叉污染（issue：ClientIP 竞态）。
@@ -485,10 +832,101 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(body, &peek)
 
+	// 鉴权与模型访问权限校验（中转站级）
+	authTok := httpauth.ExtractToken(r)
+	snap := h.loadLive()
+	valid, modelAllowed, tokenCfg := snap.ValidateAuthToken(authTok, peek.Model)
+	if !valid {
+		writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "missing or invalid API key")
+		return
+	}
+	tokenName := "master"
+	if tokenCfg != nil {
+		if tokenCfg.Name != "" {
+			tokenName = tokenCfg.Name
+		} else {
+			tokenName = tokenCfg.Key
+		}
+	}
+	if !modelAllowed {
+		writeOpenAIError(w, http.StatusForbidden, "model_not_allowed", fmt.Sprintf("token '%s' is not permitted to access model '%s'", tokenName, peek.Model))
+		return
+	}
+
+	// 令牌级限流（RPM）
+	if tokenCfg != nil && tokenCfg.RPM > 0 {
+		releaseToken, limitErr := h.limiter.Acquire("token:"+tokenCfg.Key, 0, tokenCfg.RPM)
+		if limitErr == "rpm_limit" {
+			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_exceeded", fmt.Sprintf("token '%s' rate limit reached (%d requests per minute), please retry later", tokenCfg.Name, tokenCfg.RPM))
+			return
+		}
+		defer releaseToken()
+	}
+
+	// 模型路由解析（中转站级路由）
+	reqModel := peek.Model
+
+	// 【核心机制：Token 唯一强绑定真实模型覆盖】
+	// 若当前 Token 唯一绑定了上游真实模型（如 deepseek-v4-pro），则不论客户端传入什么（如 default, workbuddy, gpt-4o 等），一律强制精准锁定！
+	if tokenCfg != nil && tokenCfg.BindModel != "" {
+		reqModel = tokenCfg.BindModel
+	}
+
+	// WorkBuddy "测试连接" / 轻量探测端点健壮性优化：秒级响应（HTTP 200），不因冷启动或排队导致客户端握手超时
+	if h.isProbeRequest(body, reqModel) {
+		h.handleProbeRequest(w, r, reqModel, peek.Stream)
+		return
+	}
+
+	route, hasRoute := snap.FindRoute(reqModel)
+	if hasRoute && !route.Enabled {
+		writeOpenAIError(w, http.StatusBadRequest, "model_disabled", fmt.Sprintf("model '%s' is currently disabled by administrator", reqModel))
+		return
+	}
+
+	targetModel := reqModel
+	if hasRoute && route.Target != "" {
+		targetModel = route.Target
+	} else if target, ok := h.resolveAlias(reqModel); ok {
+		targetModel = target
+	}
+
+	// 单模型并发与 RPM 限流控制
+	if hasRoute && (route.MaxInFlight > 0 || route.RPM > 0) {
+		release, limitErr := h.limiter.Acquire(reqModel, route.MaxInFlight, route.RPM)
+		if limitErr == "concurrent_limit" {
+			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_exceeded", fmt.Sprintf("model '%s' concurrent request limit reached (max_in_flight: %d), please retry later", reqModel, route.MaxInFlight))
+			return
+		} else if limitErr == "rpm_limit" {
+			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_exceeded", fmt.Sprintf("model '%s' rate limit reached (%d requests per minute), please retry later", reqModel, route.RPM))
+			return
+		}
+		defer release()
+	}
+
+	isReasoner := (hasRoute && route.Reasoning) || strings.Contains(strings.ToLower(reqModel), "reasoner") ||
+		strings.Contains(strings.ToLower(targetModel), "reasoner") ||
+		strings.Contains(strings.ToLower(targetModel), "r1")
+
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
-	realm, bareModel := resolveModel(peek.Model)
+	realm, bareModel := resolveModel(targetModel)
+
+	if isReasoner {
+		body = ensureThinkingInBody(body)
+	}
+
+	// 模型级熔断降级预检（circuit breaker pre-check）：若主模型当前处于降级期且未到
+	// 恢复探测窗口，直接切换到已激活的备选模型，跳过主模型的无谓尝试。
+	if h.modelBreaker != nil {
+		if isDegraded, fb := h.modelBreaker.Check(targetModel); isDegraded && fb != "" {
+			log.Printf("[circuit] 模型 %s 处于降级期，直接使用备选模型 %s", targetModel, fb)
+			targetModel = fb
+			realm, bareModel = resolveModel(targetModel)
+			body = rewriteModel(body, bareModel)
+		}
+	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -505,7 +943,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Session != nil && sessKey != "" {
 		// 按模型解析：绑定号在**当前模型**被 6004 限额时视为不可用 → 重新分配，
 		// 而不是钉在限额号上反复失败（"限额后换不动号"的正解）。
-		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, peek.Model); ok {
+		if uid, ok := h.cfg.Session.ResolveForModel(sessKey, bareModel); ok {
 			stickyUID = uid
 		}
 	}
@@ -550,7 +988,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			unbindSticky()
 		}
 	}
-	recordAttempt := func(uid string, delta pool.TokenUsageDelta, started time.Time) {
+	recordAttempt := func(uid string, delta pool.TokenUsageDelta, cachedTokens int64, started time.Time) {
 		delta.Model = peek.Model
 		latency := time.Since(started)
 		latencyMs := latency.Milliseconds()
@@ -573,9 +1011,11 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			if a, ok := h.cfg.Pool.Status(uid); ok && a.Realm != "" {
 				realm = a.Realm
 			}
-			h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, usage.Delta{
+			h.cfg.Usage.Add(time.Now(), realm, uid, delta.Model, tokenName, usage.Delta{
 				PromptTokens:     delta.PromptTokens,
 				HasPromptTokens:  delta.HasPromptTokens,
+				CachedTokens:     cachedTokens,
+				HasCachedTokens:  cachedTokens > 0,
 				CompletionTokens: delta.CompletionTokens,
 				HasCompletion:    delta.HasCompletionTokens,
 				TotalTokens:      delta.TotalTokens,
@@ -658,8 +1098,42 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
 		}
 		if acct == nil {
-			st.status = http.StatusServiceUnavailable
-			break
+			// 若当前主模型已无任何可用账号，检查是否配置了 fallback 备选模型列表（中转站自动降级切号）
+			if hasRoute && len(route.Fallbacks) > 0 {
+				// 关键修复：切换到 fallback 模型时必须清空 tried 集合！
+				// 此前 tried 保留了主模型失败的全部账号 UID，导致 PickExcluding
+				// 在备选模型上也跳过这些账号，fbAcct 永远为 nil。
+				fbTried := map[string]bool{}
+				for _, fb := range route.Fallbacks {
+					fbRealm, fbBare := resolveModel(fb)
+					if fbAcct := h.cfg.Pool.PickExcludingForRealm(fbTried, fbBare, fbRealm); fbAcct != nil {
+						log.Printf("[server] model %s all accounts unavailable, auto fallback to %s on acct=%s", targetModel, fb, fbAcct.UID)
+						// 记录模型级降级（circuit breaker）：计算恢复时间并登记。
+						if h.modelBreaker != nil {
+							var recoveryTime time.Time
+							var ue *upstream.Error
+							if errors.As(lastErr, &ue) {
+								if rt, ok := upstream.ParseRateReset(ue.Msg); ok {
+									recoveryTime = rt
+								} else if ue.RetryAfter > 0 {
+									recoveryTime = time.Now().Add(ue.RetryAfter)
+								}
+							}
+							h.modelBreaker.RecordDegraded(targetModel, fb, recoveryTime, "all accounts 429/exhausted")
+						}
+						targetModel = fb
+						realm = fbRealm
+						bareModel = fbBare
+						body = rewriteModel(body, fbBare)
+						acct = fbAcct
+						break
+					}
+				}
+			}
+			if acct == nil {
+				st.status = http.StatusServiceUnavailable
+				break
+			}
 		}
 		st.uid = acct.UID
 		// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
@@ -718,7 +1192,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
 			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
 			// 上游 client 已打 transport error 日志。
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, attemptStarted)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
 			h.cfg.Pool.NoteFailures(acct.UID)
@@ -729,7 +1203,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if status >= 400 {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, attemptStarted)
 			st.status = status
 			var kind upstream.ErrKind
 			if uerr != nil {
@@ -815,6 +1289,10 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		h.cfg.Pool.NoteSuccess(acct.UID)
+		// 模型级熔断恢复探测成功：主模型返回 200，若此前处于降级期则自动升级恢复。
+		if h.modelBreaker != nil {
+			h.modelBreaker.RecordSuccess(targetModel)
+		}
 		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
@@ -843,7 +1321,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadGateway
 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			}
-			recordAttempt(acct.UID, stats.Usage(), attemptStarted)
+			recordAttempt(acct.UID, stats.Usage(), 0, attemptStarted)
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -864,13 +1342,22 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
 		if err != nil {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, attemptStarted)
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
 			return
 		}
-		recordAttempt(acct.UID, usageDeltaFromResponse(resp), attemptStarted)
+		var cachedT int64
+		if u, ok := resp["usage"].(map[string]any); ok {
+			if c, ok := u["prompt_cache_hit_tokens"].(float64); ok { cachedT = int64(c) }
+			if c, ok := u["cache_read_input_tokens"].(float64); ok && int64(c) > cachedT { cachedT = int64(c) }
+			if c, ok := u["cached_tokens"].(float64); ok && int64(c) > cachedT { cachedT = int64(c) }
+			if p, ok := u["prompt_tokens_details"].(map[string]any); ok {
+				if c, ok := p["cached_tokens"].(float64); ok && int64(c) > cachedT { cachedT = int64(c) }
+			}
+		}
+		recordAttempt(acct.UID, usageDeltaFromResponse(resp), cachedT, attemptStarted)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)

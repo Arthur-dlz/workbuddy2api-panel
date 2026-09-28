@@ -126,13 +126,14 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型路由', tokens: 'API 令牌', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
   document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
-  $('ttl').textContent = TITLES[v];
-  if (v === 'models' && !$('mdBody').children.length) loadModels();
+  $('ttl').textContent = TITLES[v] || v;
+  if (v === 'models') { loadModelRoutes(); if (!$('mdBody').children.length) loadModels(); }
+  if (v === 'tokens') loadTokens();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
@@ -332,44 +333,687 @@ function rateCell(m) {
   return m.credits ? esc(m.credits) : '—';
 }
 
+/* ── 模型路由 (中转) ───────────────────────────────────────────────── */
+let routesLoaded = [];
+let tokensLoaded = [];
+let circuitCache = []; // 模型级熔断降级状态缓存
+
+async function fetchCircuitStatus() {
+  try {
+    const data = await api('circuit-status');
+    circuitCache = Array.isArray(data) ? data : [];
+  } catch (_) {
+    circuitCache = [];
+  }
+}
+
+function circuitBadge(modelId, target) {
+  // 按 route.id 或 route.target 查找降级状态
+  const item = circuitCache.find(c => c.model === modelId || c.model === target);
+  if (!item) return '';
+  if (item.status === 'degraded') {
+    const sec = item.remaining_sec || 0;
+    const timeStr = sec >= 60 ? Math.ceil(sec / 60) + '分钟' : sec + '秒';
+    return ' <span class="tag warn" style="font-size:11px;" title="全池429/额度耗尽，自动降级至备选模型">🔴 降级中 → ' +
+      esc(item.active_fallback || '?') + ' (' + timeStr + '后恢复)</span>' +
+      ' <button type="button" class="xs ghost" data-act="circuit-revive" data-model="' + esc(item.model) + '" title="手动恢复主模型">⚡恢复</button>';
+  }
+  if (item.status === 'probing') {
+    return ' <span class="tag" style="font-size:11px;background:var(--warn-bg);color:var(--warn);" title="恢复窗口已到，等待下次请求验证主模型">🟡 探测中</span>';
+  }
+  return '';
+}
+
+function renderModelRoutes() {
+  const tb = $('routesBody');
+  if (!tb) return;
+  if (!routesLoaded || !routesLoaded.length) {
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty">暂无中转路由规则，点击右上角「添加路由」自定义模型转发</div></td></tr>';
+    return;
+  }
+  tb.innerHTML = routesLoaded.map((r, i) => {
+    const enabledTag = r.enabled
+      ? '<button type="button" class="xs chip on" data-act="toggle-route" data-idx="' + i + '">已启用</button>'
+      : '<button type="button" class="xs chip" data-act="toggle-route" data-idx="' + i + '">已禁用</button>';
+    const fb = (r.fallbacks && r.fallbacks.length)
+      ? r.fallbacks.map(f => '<span class="tag ok">' + esc(f) + '</span>').join(' ')
+      : '<span style="color:var(--ink-3)">—</span>';
+    const limit = [];
+    if (r.max_in_flight > 0) limit.push(r.max_in_flight + ' 在途');
+    if (r.rpm > 0) limit.push(r.rpm + ' RPM');
+    const limitHtml = limit.length ? limit.join(' / ') : '<span style="color:var(--ink-3)">不限</span>';
+    const reasonTag = r.reasoning
+      ? '<span class="tag ok">强制开启' + (r.effort ? ' · ' + esc(r.effort) : '') + '</span>'
+      : '<span style="color:var(--ink-3)">默认</span>';
+    const badge = circuitBadge(r.id, r.target);
+    return '<tr>' +
+      '<td>' + enabledTag + '</td>' +
+      '<td><b>' + esc(r.id) + '</b>' + badge + '</td>' +
+      '<td><span class="tag">' + esc(r.target) + '</span></td>' +
+      '<td>' + fb + '</td>' +
+      '<td class="num">' + limitHtml + '</td>' +
+      '<td>' + reasonTag + '</td>' +
+      '<td style="color:var(--ink-2);font-size:12px;">' + esc(r.description || '—') + '</td>' +
+      '<td class="acts">' +
+        '<button type="button" class="xs ghost" data-act="test-route" data-idx="' + i + '">测试</button>' +
+        '<button type="button" class="xs ghost" data-act="edit-route" data-idx="' + i + '">编辑</button>' +
+        '<button type="button" class="xs ghost danger" data-act="del-route" data-idx="' + i + '">删除</button>' +
+      '</td>' +
+    '</tr>';
+  }).join('');
+}
+
+async function loadModelRoutes() {
+  try {
+    const [d] = await Promise.all([api('config'), fetchCircuitStatus()]);
+    cfgLoaded = d.config;
+    routesLoaded = (cfgLoaded && cfgLoaded.model_routes) ? cfgLoaded.model_routes : [];
+    renderModelRoutes();
+  } catch (e) {
+    const tb = $('routesBody');
+    if (tb) tb.innerHTML = '<tr><td colspan="8"><div class="empty">加载路由失败：' + esc(e.message) + '</div></td></tr>';
+  }
+}
+
+async function saveRoutesConfig() {
+  try {
+    if (cfgLoaded) {
+      cfgLoaded.model_routes = routesLoaded;
+    }
+    const res = await api('config', { method: 'POST', body: JSON.stringify({ model_routes: routesLoaded }) });
+    if (!res || res.ok === false) {
+      throw new Error(res && res.error ? res.error : '保存失败');
+    }
+    toast('模型路由配置已保存并立即生效', 'ok');
+    const d = await api('config');
+    cfgLoaded = d.config;
+    routesLoaded = (cfgLoaded && cfgLoaded.model_routes) ? cfgLoaded.model_routes : [];
+    renderModelRoutes();
+  } catch (e) {
+    toast('保存路由失败: ' + e.message, 'err');
+    try {
+      const d = await api('config');
+      cfgLoaded = d.config;
+      routesLoaded = (cfgLoaded && cfgLoaded.model_routes) ? cfgLoaded.model_routes : [];
+      renderModelRoutes();
+    } catch (_) {}
+  }
+}
+
+async function populateRouteTargetModels(curTarget) {
+  const models = await fetchUpstreamModels(false);
+  const sel = $('routeTargetSelect');
+  const fbSel = $('routeFallbackSelect');
+  const dl = $('targetModelList');
+  if (sel) {
+    sel.innerHTML = '<option value="">-- 选择腾讯官方真实模型 (动态拉取) --</option>' +
+      models.map(m => {
+        const id = m.raw_id || m.id.replace(/^(cn|global):/, '');
+        const cr = m.credits ? ('[' + m.credits + '] ') : '';
+        const name = m.name || id;
+        const selAttr = (id === curTarget) ? ' selected' : '';
+        return `<option value="${esc(id)}"${selAttr}>${esc(cr)}${esc(name)} (${esc(id)})</option>`;
+      }).join('');
+    sel.onchange = () => {
+      if (sel.value) {
+        $('routeTarget').value = sel.value;
+        if (!$('routeId').value.trim()) {
+          $('routeId').value = sel.value;
+        }
+      }
+    };
+    if (curTarget) sel.value = curTarget;
+  }
+  if (fbSel) {
+    fbSel.innerHTML = '<option value="">-- 从上游真实模型中自选备用降级模型 --</option>' +
+      models.map(m => {
+        const id = m.raw_id || m.id.replace(/^(cn|global):/, '');
+        const cr = m.credits ? ('[' + m.credits + '] ') : '';
+        const name = m.name || id;
+        return `<option value="${esc(id)}">${esc(cr)}${esc(name)} (${esc(id)})</option>`;
+      }).join('');
+  }
+  if (dl) {
+    dl.innerHTML = models.map(m => {
+      const id = m.raw_id || m.id.replace(/^(cn|global):/, '');
+      const cr = m.credits ? ('[' + m.credits + '] ') : '';
+      const name = m.name || id;
+      const desc = m.description ? (' - ' + m.description.slice(0, 30)) : '';
+      return `<option value="${esc(id)}">${esc(cr)}${esc(name)}${esc(desc)}</option>`;
+    }).join('');
+  }
+}
+
+function renderRouteFallbackChips() {
+  const box = $('routeFallbackChips');
+  if (!box) return;
+  const raw = ($('routeFallbacks').value || '').trim();
+  const list = raw ? raw.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean) : [];
+  if (!list.length) {
+    box.innerHTML = '<span style="font-size:12px;color:var(--ink-3);">当前未配置降级模型 (主模型全池不可用时将直接报错)</span>';
+    return;
+  }
+  box.innerHTML = list.map((fb, idx) => {
+    return `<span class="tag ok" style="display:inline-flex;align-items:center;gap:4px;font-size:12px;">` +
+      `<span>#${idx + 1} 降级至 <b>${esc(fb)}</b></span>` +
+      `<a href="javascript:void(0)" data-rm-fb="${idx}" style="color:var(--err);text-decoration:none;font-weight:bold;margin-left:4px;" title="移除此降级模型">×</a>` +
+      `</span>`;
+  }).join(' ');
+}
+
+async function openRouteModal(idx, prefilledTarget) {
+  $('routeEditIndex').value = String(idx);
+  let curTarget = prefilledTarget || '';
+  if (idx >= 0 && routesLoaded[idx]) {
+    const r = routesLoaded[idx];
+    $('routeModalTitle').textContent = '编辑模型路由';
+    $('routeId').value = r.id || '';
+    curTarget = r.target || '';
+    $('routeTarget').value = curTarget;
+    $('routeFallbacks').value = (r.fallbacks || []).join(', ');
+    $('routeMaxInFlight').value = r.max_in_flight || '';
+    $('routeRPM').value = r.rpm || '';
+    $('routeReasoning').value = r.reasoning ? 'force_on' : 'auto';
+    $('routeEffort').value = r.effort || '';
+    $('routeDesc').value = r.description || '';
+    $('routeEnabled').checked = r.enabled !== false;
+  } else {
+    $('routeModalTitle').textContent = '添加模型路由';
+    $('routeId').value = curTarget || '';
+    $('routeTarget').value = curTarget;
+    $('routeFallbacks').value = '';
+    $('routeMaxInFlight').value = '';
+    $('routeRPM').value = '';
+    $('routeReasoning').value = 'auto';
+    $('routeEffort').value = '';
+    $('routeDesc').value = '';
+    $('routeEnabled').checked = true;
+  }
+  renderRouteFallbackChips();
+  $('routeVeil').classList.add('on');
+  await populateRouteTargetModels(curTarget);
+}
+
+async function saveRoute() {
+  const id = $('routeId').value.trim();
+  const target = $('routeTarget').value.trim();
+  if (!id) { $('routeId').focus(); toast('请输入外部模型 ID', 'err'); return; }
+  if (!target) { $('routeTarget').focus(); toast('请输入上游目标模型', 'err'); return; }
+
+  const fallbacks = $('routeFallbacks').value.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
+  const maxInFlight = parseInt($('routeMaxInFlight').value, 10) || 0;
+  const rpm = parseInt($('routeRPM').value, 10) || 0;
+  const reasonVal = $('routeReasoning').value;
+  const reasoning = reasonVal === 'force_on';
+  const effort = $('routeEffort').value;
+  const description = $('routeDesc').value.trim();
+  const enabled = $('routeEnabled').checked;
+
+  const item = {
+    id,
+    target,
+    fallbacks,
+    max_in_flight: maxInFlight,
+    rpm,
+    reasoning,
+    effort,
+    description,
+    enabled
+  };
+
+  const idx = parseInt($('routeEditIndex').value, 10);
+  if (idx >= 0 && idx < routesLoaded.length) {
+    routesLoaded[idx] = item;
+  } else {
+    routesLoaded.push(item);
+  }
+  $('routeVeil').classList.remove('on');
+  renderModelRoutes();
+  await saveRoutesConfig();
+}
+
+async function testRoute(route) {
+  testModel(route.id, '', route.id + ' ➔ ' + route.target);
+}
+
+async function testModel(model, customKey, title) {
+  $('testModelName').textContent = '· ' + (title || model);
+  $('testStatus').hidden = false;
+  $('testStatus').className = 'state';
+  $('testStatus').innerHTML = '<span class="dots">正在向本地网关请求模型 ' + esc(model) + '</span>';
+  $('testResult').hidden = true;
+  $('testResult').textContent = '';
+  $('testVeil').classList.add('on');
+
+  const start = Date.now();
+  try {
+    const k = customKey || localStorage.getItem(LS_KEY) || '';
+    const h = { 'Content-Type': 'application/json' };
+    if (k) h['Authorization'] = 'Bearer ' + k;
+    const res = await fetch('/v1/chat/completions', {
+      method: 'POST',
+      headers: h,
+      body: JSON.stringify({
+        model: model,
+        messages: [{ role: 'user', content: 'Ping' }],
+        max_tokens: 32
+      })
+    });
+    const durMs = Date.now() - start;
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      $('testStatus').className = 'state err';
+      $('testStatus').textContent = '调用失败 (HTTP ' + res.status + '，耗时 ' + durMs + 'ms)';
+      $('testResult').hidden = false;
+      $('testResult').textContent = JSON.stringify(body, null, 2);
+    } else {
+      $('testStatus').className = 'state ok';
+      const msg = body.choices && body.choices[0] && body.choices[0].message;
+      const content = msg ? (msg.content || '') : '';
+      const reason = msg && msg.reasoning_content ? ('\n[思考输出]\n' + msg.reasoning_content + '\n') : '';
+      $('testStatus').textContent = '测试成功 (耗时 ' + durMs + 'ms, 上游 ' + (body.model || model) + ')';
+      $('testResult').hidden = false;
+      $('testResult').textContent = (reason ? reason + '\n[回复内容]\n' : '') + content + '\n\n完整响应:\n' + JSON.stringify(body, null, 2);
+    }
+  } catch (err) {
+    $('testStatus').className = 'state err';
+    $('testStatus').textContent = '请求异常: ' + err.message;
+  }
+}
+
+/* ── API 令牌 ──────────────────────────────────────────────────────── */
+let upstreamModelsCache = null;
+
+async function fetchUpstreamModels(forceRefresh) {
+  if (upstreamModelsCache && !forceRefresh) return upstreamModelsCache;
+  try {
+    const res = await api('upstream-models');
+    if (res && res.models) {
+      upstreamModelsCache = res.models;
+      return upstreamModelsCache;
+    }
+  } catch (e) {
+    console.warn('fetchUpstreamModels failed:', e);
+  }
+  return [];
+}
+
+async function populateTokenBindModelSelect(selectedModel, forceRefresh) {
+  const sel = $('tokenBindModel');
+  if (!sel) return;
+  sel.innerHTML = '<option value="">正在从腾讯官方上游实时探测真实模型...</option>';
+  const models = await fetchUpstreamModels(forceRefresh);
+  if (!models || !models.length) {
+    sel.innerHTML = '<option value="">(未能拉取到官方模型，请先检查账号池是否正常)</option>';
+    return;
+  }
+  sel.innerHTML = '<option value="">-- 请选择腾讯官方真实模型 (唯一绑定) --</option>' +
+    models.map(m => {
+      const id = m.raw_id || m.id.replace(/^(cn|global):/, '');
+      const cr = m.credits ? ('[' + m.credits + '] ') : '';
+      const name = m.name || id;
+      const desc = m.description ? (' - ' + m.description.slice(0, 35)) : '';
+      const selAttr = (id === selectedModel) ? ' selected' : '';
+      return `<option value="${esc(id)}"${selAttr}>${esc(cr)}${esc(name)} (${esc(id)})${esc(desc)}</option>`;
+    }).join('');
+}
+
+function renderTokens() {
+  const tb = $('tokensBody');
+  if (!tb) return;
+  if (!tokensLoaded || !tokensLoaded.length) {
+    tb.innerHTML = '<tr><td colspan="6"><div class="empty">暂无 API 令牌，点击右上角「新建令牌」创建客户端专属 Key</div></td></tr>';
+    return;
+  }
+  tb.innerHTML = tokensLoaded.map((t, i) => {
+    const statusTag = t.enabled
+      ? '<span class="tag ok">有效</span>'
+      : '<span class="tag bad">已禁用</span>';
+    const boundTag = t.bind_model
+      ? '<span class="tag ok" style="font-weight:600;display:inline-flex;align-items:center;gap:4px;"><i class="dot ok"></i>' + esc(t.bind_model) + '</span>'
+      : (t.models && t.models.length && !t.models.includes('*')
+          ? t.models.map(m => '<span class="tag ok">' + esc(m) + '</span>').join(' ')
+          : '<span class="tag">全部已启用模型 (*)</span>');
+    const rpmTag = t.rpm > 0 ? (t.rpm + ' RPM') : '<span style="color:var(--ink-3)">默认</span>';
+    const maskedKey = t.key ? (t.key.length > 10 ? t.key.slice(0, 7) + '...' + t.key.slice(-4) : t.key) : '—';
+    return '<tr>' +
+      '<td>' + statusTag + '</td>' +
+      '<td><b>' + esc(t.name || '未命名') + '</b></td>' +
+      '<td>' + boundTag + '</td>' +
+      '<td class="num"><code style="font-size:12px;background:var(--surface-2);padding:2px 6px;border-radius:4px;cursor:pointer;" title="点击复制 Key" class="token-key-copy" data-key="' + esc(t.key) + '">' + esc(maskedKey) + '</code> <button type="button" class="xs ghost" data-act="copy-key" data-key="' + esc(t.key) + '">复制</button></td>' +
+      '<td class="num">' + rpmTag + '</td>' +
+      '<td class="acts">' +
+        '<button type="button" class="xs ghost" data-act="copy-wb-cfg" data-idx="' + i + '" title="一键复制 WorkBuddy 实例配置参数">复制配置</button>' +
+        '<button type="button" class="xs ghost" data-act="test-token" data-idx="' + i + '" title="测试该 Token 连通性">测试</button>' +
+        '<button type="button" class="xs ghost" data-act="edit-token" data-idx="' + i + '">编辑</button>' +
+        (t.enabled
+          ? '<button type="button" class="xs ghost" data-act="toggle-token" data-idx="' + i + '">禁用</button>'
+          : '<button type="button" class="xs primary" data-act="toggle-token" data-idx="' + i + '">启用</button>') +
+        '<button type="button" class="xs ghost danger" data-act="del-token" data-idx="' + i + '">删除</button>' +
+      '</td>' +
+    '</tr>';
+  }).join('');
+}
+
+async function loadTokens() {
+  try {
+    const d = await api('config');
+    cfgLoaded = d.config;
+    tokensLoaded = (cfgLoaded && cfgLoaded.tokens) ? cfgLoaded.tokens : [];
+    renderTokens();
+  } catch (e) {
+    const tb = $('tokensBody');
+    if (tb) tb.innerHTML = '<tr><td colspan="6"><div class="empty">加载令牌失败：' + esc(e.message) + '</div></td></tr>';
+  }
+}
+
+async function saveTokensConfig() {
+  try {
+    if (cfgLoaded) {
+      cfgLoaded.tokens = tokensLoaded;
+    }
+    const res = await api('config', { method: 'POST', body: JSON.stringify({ tokens: tokensLoaded }) });
+    if (!res || res.ok === false) {
+      throw new Error(res && res.error ? res.error : '保存失败');
+    }
+    toast('API 令牌已更新并立即生效', 'ok');
+    const d = await api('config');
+    cfgLoaded = d.config;
+    tokensLoaded = (cfgLoaded && cfgLoaded.tokens) ? cfgLoaded.tokens : [];
+    renderTokens();
+  } catch (e) {
+    toast('保存令牌失败: ' + e.message, 'err');
+    try {
+      const d = await api('config');
+      cfgLoaded = d.config;
+      tokensLoaded = (cfgLoaded && cfgLoaded.tokens) ? cfgLoaded.tokens : [];
+      renderTokens();
+    } catch (_) {}
+  }
+}
+
+function generateRandomTokenKey() {
+  const chars = '0123456789abcdef';
+  let out = 'sk-';
+  for (let i = 0; i < 32; i++) {
+    out += chars[Math.floor(Math.random() * chars.length)];
+  }
+  $('tokenKey').value = out;
+}
+
+async function openTokenModal(idx, prefilledBindModel) {
+  $('tokenEditIndex').value = String(idx);
+  let curBind = prefilledBindModel || '';
+  if (idx >= 0 && tokensLoaded[idx]) {
+    const t = tokensLoaded[idx];
+    $('tokenModalTitle').textContent = '编辑 API 令牌';
+    $('tokenName').value = t.name || '';
+    $('tokenKey').value = t.key || '';
+    curBind = t.bind_model || '';
+    $('tokenModels').value = (t.models || []).join(', ');
+    $('tokenRPM').value = t.rpm || '';
+    $('tokenEnabled').checked = t.enabled !== false;
+  } else {
+    $('tokenModalTitle').textContent = '新建 API 令牌';
+    $('tokenName').value = curBind ? ('WorkBuddy-' + curBind) : '';
+    generateRandomTokenKey();
+    $('tokenModels').value = '';
+    $('tokenRPM').value = '';
+    $('tokenEnabled').checked = true;
+  }
+  $('tokenVeil').classList.add('on');
+  await populateTokenBindModelSelect(curBind, false);
+}
+
+async function saveToken() {
+  const name = $('tokenName').value.trim();
+  const key = $('tokenKey').value.trim();
+  if (!name) { $('tokenName').focus(); toast('请输入令牌名称', 'err'); return; }
+  if (!key) { $('tokenKey').focus(); toast('请输入或生成 API Key', 'err'); return; }
+
+  const bind_model = $('tokenBindModel') ? $('tokenBindModel').value.trim() : '';
+  const models = $('tokenModels').value.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean);
+  const rpm = parseInt($('tokenRPM').value, 10) || 0;
+  const enabled = $('tokenEnabled').checked;
+
+  const item = {
+    name,
+    key,
+    bind_model: bind_model || '',
+    models: models.length ? models : (bind_model ? [bind_model] : ['*']),
+    rpm,
+    enabled
+  };
+
+  const idx = parseInt($('tokenEditIndex').value, 10);
+  if (idx >= 0 && idx < tokensLoaded.length) {
+    tokensLoaded[idx] = item;
+  } else {
+    tokensLoaded.push(item);
+  }
+  $('tokenVeil').classList.remove('on');
+  renderTokens();
+  await saveTokensConfig();
+}
+
+$('tblRoutes').onclick = async e => {
+  const btn = e.target.closest('button[data-act]');
+  if (!btn) return;
+  const act = btn.dataset.act;
+  // 模型级熔断手动恢复（无需 idx）
+  if (act === 'circuit-revive') {
+    const model = btn.dataset.model;
+    if (!model) return;
+    try {
+      await api('circuit/revive', { method: 'POST', body: JSON.stringify({ model }) });
+      toast('模型 ' + model + ' 已手动恢复为主模型', 'ok');
+      await fetchCircuitStatus();
+      renderModelRoutes();
+    } catch (err) {
+      toast('恢复失败: ' + err.message, 'err');
+    }
+    return;
+  }
+  const idx = Number(btn.dataset.idx);
+  if (isNaN(idx) || !routesLoaded[idx]) return;
+  if (act === 'toggle-route') {
+    routesLoaded[idx].enabled = !routesLoaded[idx].enabled;
+    renderModelRoutes();
+    await saveRoutesConfig();
+  } else if (act === 'edit-route') {
+    openRouteModal(idx);
+  } else if (act === 'del-route') {
+    const ok = typeof confirm === 'function' ? confirm('确定删除模型路由「' + routesLoaded[idx].id + '」吗？') : true;
+    if (!ok) return;
+    routesLoaded.splice(idx, 1);
+    renderModelRoutes();
+    await saveRoutesConfig();
+  } else if (act === 'test-route') {
+    testRoute(routesLoaded[idx]);
+  }
+};
+
+$('tblTokens').onclick = async e => {
+  const btn = e.target.closest('button[data-act], code[data-key]');
+  if (!btn) return;
+  if (btn.dataset.act === 'copy-key' || btn.classList.contains('token-key-copy')) {
+    const k = btn.dataset.key;
+    if (k) {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(k).then(() => toast('API Key 已复制到剪贴板', 'ok')).catch(() => toast(k));
+      } else {
+        toast(k);
+      }
+    }
+    return;
+  }
+  const act = btn.dataset.act;
+  const idx = Number(btn.dataset.idx);
+  if (isNaN(idx) || !tokensLoaded[idx]) return;
+  if (act === 'toggle-token') {
+    tokensLoaded[idx].enabled = !tokensLoaded[idx].enabled;
+    renderTokens();
+    await saveTokensConfig();
+  } else if (act === 'copy-wb-cfg') {
+    const t = tokensLoaded[idx];
+    const host = window.location.host || '127.0.0.1:9527';
+    const text = `接口地址(Base URL): http://${host}/v1\nAPI Key: ${t.key}\n模型名称(Model): ${t.bind_model || 'default'}`;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => toast('已复制 WorkBuddy 实例配置参数', 'ok')).catch(() => toast(text));
+    } else {
+      toast(text);
+    }
+  } else if (act === 'test-token') {
+    const t = tokensLoaded[idx];
+    testModel(t.bind_model || 'default', t.key, (t.name || 'Token') + ' (' + (t.bind_model || 'default') + ')');
+  } else if (act === 'edit-token') {
+    openTokenModal(idx);
+  } else if (act === 'del-token') {
+    const tokenItem = tokensLoaded[idx];
+    if (!tokenItem) return;
+    const ok = typeof confirm === 'function' ? confirm('确定删除令牌「' + (tokenItem.name || tokenItem.key) + '」吗？') : true;
+    if (!ok) return;
+    tokensLoaded.splice(idx, 1);
+    if (cfgLoaded) {
+      cfgLoaded.tokens = tokensLoaded;
+    }
+    renderTokens();
+    await saveTokensConfig();
+  }
+};
+
+if ($('btnRefreshUpstreamModels')) {
+  $('btnRefreshUpstreamModels').onclick = () => {
+    populateTokenBindModelSelect($('tokenBindModel').value, true);
+    toast('已触发刷新上游模型列表', 'ok');
+  };
+}
+
+$('btnAddRoute').onclick = () => openRouteModal(-1);
+$('btnCancelRoute').onclick = () => $('routeVeil').classList.remove('on');
+$('btnSaveRoute').onclick = saveRoute;
+
+// 故障转移降级模型交互控制
+if ($('btnAddFallbackModel')) {
+  $('btnAddFallbackModel').onclick = () => {
+    const sel = $('routeFallbackSelect');
+    const val = sel ? sel.value.trim() : '';
+    if (!val) {
+      toast('请先在下拉列表中选择一个上游真实模型', 'err');
+      return;
+    }
+    const cur = ($('routeFallbacks').value || '').trim();
+    const list = cur ? cur.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean) : [];
+    if (list.includes(val)) {
+      toast('模型 ' + val + ' 已经在备选降级列表中了', 'err');
+      return;
+    }
+    list.push(val);
+    $('routeFallbacks').value = list.join(', ');
+    renderRouteFallbackChips();
+    toast('已将 ' + val + ' 加入备选降级列表', 'ok');
+  };
+}
+if ($('btnClearFallbacks')) {
+  $('btnClearFallbacks').onclick = () => {
+    $('routeFallbacks').value = '';
+    renderRouteFallbackChips();
+  };
+}
+if ($('routeFallbacks')) {
+  $('routeFallbacks').oninput = () => renderRouteFallbackChips();
+}
+if ($('routeFallbackChips')) {
+  $('routeFallbackChips').onclick = e => {
+    const a = e.target.closest('[data-rm-fb]');
+    if (!a) return;
+    const rmIdx = parseInt(a.dataset.rmFb, 10);
+    const cur = ($('routeFallbacks').value || '').trim();
+    const list = cur ? cur.split(/[,，\s]+/).map(s => s.trim()).filter(Boolean) : [];
+    if (rmIdx >= 0 && rmIdx < list.length) {
+      list.splice(rmIdx, 1);
+      $('routeFallbacks').value = list.join(', ');
+      renderRouteFallbackChips();
+    }
+  };
+}
+
+$('btnAddToken').onclick = () => openTokenModal(-1);
+$('btnGenTokenKey').onclick = generateRandomTokenKey;
+$('btnCancelToken').onclick = () => $('tokenVeil').classList.remove('on');
+$('btnSaveToken').onclick = saveToken;
+$('btnCloseTest').onclick = () => $('testVeil').classList.remove('on');
+document.querySelectorAll('.route-preset').forEach(b => {
+  b.onclick = () => {
+    const t = b.dataset.target || '';
+    $('routeId').value = b.dataset.id || '';
+    $('routeTarget').value = t;
+    if ($('routeTargetSelect')) $('routeTargetSelect').value = t;
+    if (b.dataset.reasoning) $('routeReasoning').value = b.dataset.reasoning;
+  };
+});
+
 async function loadModels() {
   const tb = $('mdBody');
-  tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
+  tb.innerHTML = '<tr><td colspan="8"><div class="empty">正在向上游查询…</div></td></tr>';
   try {
     // 探测数据是可选增强：拉取失败不影响模型列表本身
     const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
     const list = d.models || [];
-    if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
+    if (!list.length) { tb.innerHTML = '<tr><td colspan="8"><div class="empty">上游未返回模型</div></td></tr>'; return; }
     const probes = pr.probes || {};
     const probeKeys = Object.keys(probes);
     const probeOf = id => probes[id] || probes[probeKeys.find(k => k.endsWith(':' + id))];
     tb.innerHTML = list.map(m => {
+      const rawId = m.raw_id || m.id.replace(/^(cn|global):/, '');
       const eff = (m.supported_efforts || []).slice();
       if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
       const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
         : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
       // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
       const caps = [];
+      if (m.is_alias) caps.push('<span class="tag ok">别名 ➔ ' + esc(m.target || '') + '</span>');
       if (m.is_default) caps.push('<span class="tag ok">默认</span>');
       if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
       if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
       if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
       const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
       const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
+      const acts = '<td class="acts">' +
+        '<button type="button" class="xs ghost" data-act="quick-route" data-model="' + esc(rawId) + '" title="将此模型添加到模型路由规则">加路由</button> ' +
+        '<button type="button" class="xs ghost" data-act="quick-token" data-model="' + esc(rawId) + '" title="为此模型生成独立专属 API Key">建Key</button>' +
+        '</td>';
       return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
         '<td class="num">' + rateCell(m) + '</td>' +
         '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
         '<td class="efs" style="white-space:normal">' + effs + '</td>' +
         '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
-        outCell(m, probeOf(m.id)) + '</tr>';
+        outCell(m, probeOf(m.id)) +
+        acts +
+        '</tr>';
     }).join('');
     const hit = list.filter(m => probeOf(m.id)).length;
     $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
   } catch (e) {
-    tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   }
 }
 $('btnModels').onclick = loadModels;
+
+if ($('tblModels')) {
+  $('tblModels').onclick = e => {
+    const btn = e.target.closest('button[data-act]');
+    if (!btn) return;
+    const act = btn.dataset.act;
+    const model = btn.dataset.model;
+    if (act === 'quick-route') {
+      openRouteModal(-1, model);
+    } else if (act === 'quick-token') {
+      go('tokens');
+      openTokenModal(-1, model);
+    }
+  };
+}
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
 let logCh = 'all';
@@ -409,7 +1053,7 @@ $('btnLogPin').onclick = () => {
 
 /* ── 配置 ─────────────────────────────────────────────────────────── */
 const CFG_MAP = {
-  listen: ['listen'], api_key: ['api_key'],
+  listen: ['listen'], port: ['port'], api_key: ['api_key'],
   package_detail_limit: ['panel', 'package_detail_limit'],
   checkin_hours: ['schedule', 'checkin_hours'], checkin_enabled: ['schedule', 'checkin_enabled'], growth_hours: ['schedule', 'growth_hours'], growth_enabled: ['schedule', 'growth_enabled'],
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
@@ -453,6 +1097,11 @@ async function loadConfig() {
       else if (Array.isArray(v)) el.value = v.join(', ');
       else el.value = v == null ? '' : v;
     }
+    const modelsEl = f.elements['models_json'];
+    if (modelsEl) {
+      const m = cfgLoaded.models;
+      modelsEl.value = m && Object.keys(m).length ? JSON.stringify(m, null, 2) : '';
+    }
     markDurationFields(); // 回填后重置校验态（清掉残留红框；现值来自后端必然合法）
     $('cfgNote').textContent = '';
   } catch (e) { toast('读取配置失败：' + e.message, 'err'); }
@@ -472,6 +1121,27 @@ function collectConfig() {
       else v = raw;
     }
     if (v !== undefined) put(out, path, v);
+  }
+  const modelsEl = f.elements['models_json'];
+  if (modelsEl) {
+    const raw = modelsEl.value.trim();
+    if (raw) {
+      try {
+        out.models = JSON.parse(raw);
+      } catch (e) {}
+    } else {
+      out.models = {};
+    }
+  }
+  if (tokensLoaded !== undefined && tokensLoaded !== null) {
+    out.tokens = tokensLoaded;
+  } else if (cfgLoaded && cfgLoaded.tokens) {
+    out.tokens = cfgLoaded.tokens;
+  }
+  if (routesLoaded !== undefined && routesLoaded !== null) {
+    out.model_routes = routesLoaded;
+  } else if (cfgLoaded && cfgLoaded.model_routes) {
+    out.model_routes = cfgLoaded.model_routes;
   }
   return out;
 }
@@ -518,6 +1188,19 @@ $('cfgForm').onsubmit = async ev => {
     el.focus();
     toast('「' + (el.closest('.fld')?.querySelector('.lb')?.textContent || firstBad) + '」' + DURATION_TIP, 'err');
     return;
+  }
+  const modelsEl = $('cfgForm').elements['models_json'];
+  if (modelsEl && modelsEl.value.trim()) {
+    try {
+      const parsed = JSON.parse(modelsEl.value.trim());
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        throw new Error('必须是 JSON 对象（如 {"别名": "上游模型"}）');
+      }
+    } catch (e) {
+      modelsEl.focus();
+      toast('模型映射 JSON 格式无效：' + e.message, 'err');
+      return;
+    }
   }
   const btn = $('btnCfgSave');
   btn.disabled = true; btn.textContent = '保存中…';
@@ -1221,7 +1904,7 @@ function fmtTok(n) {
   if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
   if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
-  return String(n);
+  return String(Math.round(n));
 }
 function fmtMs(ms) {
   ms = Number(ms || 0);
@@ -1268,174 +1951,347 @@ function usRow(name, sub, a, mid, withPerf) {
     '</tr>';
 }
 
-function renderUsage(d) {
-  const t = d.totals || {};
-  $('usStats').innerHTML =
-    usStat(fmtTok(t.requests), '请求数') +
-    usStat(fmtTok(t.total_tokens), '总 token') +
-    usStat(fmtTok(t.prompt_tokens), 'prompt') +
-    usStat(fmtTok(t.completion_tokens), 'completion') +
-    usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
-    usStat(fmtMs(t.avg_latency_ms), '平均延迟');
+let usageDataCache = null;
 
-  // 卡片、三张表与时序图全部按所选窗口统计（切窗口数字随之变化）；
-  // 「全部历史」含 90 天前折叠出的日桶。这里标注当前口径与数据起点。
+function renderUsage(d) {
+  usageDataCache = d;
+  const t = d.totals || {};
+  const cachedTokens = t.cached_tokens || 0;
+  const promptTokens = t.prompt_tokens || 0;
+  const hitRate = promptTokens > 0 ? (cachedTokens / promptTokens * 100) : 0;
+  const savedCredits = cachedTokens * 0.9 / 1000 * 1.0;
+  const totalTokens = t.total_tokens || 0;
+  const requests = t.requests || 0;
+
+  // 1. DeepSeek 风格 4 核心 KPI 卡片
+  const kpiEl = $('dsKpiGrid');
+  if (kpiEl) {
+    const estCredits = (totalTokens / 1000 * 1.0);
+    kpiEl.innerHTML = `
+      <div class="ds-kpi-card">
+        <div class="lbl"><span>预估消耗额度</span><span class="tag ok" style="font-size:10px;">CNY估算</span></div>
+        <div class="val">¥ ${(estCredits * 0.002).toFixed(3)}</div>
+        <div class="sub">折合约 ${estCredits.toFixed(1)} 积分 · 节省 ~${savedCredits.toFixed(1)} 积分</div>
+      </div>
+      <div class="ds-kpi-card">
+        <div class="lbl"><span>API 请求次数</span><span style="font-size:11px;color:var(--ink-3);">含重试</span></div>
+        <div class="val">${fmtTok(requests)}</div>
+        <div class="sub">成功率: ${requests > 0 ? (((requests - (t.errors || 0)) / requests) * 100).toFixed(1) : 100}% · 失败尝试 ${t.errors || 0}</div>
+      </div>
+      <div class="ds-kpi-card">
+        <div class="lbl"><span>Tokens 消耗总计</span></div>
+        <div class="val">${fmtTok(totalTokens)}</div>
+        <div class="sub">Prompt: ${fmtTok(promptTokens)} / Output: ${fmtTok(t.completion_tokens || 0)}</div>
+      </div>
+      <div class="ds-kpi-card">
+        <div class="lbl"><span>Prompt Cache 命中率</span><span class="tag ${hitRate > 50 ? 'ok' : (hitRate > 0 ? 'warn' : 'mute')}" style="font-size:10px;">前缀复用</span></div>
+        <div class="val" style="color:${hitRate > 50 ? 'var(--ok)' : (hitRate > 0 ? 'var(--warn)' : 'inherit')};">${hitRate.toFixed(1)}%</div>
+        <div class="sub">已命中缓存 Token: ${fmtTok(cachedTokens)}</div>
+      </div>
+    `;
+  }
+
+  // 顶部标题数字
+  if ($('chartReqTotal')) $('chartReqTotal').textContent = fmtTok(requests);
+  if ($('chartTokTotal')) $('chartTokTotal').textContent = fmtTok(totalTokens);
+
+  // 填充 API 令牌筛选下拉
+  const tokenSel = $('usTokenFilter');
+  if (tokenSel) {
+    const curVal = tokenSel.value;
+    const tokens = d.by_token || [];
+    tokenSel.innerHTML = '<option value="">全部令牌</option>' +
+      tokens.map(tk => `<option value="${esc(tk.key)}"${tk.key === curVal ? ' selected' : ''}>${esc(tk.key)} (${fmtTok(tk.requests)}次)</option>`).join('');
+    tokenSel.onchange = () => filterAndRenderCharts();
+  }
+
+  // 元信息
   const winLabel = ($('usWindow') && $('usWindow').selectedOptions[0]) ?
     $('usWindow').selectedOptions[0].textContent.trim() : '';
-  $('usNote').textContent =
-    (winLabel ? winLabel + ' · ' : '') +
-    (d.buckets || 0) + ' 个分桶' +
-    (d.since ? ' · 数据自 ' + d.since.replace('T', ' ') : '') +
-    (d.file_bytes ? ' · 文件 ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
+  if ($('usNote')) {
+    $('usNote').textContent =
+      (winLabel ? winLabel + ' · ' : '') +
+      (d.buckets || 0) + ' 个分桶' +
+      (d.since ? ' · 自 ' + d.since.replace('T', ' ') : '');
+  }
 
-  $('usAccBody').innerHTML = (d.by_account || []).map(x =>
-    usRow(x.key.slice(0, 8), x.extra || '', x,
-      '<td class="num">' + esc(x.realm || '') + '</td>', true)
-  ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+  // 渲染下钻表格
+  if ($('usTokenBody')) {
+    $('usTokenBody').innerHTML = (d.by_token || []).map(x => {
+      const pt = x.prompt_tokens || 0;
+      const ct = x.cached_tokens || 0;
+      const hr = pt > 0 ? (ct / pt * 100) : 0;
+      const badge = hr > 50 ? 'ok' : (hr > 20 ? 'warn' : 'mute');
+      const hrHtml = '<span class="tag ' + badge + '">' + hr.toFixed(1) + '%</span>';
+      const sc = ct * 0.9 / 1000 * 1.0;
+      return '<tr>' +
+        '<td class="mark" aria-hidden="true"></td>' +
+        '<td><b>' + esc(x.key) + '</b>' + (x.extra ? '<div class="note">' + esc(x.extra) + '</div>' : '') + '</td>' +
+        '<td class="num">' + fmtTok(x.requests) + '</td>' +
+        '<td class="num">' + (x.errors ? '<span style="color:var(--warn)">' + fmtTok(x.errors) + '</span>' : '—') + '</td>' +
+        '<td class="num">' + fmtTok(pt) + '</td>' +
+        '<td class="num" style="color:var(--accent)">' + fmtTok(ct) + '</td>' +
+        '<td>' + hrHtml + '</td>' +
+        '<td class="num">' + fmtTok(x.completion_tokens) + '</td>' +
+        '<td class="num"><b>' + fmtTok(x.total_tokens) + '</b></td>' +
+        '<td class="num" style="color:var(--ok)">~' + sc.toFixed(1) + '</td>' +
+        '</tr>';
+    }).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+  }
 
-  $('usModelBody').innerHTML = (d.by_model || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+  if ($('usAccBody')) {
+    $('usAccBody').innerHTML = (d.by_account || []).map(x =>
+      usRow(x.key.slice(0, 8), x.extra || '', x,
+        '<td class="num">' + esc(x.realm || '') + '</td>', true)
+    ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+  }
 
-  $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+  if ($('usModelBody')) {
+    $('usModelBody').innerHTML = (d.by_model || []).map(x =>
+      usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+  }
 
-  renderUsageChart(d.series || []);
+  if ($('usRealmBody')) {
+    $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
+      usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+  }
+
+  filterAndRenderCharts();
 }
 
-/* renderUsageChart 画堆叠柱状图。
- *
- * x 轴是**真实时间轴**，不是按序号等距。这一点很重要：数据里存在 1 小时的
- * 间隔，也存在 6~8 小时的断档（没请求的时段不产生桶），等距排布会把 8 小时
- * 画得和 1 小时一样宽，让「什么时候用的」完全失真。
- *
- * 另外不再用 preserveAspectRatio="none"：那会把 760 宽的 viewBox 横向拉伸到
- * 容器宽度，柱子和文字都变形。改为固定比例、按容器宽度自适应高度。
- *
- * 时间轴用本地时间解析（后端返回的就是本地时区），day 点按当天 00:00 参与定位，
- * 与 hour 点在同一个连续轴上——日桶本来就是他那天所有小时的聚合。
- */
+function filterAndRenderCharts() {
+  if (!usageDataCache) return;
+  const hours = Number(($('usWindow') && $('usWindow').value) || 72);
+  const series = usageDataCache.series || [];
+  renderReqAreaChart(series, hours);
+  renderTokBarChart(series, hours);
+}
 
 /* parsePointTime 把后端的 t 解析成毫秒时间戳。 */
 function parsePointTime(p) {
-  // hour: "2026-09-16T13"  day: "2026-09-16"
   const s = p.t.length === 13 ? p.t + ':00:00' : p.t + 'T00:00:00';
   const d = new Date(s);
   return isNaN(d.getTime()) ? null : d.getTime();
 }
 
-function renderUsageChart(series) {
-  const host = $('usChart');
+/* 核心修复：基于选定窗口计算真实时间轴跨度，避免单点挤在最左边 */
+function getTimeWindowSpan(pts, hours) {
+  const now = Date.now();
+  if (hours > 0) {
+    const tStart = now - hours * 3600 * 1000;
+    return { t0: tStart, t1: now, span: hours * 3600 * 1000 };
+  }
+  if (!pts.length) {
+    return { t0: now - 86400000, t1: now, span: 86400000 };
+  }
+  let tMin = pts[0].t, tMax = pts[pts.length - 1].t;
+  if (tMin === tMax) {
+    tMin -= 3600 * 1000 * 12;
+    tMax += 3600 * 1000 * 12;
+  }
+  return { t0: tMin, t1: tMax, span: Math.max(3600000, tMax - tMin) };
+}
 
-  // 丢掉时间解析不出来的点，而不是让 NaN 传染整张图。
+/* 1. DeepSeek 风格：API 请求次数面积折线图 */
+function renderReqAreaChart(series, hours) {
+  const host = $('chartReqArea');
+  if (!host) return;
+
   const pts = [];
   for (const p of series) {
     const t = parsePointTime(p);
-    if (t === null) continue;
-    const pt = Number(p.prompt_tokens || 0);
-    const ct = Number(p.completion_tokens || 0);
-    pts.push({ t, scope: p.scope, raw: p.t, pt, ct, tt: Number(p.total_tokens || 0) || (pt + ct),
-               req: p.requests || 0 });
+    if (t !== null) pts.push({ t, req: Number(p.requests || 0), raw: p.t, scope: p.scope });
   }
+
   if (!pts.length) {
-    host.innerHTML = '<div class="us-empty">暂无用量数据。发起一次对话后再刷新。</div>';
+    host.innerHTML = '<div class="us-empty">暂无请求数据</div>';
     return;
   }
 
-  const W = 760, H = 180, PL = 52, PR = 12, PT = 12, PB = 30;
+  const W = 460, H = 160, PL = 48, PR = 16, PT = 15, PB = 28;
   const iw = W - PL - PR, ih = H - PT - PB;
+  const { t0, span } = getTimeWindowSpan(pts, hours);
 
-  const t0 = pts[0].t;
-  const t1 = pts[pts.length - 1].t;
-  const span = Math.max(1, t1 - t0);
+  const maxVal = Math.max(4, ...pts.map(p => p.req));
+  const xOf = t => PL + Math.max(0, Math.min(iw, (t - t0) / span * iw));
+  const yOf = v => PT + ih - (v / maxVal * ih);
 
-  const max = Math.max(1, ...pts.map(p => p.tt));
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="none">';
+  out += `<defs>
+    <linearGradient id="reqGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.32"/>
+      <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.01"/>
+    </linearGradient>
+  </defs>`;
 
-  // 柱宽取「最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会
-  // 变细，但不会细到看不见。
-  let minGap = Infinity;
-  for (let i = 1; i < pts.length; i++) minGap = Math.min(minGap, pts[i].t - pts[i - 1].t);
-  if (!isFinite(minGap) || minGap <= 0) minGap = span;
-  const slot = iw * (minGap / span);
-  const bw = Math.max(1.5, Math.min(30, slot * 0.7));
-
-  const xOf = t => PL + (t - t0) / span * iw;
-
-  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" ' +
-            'preserveAspectRatio="xMidYMid meet">';
-
-  // y 轴网格 + 刻度
-  for (let i = 0; i <= 4; i++) {
-    const y = PT + ih - (ih * i / 4);
-    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
-           '" y2="' + y.toFixed(1) + '"/>';
-    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
-           '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
+  // y 轴 3 条干净的横向网格线 + 文字（绝对不和图形重叠，取整格式化）
+  for (let i = 0; i <= 3; i++) {
+    const y = PT + ih - (ih * i / 3);
+    const tickVal = Math.round(maxVal * i / 3);
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 8) + '" y="' + (y + 3.5).toFixed(1) + '" text-anchor="end">' + fmtTok(tickVal) + '</text>';
   }
 
-  // 柱子
-  for (const p of pts) {
-    const cx = xOf(p.t);
-    const x = cx - bw / 2;
-    const hTot = ih * (p.tt / max);
-    const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
-    const hC = Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
-    const yBase = PT + ih;
-    if (hP > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP).toFixed(2) +
-      '" width="' + bw.toFixed(2) + '" height="' + hP.toFixed(2) +
-      '" fill="var(--accent)" rx="1.5"/>';
-    if (hC > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
-      '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) +
-      '" fill="var(--ok)" rx="1.5"/>';
-    out += '<title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
-           fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
-  }
-
-  // x 轴基线画在柱子之后，避免压在柱底
-  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) +
-         '" y2="' + (PT + ih) + '"/>';
-
-  // x 轴刻度：按真实时间等距取 6 个位置，取该位置**最近的实际柱子**做标签，
-  // 所以标签永远落在有数据的点上，不会指到空档里。
-  const TICKS = Math.min(6, pts.length);
-  const usedLabel = new Set();
-  for (let k = 0; k < TICKS; k++) {
-    const target = t0 + span * (TICKS === 1 ? 0.5 : k / (TICKS - 1));
-    let bi = 0, best = Infinity;
-    for (let i = 0; i < pts.length; i++) {
-      const d = Math.abs(pts[i].t - target);
-      if (d < best) { best = d; bi = i; }
+  // 坐标点计算
+  const coords = pts.map(p => ({ x: xOf(p.t), y: yOf(p.req), p }));
+  // 首尾补全（若窗口较大）
+  let pathD = '';
+  if (coords.length === 1) {
+    const c = coords[0];
+    pathD = `M ${PL} ${PT+ih} L ${c.x - 20} ${PT+ih} L ${c.x} ${c.y} L ${c.x + 20} ${PT+ih} L ${W-PR} ${PT+ih}`;
+  } else {
+    pathD = `M ${coords[0].x.toFixed(1)} ${coords[0].y.toFixed(1)}`;
+    for (let i = 1; i < coords.length; i++) {
+      const prev = coords[i - 1];
+      const cur = coords[i];
+      const mx = (prev.x + cur.x) / 2;
+      pathD += ` C ${mx.toFixed(1)} ${prev.y.toFixed(1)}, ${mx.toFixed(1)} ${cur.y.toFixed(1)}, ${cur.x.toFixed(1)} ${cur.y.toFixed(1)}`;
     }
-    if (usedLabel.has(bi)) continue;
-    usedLabel.add(bi);
-    const p = pts[bi];
-    const d = new Date(p.t);
-    const lab = p.scope === 'day'
-      ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
-      : String(d.getHours()).padStart(2, '0') + ':00';
-    // 首尾标签靠边对齐，避免被裁掉
-    const cx = xOf(p.t);
-    const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
-    out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
-           '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' + esc(lab) + '</text>';
   }
 
-  // 跨天时补一条日期分隔线，让「日界」在长窗口里可见
-  let prevDay = null;
-  for (const p of pts) {
-    const d = new Date(p.t).getDate();
-    if (prevDay !== null && d !== prevDay) {
-      const x = xOf(p.t).toFixed(1);
-      out += '<line class="gl" x1="' + x + '" y1="' + PT + '" x2="' + x + '" y2="' +
-             (PT + ih) + '" style="opacity:.45"/>';
-    }
-    prevDay = d;
+  // 面积填充
+  const areaD = pathD + ` L ${coords[coords.length - 1].x.toFixed(1)} ${(PT + ih).toFixed(1)} L ${coords[0].x.toFixed(1)} ${(PT + ih).toFixed(1)} Z`;
+  out += '<path d="' + areaD + '" fill="url(#reqGrad)"/>';
+  // 曲线轮廓
+  out += '<path d="' + pathD + '" fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round"/>';
+
+  // 关键数据节点小圆圈
+  for (const c of coords) {
+    out += `<circle cx="${c.x.toFixed(1)}" cy="${c.y.toFixed(1)}" r="3" fill="#ffffff" stroke="#2563eb" stroke-width="2">` +
+      `<title>${esc(c.p.raw)}: ${c.p.req} 次请求</title></circle>`;
+  }
+
+  // X 轴基线
+  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) + '" y2="' + (PT + ih) + '"/>';
+
+  // X 轴日期刻度（等间距 4 个标尺，首尾不贴边）
+  for (let k = 0; k <= 3; k++) {
+    const t = t0 + span * (k / 3);
+    const d = new Date(t);
+    const lab = (hours <= 24)
+      ? String(d.getHours()).padStart(2, '0') + ':00'
+      : (d.getMonth() + 1) + '/' + d.getDate();
+    const cx = PL + (k / 3) * iw;
+    out += '<text class="tk" x="' + cx.toFixed(1) + '" y="' + (PT + ih + 15) + '" text-anchor="middle">' + esc(lab) + '</text>';
   }
 
   out += '</svg>';
   host.innerHTML = out;
 }
 
-function fmtTokTip(v) { return fmtTok(v); }
+/* 2. DeepSeek 风格：Tokens 消耗与缓存堆叠柱状图 */
+function renderTokBarChart(series, hours) {
+  const host = $('chartTokBar');
+  if (!host) return;
+
+  const rawPts = [];
+  for (const p of series) {
+    const t = parsePointTime(p);
+    if (t === null) continue;
+    const pt = Number(p.prompt_tokens || 0);
+    const ct = Number(p.completion_tokens || 0);
+    const cached = Number(p.cached_tokens || 0);
+    rawPts.push({ t, scope: p.scope, raw: p.t, pt, ct, cached, tt: Number(p.total_tokens || 0) || (pt + ct), req: p.requests || 0 });
+  }
+
+  if (!rawPts.length) {
+    host.innerHTML = '<div class="us-empty">暂无 Token 消耗数据</div>';
+    return;
+  }
+
+  // 按时间严格升序排序
+  rawPts.sort((a, b) => a.t - b.t);
+
+  const W = 460, H = 160, PL = 54, PR = 16, PT = 15, PB = 28;
+  const iw = W - PL - PR, ih = H - PT - PB;
+  const { t0, span } = getTimeWindowSpan(rawPts, hours);
+
+  const maxVal = Math.max(10, ...rawPts.map(p => p.tt));
+  const xOf = t => PL + Math.max(0, Math.min(iw, (t - t0) / span * iw));
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="none">';
+
+  // y 轴 3 条横向刻度线 + 文字（保持 8px 以上安全 Padding，数值严格四舍五入为整洁整数）
+  for (let i = 0; i <= 3; i++) {
+    const y = PT + ih - (ih * i / 3);
+    const tickVal = Math.round(maxVal * i / 3);
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 8) + '" y="' + (y + 3.5).toFixed(1) + '" text-anchor="end">' + fmtTok(tickVal) + '</text>';
+  }
+
+  // 1. 柱宽适度收窄：参考 DeepSeek 设计，控制在 7~10px 纤细精致
+  const bw = Math.max(5, Math.min(9, iw / Math.max(24, rawPts.length * 3)));
+  const minGap = 4; // 相邻柱子之间至少保留 4 像素纯净间隙，绝不重叠
+
+  // 2. 防重叠自适应排列算法：当多个实例/时点时间极其接近时，自动侧向推开保持 4px 距离
+  let prevRight = PL - 999;
+  const pts = [];
+  for (let i = 0; i < rawPts.length; i++) {
+    const p = rawPts[i];
+    let idealCenter = xOf(p.t);
+    let left = idealCenter - bw / 2;
+    if (left < prevRight + minGap) {
+      left = prevRight + minGap;
+    }
+    if (left + bw > W - PR - 2) {
+      left = W - PR - bw - 2;
+    }
+    if (left < PL + 4) {
+      left = PL + 4;
+    }
+    prevRight = left + bw;
+    pts.push({ ...p, x: left });
+  }
+
+  // 3. 绘制柱体
+  for (const p of pts) {
+    const x = p.x;
+    const hTot = ih * (p.tt / maxVal);
+
+    // 三层堆叠：Prompt未命中(深蓝) + Cache命中(浅蓝) + Completion(翡翠绿)
+    const hPrompt = p.tt ? hTot * (p.pt / p.tt) : 0;
+    const hCached = p.tt ? hTot * (p.cached / p.tt) : 0;
+    const hRealPrompt = Math.max(0, hPrompt - hCached);
+    const hComp = Math.max(p.tt && p.ct ? 1.5 : 0, hTot - hPrompt);
+
+    let currY = PT + ih;
+
+    // 1. Completion (顶层翡翠绿)
+    if (hComp > 0) {
+      out += `<rect x="${x.toFixed(1)}" y="${(currY - hComp).toFixed(1)}" width="${bw.toFixed(1)}" height="${hComp.toFixed(1)}" fill="#10b981" rx="2"/>`;
+      currY -= hComp;
+    }
+    // 2. Cache 命中 (中层浅天蓝)
+    if (hCached > 0) {
+      out += `<rect x="${x.toFixed(1)}" y="${(currY - hCached).toFixed(1)}" width="${bw.toFixed(1)}" height="${hCached.toFixed(1)}" fill="#60a5fa" rx="2"/>`;
+      currY -= hCached;
+    }
+    // 3. Prompt (底层深蓝)
+    if (hRealPrompt > 0) {
+      out += `<rect x="${x.toFixed(1)}" y="${(currY - hRealPrompt).toFixed(1)}" width="${bw.toFixed(1)}" height="${hRealPrompt.toFixed(1)}" fill="#2563eb" rx="2"/>`;
+      currY -= hRealPrompt;
+    }
+
+    out += `<title>${esc(p.raw)}\nPrompt: ${fmtTok(p.pt)} (Cache: ${fmtTok(p.cached)})\nCompletion: ${fmtTok(p.ct)}\n合计: ${fmtTok(p.tt)} Tokens</title>`;
+  }
+
+  // X 轴基线
+  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) + '" y2="' + (PT + ih) + '"/>';
+
+  // X 轴日期刻度
+  for (let k = 0; k <= 3; k++) {
+    const t = t0 + span * (k / 3);
+    const d = new Date(t);
+    const lab = (hours <= 24)
+      ? String(d.getHours()).padStart(2, '0') + ':00'
+      : (d.getMonth() + 1) + '/' + d.getDate();
+    const cx = PL + (k / 3) * iw;
+    out += '<text class="tk" x="' + cx.toFixed(1) + '" y="' + (PT + ih + 15) + '" text-anchor="middle">' + esc(lab) + '</text>';
+  }
+
+  out += '</svg>';
+  host.innerHTML = out;
+}
 
 async function loadUsage() {
   const hours = ($('usWindow') && $('usWindow').value) || 72;
@@ -1443,7 +2299,8 @@ async function loadUsage() {
     const d = await api('usage?hours=' + encodeURIComponent(hours));
     renderUsage(d);
   } catch (e) {
-    $('usChart').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
+    if ($('chartTokBar')) $('chartTokBar').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
+    if ($('chartReqArea')) $('chartReqArea').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
   }
 }
 

@@ -41,11 +41,16 @@ func lookupDefaultEffort(defaultEfforts map[string]string, model string) string 
 	return defaultEfforts[model]
 }
 
-// isDeepSeekModel 模型名以 deepseek 为前缀（不区分大小写）。
-// 覆盖 deepseek-v4.1-flash / deepseek-v4-pro / deepseek-r1 等变体；
-// 前缀匹配对齐官方 thinkingFormat:"deepseek" 的判定口径，避免漏注。
+// isDeepSeekModel 模型名以 deepseek 为前缀或包含 reasoner / -r1 等推理标识（不区分大小写）。
+// 覆盖 deepseek-v4.1-flash / deepseek-v4-pro / deepseek-r1 / deepseek-reasoner / tencent-code-r1 等变体；
+// 匹配对齐思维链判定口径，确保开启 thinking:{type:"enabled"} 并提取 reasoning_content。
 func isDeepSeekModel(model string) bool {
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(model)), "deepseek")
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(m, "deepseek") ||
+		strings.Contains(m, "reasoner") ||
+		strings.Contains(m, "-r1") ||
+		strings.HasSuffix(m, "r1") ||
+		strings.Contains(m, "tencent-code-r1")
 }
 
 // backfillReasoningContent DeepSeek 多轮一致性：保证每条 assistant 消息带

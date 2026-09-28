@@ -44,19 +44,21 @@ const (
 // bucket 一个 (时间片, realm, uid, model) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
 type bucket struct {
-	Scope string  `json:"s"` // "h:2006-01-02T15" 或 "d:2006-01-02"
-	Realm string  `json:"r"`
-	UID   string  `json:"u"`
-	Model string  `json:"m"`
-	Req   int64   `json:"q"`  // 请求数（含失败）
-	Err   int64   `json:"e"`  // 失败数
-	PT    int64   `json:"p"`  // prompt tokens
-	CT    int64   `json:"c"`  // completion tokens
-	TT    int64   `json:"t"`  // total tokens（上游给什么用什么的合计）
-	LatMs int64   `json:"l"`  // 延迟累计（ms）
-	LatN  int64   `json:"ln"` // 延迟样本数
-	TPS   float64 `json:"v"`  // 吐字速率累计
-	TPSN  int64   `json:"vn"` // 速率样本数
+	Scope    string  `json:"s"` // "h:2006-01-02T15" 或 "d:2006-01-02"
+	Realm    string  `json:"r"`
+	UID      string  `json:"u"`
+	Model    string  `json:"m"`
+	TokenKey string  `json:"k,omitempty"`
+	Req      int64   `json:"q"`  // 请求数（含失败）
+	Err      int64   `json:"e"`  // 失败数
+	PT       int64   `json:"p"`  // prompt tokens
+	CT       int64   `json:"c"`  // completion tokens
+	TT       int64   `json:"t"`  // total tokens（上游给什么用什么的合计）
+	CachedT  int64   `json:"ch,omitempty"`
+	LatMs    int64   `json:"l"`  // 延迟累计（ms）
+	LatN     int64   `json:"ln"` // 延迟样本数
+	TPS      float64 `json:"v"`  // 吐字速率累计
+	TPSN     int64   `json:"vn"` // 速率样本数
 }
 
 // file 落盘结构。
@@ -130,6 +132,8 @@ func (r *Recorder) Stop() {
 type Delta struct {
 	PromptTokens     int64
 	HasPromptTokens  bool
+	CachedTokens     int64
+	HasCachedTokens  bool
 	CompletionTokens int64
 	HasCompletion    bool
 	TotalTokens      int64
@@ -144,7 +148,7 @@ type Delta struct {
 //
 // ok=false 表示该次尝试失败（传输错误 / 上游 >=400 / 解析失败）。失败尝试通常
 // 没有 usage，但**仍要计入请求数与失败数**——重试放大正是靠这一列才看得出来。
-func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool) {
+func (r *Recorder) Add(now time.Time, realm, uid, model, tokenKey string, d Delta, ok bool) {
 	if r == nil {
 		return
 	}
@@ -154,15 +158,18 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 	if model == "" {
 		model = "(unknown)"
 	}
+	if tokenKey == "" {
+		tokenKey = "master"
+	}
 	scope := "h:" + now.Format(hourLayout)
-	key := scope + "|" + realm + "|" + uid + "|" + model
+	key := scope + "|" + realm + "|" + uid + "|" + model + "|" + tokenKey
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	b := r.buckets[key]
 	if b == nil {
-		b = &bucket{Scope: scope, Realm: realm, UID: uid, Model: model}
+		b = &bucket{Scope: scope, Realm: realm, UID: uid, Model: model, TokenKey: tokenKey}
 		r.buckets[key] = b
 	}
 	b.Req++
@@ -171,6 +178,9 @@ func (r *Recorder) Add(now time.Time, realm, uid, model string, d Delta, ok bool
 	}
 	if d.HasPromptTokens {
 		b.PT += d.PromptTokens
+	}
+	if d.HasCachedTokens {
+		b.CachedT += d.CachedTokens
 	}
 	if d.HasCompletion {
 		b.CT += d.CompletionTokens
@@ -214,7 +224,7 @@ func (r *Recorder) Rollup(now time.Time) {
 			continue
 		}
 		day := "d:" + ts.Format(dayLayout)
-		moves = append(moves, move{from: k, to: day + "|" + b.Realm + "|" + b.UID + "|" + b.Model})
+		moves = append(moves, move{from: k, to: day + "|" + b.Realm + "|" + b.UID + "|" + b.Model + "|" + b.TokenKey})
 	}
 	for _, m := range moves {
 		src := r.buckets[m.from]
@@ -233,6 +243,7 @@ func (r *Recorder) Rollup(now time.Time) {
 			dst.PT += src.PT
 			dst.CT += src.CT
 			dst.TT += src.TT
+			dst.CachedT += src.CachedT
 			dst.LatMs += src.LatMs
 			dst.LatN += src.LatN
 			dst.TPS += src.TPS
@@ -262,7 +273,10 @@ func (r *Recorder) load() error {
 	}
 	for i := range f.Buckets {
 		b := f.Buckets[i]
-		r.buckets[b.Scope+"|"+b.Realm+"|"+b.UID+"|"+b.Model] = &b
+		if b.TokenKey == "" {
+			b.TokenKey = "master"
+		}
+		r.buckets[b.Scope+"|"+b.Realm+"|"+b.UID+"|"+b.Model+"|"+b.TokenKey] = &b
 	}
 	log.Printf("[usage] 已恢复 %d 个用量桶（%s）", len(r.buckets), r.path)
 	return nil
@@ -315,6 +329,8 @@ type Agg struct {
 	PromptTokens  int64   `json:"prompt_tokens"`
 	CompletionTok int64   `json:"completion_tokens"`
 	TotalTokens   int64   `json:"total_tokens"`
+	CachedTokens  int64   `json:"cached_tokens"`
+	CacheHitRate  float64 `json:"cache_hit_rate"`
 	AvgLatencyMs  float64 `json:"avg_latency_ms"`
 	AvgTPS        float64 `json:"avg_tokens_per_second"`
 }
@@ -335,6 +351,7 @@ func (g *aggAcc) add(b *bucket) {
 	g.PromptTokens += b.PT
 	g.CompletionTok += b.CT
 	g.TotalTokens += b.TT
+	g.CachedTokens += b.CachedT
 	g.latSum += b.LatMs
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS
@@ -348,6 +365,9 @@ func (g *aggAcc) finish() Agg {
 	}
 	if g.tpsSamples > 0 {
 		a.AvgTPS = g.tpsSum / float64(g.tpsSamples)
+	}
+	if a.PromptTokens > 0 {
+		a.CacheHitRate = float64(a.CachedTokens) / float64(a.PromptTokens) * 100
 	}
 	return a
 }
@@ -373,6 +393,7 @@ type Snapshot struct {
 	ByRealm   []KeyedAgg `json:"by_realm"`
 	ByAccount []KeyedAgg `json:"by_account"`
 	ByModel   []KeyedAgg `json:"by_model"`
+	ByToken   []KeyedAgg `json:"by_token,omitempty"`
 	Series    []Point    `json:"series"`
 	Buckets   int        `json:"buckets"`
 	FileBytes int64      `json:"file_bytes"`
@@ -411,6 +432,7 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 	acctAgg := map[string]*aggAcc{}
 	acctRealm := map[string]string{}
 	modelAgg := map[string]*aggAcc{}
+	tokenAgg := map[string]*aggAcc{}
 	hourSeries := map[string]*aggAcc{}
 	daySeries := map[string]*aggAcc{}
 
@@ -465,6 +487,15 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 		}
 		modelAgg[b.Model].add(b)
 
+		tk := b.TokenKey
+		if tk == "" {
+			tk = "master"
+		}
+		if tokenAgg[tk] == nil {
+			tokenAgg[tk] = &aggAcc{}
+		}
+		tokenAgg[tk].add(b)
+
 		if strings.HasPrefix(b.Scope, "h:") {
 			scope := strings.TrimPrefix(b.Scope, "h:")
 			if hourSeries[scope] == nil {
@@ -487,6 +518,7 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 			return k, nicks[k]
 		}),
 		ByModel:   keyed(modelAgg, func(k string) (string, string) { return k, "" }),
+		ByToken:   keyed(tokenAgg, func(k string) (string, string) { return k, "" }),
 		Buckets:   matched,
 		Generated: time.Now().Format(time.RFC3339),
 	}

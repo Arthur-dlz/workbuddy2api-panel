@@ -367,27 +367,49 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   .nav ul { display: flex; padding: 8px; } .nav .sig { border: none; }
   .stat { border-right: none; border-bottom: 1px solid var(--line-soft); }
 }
-  /* ── 用量视图 ───────────────────────────────────────────────── */
-  .uschart { border: 1px solid var(--line-soft); border-radius: 8px; overflow: hidden; }
-  .uschart-hd { display: flex; align-items: center; gap: 10px; padding: 9px 12px;
-    border-bottom: 1px solid var(--line-soft); font-size: 12px; }
-  .uschart-hd .lb { color: var(--ink-2); font-weight: 550; }
-  .uschart-hd .legend { color: var(--ink-3); font-size: 11.5px; display: flex; align-items: center; gap: 5px; }
-  .uschart-hd .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-left: 8px; }
-  .uschart-hd .sw-p { background: var(--accent); }
-  .uschart-hd .sw-c { background: var(--ok); }
-  .uschart-body { padding: 10px 12px 6px; }
-  .uschart-body svg { display: block; width: 100%; height: auto; }
-  .uschart-body .ax { stroke: var(--line-soft); stroke-width: 1; }
-  .uschart-body .gl { stroke: var(--line-soft); stroke-width: 1; stroke-dasharray: 2 3; opacity: .7; }
-  .uschart-body .tk { fill: var(--ink-3); font: 10px var(--mono); }
-  .uschart-body .us-empty { padding: 28px 0; text-align: center; color: var(--ink-3); font-size: 12.5px; }
-  /* 用量表内的 prompt/completion 小条。必须限定在 .us-wrapbar 内：账号池积分条
-     也叫 .bar（块级容器 + 百分比内条），同优先级下这里的全局 .bar 会覆盖它，
-     把积分条塌成 min-width 的一个小点（v1.9.0 回归）。 */
+  /* ── DeepSeek 风格用量视图 ───────────────────────────────────────── */
+  .ds-top-bar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-bottom: 16px; }
+  .ds-pill-select {
+    display: inline-flex; align-items: center; gap: 6px; background: var(--raise);
+    border: 1px solid var(--line-soft); border-radius: 20px; padding: 4px 12px; font-size: 13px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+  }
+  .ds-pill-select select { border: none; background: transparent; font-size: 13px; font-weight: 500; color: var(--ink); outline: none; cursor: pointer; }
+  .ds-kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px; margin-bottom: 16px; }
+  @media (max-width: 900px) { .ds-kpi-grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 500px) { .ds-kpi-grid { grid-template-columns: 1fr; } }
+  .ds-kpi-card {
+    background: var(--raise); border: 1px solid var(--line-soft); border-radius: 12px;
+    padding: 16px 18px; box-shadow: 0 1px 3px rgba(0,0,0,0.03); display: flex; flex-direction: column; justify-content: space-between;
+  }
+  .ds-kpi-card .lbl { font-size: 13px; color: var(--ink-2); margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between; }
+  .ds-kpi-card .val { font-size: 26px; font-weight: 700; color: var(--ink); font-family: var(--mono); line-height: 1.2; }
+  .ds-kpi-card .sub { font-size: 12px; color: var(--ink-3); margin-top: 6px; }
+
+  .ds-charts-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 16px; }
+  @media (max-width: 860px) { .ds-charts-grid { grid-template-columns: 1fr; } }
+  .ds-chart-box {
+    background: var(--raise); border: 1px solid var(--line-soft); border-radius: 12px;
+    padding: 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.03); overflow: hidden;
+  }
+  .ds-chart-hd { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
+  .ds-chart-hd .title-group { display: flex; align-items: baseline; gap: 8px; }
+  .ds-chart-hd .title { font-size: 14px; font-weight: 600; color: var(--ink); }
+  .ds-chart-hd .metric { font-size: 18px; font-weight: 700; font-family: var(--mono); color: var(--ink); }
+  .ds-chart-hd .legend { font-size: 11.5px; color: var(--ink-3); display: flex; align-items: center; gap: 8px; }
+  .ds-chart-hd .sw { width: 8px; height: 8px; border-radius: 2px; display: inline-block; margin-right: 4px; }
+
+  .ds-chart-body { width: 100%; height: 180px; position: relative; }
+  .ds-chart-body svg { display: block; width: 100%; height: 100%; overflow: visible; }
+  .ds-chart-body .gl { stroke: var(--line-soft); stroke-width: 1; stroke-dasharray: 2 4; opacity: .8; }
+  .ds-chart-body .ax { stroke: var(--line-soft); stroke-width: 1; }
+  .ds-chart-body .tk { fill: var(--ink-3); font: 10.5px var(--mono); }
+  .ds-chart-body .us-empty { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--ink-3); font-size: 13px; }
+
+  /* 用量表内的 prompt/completion 小条 */
   .us-wrapbar .bar { display: inline-block; height: 6px; border-radius: 3px; min-width: 2px; vertical-align: middle; }
-  .us-wrapbar .bar-p { background: var(--accent); }
-  .us-wrapbar .bar-c { background: var(--ok); }
+  .us-wrapbar .bar-p { background: #2563eb; }
+  .us-wrapbar .bar-c { background: #10b981; }
   .us-wrapbar { display: flex; gap: 2px; align-items: center; min-width: 90px; }
 
   /* ── 积分构成 ───────────────────────────────────────────────── */
@@ -465,7 +487,10 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         任务中心</a></li>
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
-        模型与档位</a></li>
+        模型路由</a></li>
+      <li><a href="#tokens" data-view="tokens">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="6" cy="7" r="3"/><path d="m8.5 9.5 4.5 4.5M10.5 11.5l1.5-1.5M12 13l1.5-1.5"/></svg>
+        API 令牌</a></li>
       <li><a href="#config" data-view="config">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
         配置</a></li>
@@ -556,20 +581,66 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
     </section>
 
-    <!-- 模型与档位 -->
+    <!-- 模型路由 -->
     <section class="view" id="view-models" hidden>
       <div class="box">
         <header>
-          <h3>模型能力 <span class="hint">max_tokens bug已修复目前可以正常透传最大输出,但是官方返回的最大输出仅为参考，不保证完全正确
-          </span></h3>
+          <h3>模型中转路由 <span class="hint">自定义对外 API 模型名、上游转发目标、故障转移重试、单模型并发与速率限制</span></h3>
+          <span class="grow"></span>
+          <button class="xs primary" id="btnAddRoute">添加路由</button>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc md" id="tblRoutes">
+          <thead><tr>
+            <th>状态</th>
+            <th>外部模型 (ID)</th>
+            <th>上游目标模型</th>
+            <th>故障转移 (Fallbacks)</th>
+            <th>限流 / 并发</th>
+            <th>思考输出</th>
+            <th>备注</th>
+            <th class="c-acts">操作</th>
+          </tr></thead>
+          <tbody id="routesBody"></tbody>
+        </table>
+        </div>
+      </div>
+
+      <div class="box">
+        <header>
+          <h3>上游可用模型能力 <span class="hint">max_tokens bug已修复目前可以正常透传最大输出,但是官方返回的最大输出仅为参考，不保证完全正确</span></h3>
           <span class="grow"></span>
           <span class="note" id="mdNote">实时查询上游</span>
           <button class="xs" id="btnModels">重新获取</button>
         </header>
         <div class="tbl-wrap">
-        <table class="acc md">
-          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
+        <table class="acc md" id="tblModels">
+          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th><th class="c-acts">快捷操作</th></tr></thead>
           <tbody id="mdBody"></tbody>
+        </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- API 令牌 -->
+    <section class="view" id="view-tokens" hidden>
+      <div class="box">
+        <header>
+          <h3>API 访问令牌 <span class="hint">生成多客户端独立调用的 API Key，支持限定可用模型与单独速率</span></h3>
+          <span class="grow"></span>
+          <button class="xs primary" id="btnAddToken">新建令牌</button>
+        </header>
+        <div class="tbl-wrap">
+        <table class="acc md" id="tblTokens">
+          <thead><tr>
+            <th>状态</th>
+            <th>令牌名称</th>
+            <th>绑定真实模型</th>
+            <th>API 密钥 (Key)</th>
+            <th>限制 (RPM)</th>
+            <th class="c-acts">操作</th>
+          </tr></thead>
+          <tbody id="tokensBody"></tbody>
         </table>
         </div>
       </div>
@@ -600,30 +671,76 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 
     <!-- 用量 -->
     <section class="view" id="view-usage" hidden>
-      <div class="box">
-        <header>
-          <h3>用量总览</h3>
-          <span class="grow"></span>
-          <span class="note" id="usNote">—</span>
-          <select id="usWindow" class="xs">
+      <!-- DeepSeek 风格顶部筛选条 -->
+      <div class="ds-top-bar">
+        <div class="ds-pill-select">
+          <span style="color:var(--ink-3);">时间维度</span>
+          <select id="usWindow">
             <option value="24">近 24 小时</option>
             <option value="72" selected>近 3 天</option>
             <option value="168">近 7 天</option>
             <option value="720">近 30 天</option>
             <option value="0">全部历史</option>
           </select>
-          <button class="xs" id="btnUsage">刷新</button>
-        </header>
-        <div class="stats" id="usStats"></div>
-        <div class="pad">
-          <div class="uschart">
-            <div class="uschart-hd">
-              <span class="lb">Token 时序</span>
-              <span class="grow"></span>
-              <span class="legend"><i class="sw sw-p"></i>prompt<i class="sw sw-c"></i>completion</span>
+        </div>
+        <div class="ds-pill-select">
+          <span style="color:var(--ink-3);">API 令牌</span>
+          <select id="usTokenFilter">
+            <option value="">全部令牌</option>
+          </select>
+        </div>
+        <span class="grow"></span>
+        <span class="note" id="usNote" style="font-size:12px;">—</span>
+        <button class="xs ghost" id="btnUsage" style="border-radius:20px;padding:4px 14px;">刷新</button>
+      </div>
+
+      <!-- DeepSeek 风格核心 KPI 卡片 -->
+      <div class="ds-kpi-grid" id="dsKpiGrid"></div>
+
+      <!-- DeepSeek 风格双图表网格 -->
+      <div class="ds-charts-grid">
+        <!-- 左图：API 请求次数面积图 -->
+        <div class="ds-chart-box">
+          <div class="ds-chart-hd">
+            <div class="title-group">
+              <span class="title">API 请求次数</span>
+              <span class="metric" id="chartReqTotal">0</span>
             </div>
-            <div id="usChart" class="uschart-body"></div>
           </div>
+          <div class="ds-chart-body" id="chartReqArea"></div>
+        </div>
+
+        <!-- 右图：Tokens 消耗与缓存堆叠柱状图 -->
+        <div class="ds-chart-box">
+          <div class="ds-chart-hd">
+            <div class="title-group">
+              <span class="title">Tokens 消耗</span>
+              <span class="metric" id="chartTokTotal">0</span>
+            </div>
+            <div class="legend">
+              <span><i class="sw" style="background:#2563eb;"></i>Prompt</span>
+              <span><i class="sw" style="background:#60a5fa;"></i>Cache命中</span>
+              <span><i class="sw" style="background:#10b981;"></i>Completion</span>
+            </div>
+          </div>
+          <div class="ds-chart-body" id="chartTokBar"></div>
+        </div>
+      </div>
+
+      <div class="box">
+        <header><h3>按 API 访问令牌 (缓存命中率与用量排行)</h3><span class="grow"></span>
+          <span class="note">展示各客户端 Key 的 Token 消耗与长上下文 Prompt Cache 命中效益</span></header>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th><th>API 令牌</th>
+              <th class="num">请求</th><th class="num">失败</th>
+              <th class="num">Prompt (总)</th><th class="num">缓存命中</th><th class="num">缓存命中率</th>
+              <th class="num">Completion</th><th class="num">合计 Token</th>
+              <th class="num">节省积分估算</th>
+            </tr></thead>
+            <tbody id="usTokenBody"></tbody>
+          </table>
         </div>
       </div>
 
@@ -680,16 +797,33 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="pad">
             <div class="grid2">
               <label class="fld"><span class="lb">监听地址</span>
-                <input name="listen" placeholder=":7863">
+                <input name="listen" placeholder=":9527">
                 <span class="hint">改动需重启进程</span></label>
+              <label class="fld"><span class="lb">服务端口 (Port)</span>
+                <input name="port" type="number" min="1" max="65535" placeholder="9527">
+                <span class="hint">改动需重启进程（避免端口冲突）</span></label>
+            </div>
+            <div class="grid2">
               <label class="fld"><span class="lb">API 密钥</span>
                 <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 不鉴权">
                 <button type="button" class="xs" id="btnEye">显示</button></div>
                 <span class="hint">立即生效（含面板自身）</span></label>
+              <label class="fld"><span class="lb">单账号明细默认展示条数</span>
+                <input name="package_detail_limit" type="number" min="1" placeholder="5">
+                <span class="hint">积分构成页按最早到期展示，其余未用完包聚合</span></label>
             </div>
-            <label class="fld"><span class="lb">单账号明细默认展示条数</span>
-              <input name="package_detail_limit" type="number" min="1" placeholder="5">
-              <span class="hint">积分构成页按最早到期展示，其余未用完包聚合</span></label>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>自定义模型映射</h3></header>
+          <div class="pad">
+            <label class="fld"><span class="lb">模型别名映射 (JSON 对象)</span>
+              <textarea name="models_json" rows="4" style="font-family:monospace;font-size:12px;" placeholder='{
+  "deepseek-chat": "deepseek-v4-pro",
+  "deepseek-reasoner": "deepseek-v4-pro"
+}'></textarea>
+              <span class="hint">支持热生效无需重启。请求别名将映射至对应上游模型；含 reasoner 或 -r1 别名自动开启思考并流式返回 reasoning_content。</span></label>
           </div>
         </div>
 
@@ -976,6 +1110,166 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <footer>
       <span class="grow"></span>
       <button class="primary" id="btnKey">进入</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 路由编辑/添加弹窗 -->
+<div class="veil" id="routeVeil">
+  <div class="dlg" style="width:580px">
+    <header>
+      <h3 id="routeModalTitle">添加模型路由</h3>
+      <div class="hint">配置外部客户端请求的模型映射到上游模型及流量治理规则。</div>
+    </header>
+    <div class="body">
+      <form id="routeForm">
+        <input type="hidden" id="routeEditIndex" value="-1">
+        <div class="grid2">
+          <label class="fld"><span class="lb">外部模型 ID (客户端调用名)</span>
+            <input id="routeId" required placeholder="如 deepseek-chat 或 gpt-4o">
+            <span class="hint">客户端请求传入的 model 参数</span>
+          </label>
+          <label class="fld"><span class="lb">上游目标模型 (Target)</span>
+            <select id="routeTargetSelect" style="margin-bottom:4px;">
+              <option value="">-- 选择腾讯官方真实模型 (动态拉取) --</option>
+            </select>
+            <input id="routeTarget" required placeholder="如 deepseek-v4-pro 或从上方下拉选择" list="targetModelList">
+            <datalist id="targetModelList"></datalist>
+            <span class="hint">实际调用的 WorkBuddy 腾讯官方真实模型</span>
+          </label>
+        </div>
+        <div style="margin-top:-6px;margin-bottom:12px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;">
+          <span style="font-size:11.5px;color:var(--ink-3);">快捷预设:</span>
+          <button type="button" class="xs chip route-preset" data-id="deepseek-chat" data-target="deepseek-v4-pro">deepseek-v4-pro (旗舰1M)</button>
+          <button type="button" class="xs chip route-preset" data-id="kimi-code" data-target="kimi-k3-1" data-reasoning="force_on">kimi-k3-1 (代码1M)</button>
+          <button type="button" class="xs chip route-preset" data-id="glm-flagship" data-target="glm-5.3" data-reasoning="force_on">glm-5.3 (旗舰)</button>
+          <button type="button" class="xs chip route-preset" data-id="hunyuan-reasoner" data-target="hy4-preview" data-reasoning="force_on">hy4-preview (思考)</button>
+          <button type="button" class="xs chip route-preset" data-id="minimax-m3" data-target="minimax-m3">minimax-m3 (多模态)</button>
+          <button type="button" class="xs chip route-preset" data-id="glm-night" data-target="glm-5.2">glm-5.2 (夜间省流)</button>
+          <button type="button" class="xs chip route-preset" data-id="deepseek-flash" data-target="deepseek-v4-flash">deepseek-v4-flash (极速)</button>
+        </div>
+        <label class="fld"><span class="lb">故障转移备用模型 (Fallbacks) - 自动降级切号</span>
+          <div style="display:flex;gap:6px;margin-bottom:6px;">
+            <select id="routeFallbackSelect" style="flex:1;">
+              <option value="">-- 从上游真实模型中自选备用降级模型 --</option>
+            </select>
+            <button type="button" class="xs ghost" id="btnAddFallbackModel">+ 添加到备用列表</button>
+            <button type="button" class="xs ghost danger" id="btnClearFallbacks">清空</button>
+          </div>
+          <input id="routeFallbacks" placeholder="按序降级尝试，如: kimi-k3-1, glm-5.3, deepseek-v4-flash" list="targetModelList">
+          <div id="routeFallbackChips" style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap;align-items:center;"></div>
+          <span class="hint">全池账号主模型429或额度耗尽时，按序降级到上述备选模型并记录恢复时间；冷却到期后自动升级回主模型</span>
+        </label>
+        <div class="grid2">
+          <label class="fld"><span class="lb">单模型最大并发 (Max In Flight)</span>
+            <input id="routeMaxInFlight" type="number" min="0" placeholder="0 = 不限">
+            <span class="hint">超过此在途并发直接返回 429</span>
+          </label>
+          <label class="fld"><span class="lb">单模型速率限制 (RPM)</span>
+            <input id="routeRPM" type="number" min="0" placeholder="0 = 不限">
+            <span class="hint">每分钟允许的最大请求数</span>
+          </label>
+        </div>
+        <div class="grid2">
+          <label class="fld"><span class="lb">思考模式 (Reasoning)</span>
+            <select id="routeReasoning">
+              <option value="auto">自动 (跟随模型支持)</option>
+              <option value="force_on">强制开启 reasoning_content</option>
+              <option value="force_off">强制关闭思考</option>
+            </select>
+          </label>
+          <label class="fld"><span class="lb">思考深度档位 (Effort)</span>
+            <select id="routeEffort">
+              <option value="">默认 (不指定)</option>
+              <option value="low">low (轻量)</option>
+              <option value="medium">medium (中等)</option>
+              <option value="high">high (深度)</option>
+            </select>
+          </label>
+        </div>
+        <label class="fld"><span class="lb">备注说明</span>
+          <input id="routeDesc" placeholder="简短备注（如：Cursor 常用 / 编码主路由）">
+        </label>
+        <div class="switch"><span class="lb">启用此路由</span>
+          <input type="checkbox" id="routeEnabled" checked>
+        </div>
+      </form>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button type="button" id="btnCancelRoute">取消</button>
+      <button type="button" class="primary" id="btnSaveRoute">保存路由</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 令牌编辑/添加弹窗 -->
+<div class="veil" id="tokenVeil">
+  <div class="dlg" style="width:520px">
+    <header>
+      <h3 id="tokenModalTitle">新建 API 令牌</h3>
+      <div class="hint">为特定客户端或用户创建独立的 API Key。</div>
+    </header>
+    <div class="body">
+      <form id="tokenForm">
+        <input type="hidden" id="tokenEditIndex" value="-1">
+        <label class="fld"><span class="lb">令牌名称 / 用途</span>
+          <input id="tokenName" required placeholder="如：Cursor 编辑器 / 个人日常 / 研发测试">
+        </label>
+        <label class="fld"><span class="lb">API 密钥 (Key)</span>
+          <div class="inline">
+            <input id="tokenKey" required placeholder="sk-..." style="font-family:var(--mono);">
+            <button type="button" class="xs" id="btnGenTokenKey">随机生成</button>
+          </div>
+          <span class="hint">调用 /v1/chat/completions 时通过 Bearer 请求头传入</span>
+        </label>
+        <label class="fld"><span class="lb">绑定上游真实模型 (唯一绑定)</span>
+          <div class="inline">
+            <select id="tokenBindModel" required style="flex:1;">
+              <option value="">-- 请选择腾讯官方真实模型 (动态拉取) --</option>
+            </select>
+            <button type="button" class="xs" id="btnRefreshUpstreamModels">🔄 刷新模型</button>
+          </div>
+          <span class="hint">【核心机制】该 API Key 与所选腾讯官方真实模型 1:1 绝对锁定！客户端导入时模型名可填任意名称（或 default），网关一律精准分发至该真实模型。</span>
+        </label>
+        <details style="margin-bottom:12px;font-size:12px;">
+          <summary style="cursor:pointer;color:var(--ink-3);">高级选项：模型访问白名单 (非绑定模式时生效)</summary>
+          <label class="fld" style="margin-top:8px;"><span class="lb">允许访问的模型列表</span>
+            <input id="tokenModels" placeholder="若绑定了真实模型则忽略此项；留空=所有模型；逗号分隔">
+            <span class="hint">白名单限制。客户端请求未授权模型将被拒绝 (403)</span>
+          </label>
+        </details>
+        <label class="fld"><span class="lb">速率限制 (RPM)</span>
+          <input id="tokenRPM" type="number" min="0" placeholder="0 = 遵循全局或单模型限制">
+          <span class="hint">该令牌每分钟允许的最大请求数</span>
+        </label>
+        <div class="switch"><span class="lb">启用此令牌</span>
+          <input type="checkbox" id="tokenEnabled" checked>
+        </div>
+      </form>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button type="button" id="btnCancelToken">取消</button>
+      <button type="button" class="primary" id="btnSaveToken">保存令牌</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 路由测试弹窗 -->
+<div class="veil" id="testVeil">
+  <div class="dlg" style="width:580px">
+    <header>
+      <h3>模型连通性测试 <span class="hint" id="testModelName"></span></h3>
+      <div class="hint">向本地网关发送一个简短测试请求，验证模型映射与上游响应。</div>
+    </header>
+    <div class="body">
+      <div id="testStatus" class="state"><span class="dots">正在向网关发送测试请求</span></div>
+      <pre id="testResult" style="max-height:240px;overflow:auto;font:11.5px/1.4 var(--mono);background:var(--surface-2);padding:10px;border-radius:6px;border:1px solid var(--line-soft);white-space:pre-wrap;" hidden></pre>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button class="primary" id="btnCloseTest">关闭</button>
     </footer>
   </div>
 </div>
