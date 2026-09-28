@@ -2524,10 +2524,13 @@ function renderReqAreaChart(series, hours) {
   // 关键数据节点小圆圈（点数多时只渲染有请求的峰值点和端点，保持清爽专业）
   for (const c of coords) {
     if (c.s.req > 0 || coords.length <= 15) {
-      out += `<circle cx="${c.x.toFixed(1)}" cy="${c.y.toFixed(1)}" r="3" fill="#ffffff" stroke="#2563eb" stroke-width="2">` +
-        `<title>${esc(c.s.raw)}: ${c.s.req} 次请求</title></circle>`;
+      out += `<circle cx="${c.x.toFixed(1)}" cy="${c.y.toFixed(1)}" r="3" fill="#ffffff" stroke="#2563eb" stroke-width="2"/>`;
     }
   }
+
+  // 悬浮交互指示虚线与高亮圆点
+  out += `<line class="ch-line" id="reqCrosshair" x1="0" y1="${PT}" x2="0" y2="${PT + ih}"/>`;
+  out += `<circle class="ch-dot" id="reqHighlightDot" cx="0" cy="0" r="5" fill="#2563eb" stroke="#ffffff" stroke-width="2.5"/>`;
 
   // X 轴基线
   out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) + '" y2="' + (PT + ih) + '"/>';
@@ -2544,7 +2547,90 @@ function renderReqAreaChart(series, hours) {
   }
 
   out += '</svg>';
+  out += '<div class="ds-chart-tip" id="reqTip"></div>';
   host.innerHTML = out;
+
+  // 悬停交互事件绑定
+  const tip = host.querySelector('#reqTip');
+  const crosshair = host.querySelector('#reqCrosshair');
+  const dot = host.querySelector('#reqHighlightDot');
+
+  const hideTip = () => {
+    if (crosshair) crosshair.style.opacity = '0';
+    if (dot) dot.style.opacity = '0';
+    if (tip) tip.style.opacity = '0';
+  };
+
+  host.onmouseleave = hideTip;
+  host.onmousemove = (e) => {
+    const rect = host.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
+    const scaleX = W / rect.width;
+    const svgX = mouseX * scaleX;
+
+    if (svgX < PL - 15 || svgX > W - PR + 15 || mouseY < 0 || mouseY > rect.height) {
+      hideTip();
+      return;
+    }
+
+    let bestIdx = 0;
+    let minD = Infinity;
+    for (let i = 0; i < coords.length; i++) {
+      const d = Math.abs(coords[i].x - svgX);
+      if (d < minD) {
+        minD = d;
+        bestIdx = i;
+      }
+    }
+
+    const c = coords[bestIdx];
+    const s = c.s;
+
+    if (crosshair) {
+      crosshair.setAttribute('x1', c.x.toFixed(1));
+      crosshair.setAttribute('x2', c.x.toFixed(1));
+      crosshair.style.opacity = '1';
+    }
+    if (dot) {
+      dot.setAttribute('cx', c.x.toFixed(1));
+      dot.setAttribute('cy', c.y.toFixed(1));
+      dot.style.opacity = '1';
+    }
+
+    if (tip) {
+      const dateStr = isHourly
+        ? s.raw.replace('T', ' ') + ':00'
+        : s.raw.slice(0, 10);
+      tip.innerHTML = `
+        <div class="tip-title">${esc(dateStr)}</div>
+        <div class="tip-row">
+          <span class="tip-label"><i class="sw" style="background:#2563eb;"></i>请求总数</span>
+          <span class="tip-val" style="color:#2563eb;">${fmtTok(s.req)} 次</span>
+        </div>
+        <div class="tip-row">
+          <span class="tip-label"><i class="sw" style="background:var(--ink-3);"></i>消耗 Token</span>
+          <span class="tip-val">${fmtTok(s.tt)}</span>
+        </div>
+      `;
+
+      const tipW = tip.offsetWidth || 140;
+      const cssX = (c.x / W) * rect.width;
+      const cssY = (c.y / H) * rect.height;
+
+      let leftPx = cssX + 12;
+      if (leftPx + tipW > rect.width - 8) {
+        leftPx = cssX - tipW - 12;
+      }
+      let topPx = Math.max(6, Math.min(rect.height - 70, cssY - 26));
+
+      tip.style.left = Math.max(4, leftPx) + 'px';
+      tip.style.top = topPx + 'px';
+      tip.style.opacity = '1';
+    }
+  };
 }
 
 /* 2. DeepSeek 风格：Tokens 消耗与缓存堆叠柱状图（支持类型/模型双维度 + 日历补零 + 防重叠） */
@@ -2565,6 +2651,9 @@ function renderTokBarChart(series, hours) {
   const maxVal = Math.max(10, ...slots.map(s => s.tt));
   let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="none">';
 
+  // 悬停背景光柱 (Hover Band)
+  out += `<rect class="ch-band" id="tokHoverBand" x="0" y="${PT}" width="0" height="${ih}"/>`;
+
   // 3. y 轴 3 条横向刻度线 + 文字（保持 8px 以上安全 Padding，数值四舍五入）
   for (let i = 0; i <= 3; i++) {
     const y = PT + ih - (ih * i / 3);
@@ -2577,6 +2666,12 @@ function renderTokBarChart(series, hours) {
   const minGap = Math.max(2, Math.min(6, slotWidth * 0.25));
   const bw = Math.max(3, Math.min(24, slotWidth - minGap));
 
+  // 模型模式颜色映射及 Top 模型
+  let top4 = [];
+  const MODEL_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6'];
+  const COLOR_OTHER = '#94a3b8';
+  const modelColorMap = {};
+
   // 5. 根据模式分支渲染
   if (currentTokChartMode === 'model') {
     // ── 按模型模式 ──
@@ -2588,11 +2683,8 @@ function renderTokBarChart(series, hours) {
       }
     }
     const sortedModels = Object.keys(modelTotals).sort((a, b) => modelTotals[b] - modelTotals[a]);
-    const top4 = sortedModels.slice(0, 4);
+    top4 = sortedModels.slice(0, 4);
 
-    const MODEL_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6'];
-    const COLOR_OTHER = '#94a3b8';
-    const modelColorMap = {};
     top4.forEach((m, idx) => {
       modelColorMap[m] = MODEL_COLORS[idx % MODEL_COLORS.length];
     });
@@ -2681,13 +2773,7 @@ function renderTokBarChart(series, hours) {
         currY -= bucket.h;
         barSvg += `<rect x="${x.toFixed(1)}" y="${currY.toFixed(1)}" width="${bw.toFixed(1)}" height="${bucket.h.toFixed(1)}" fill="${bucket.color}"${rxAttr}/>`;
       }
-
-      let tip = `${esc(s.raw)}\n`;
-      for (const b of slotBuckets) {
-        tip += `${esc(b.name)}: ${fmtTok(b.tokens)}\n`;
-      }
-      tip += `合计: ${fmtTok(s.tt)} Tokens`;
-      out += `<g>${barSvg}<title>${tip}</title></g>`;
+      out += `<g>${barSvg}</g>`;
     }
   } else {
     // ── 按类型模式 ──
@@ -2741,9 +2827,7 @@ function renderTokBarChart(series, hours) {
         currY -= seg.h;
         barSvg += `<rect x="${x.toFixed(1)}" y="${currY.toFixed(1)}" width="${bw.toFixed(1)}" height="${seg.h.toFixed(1)}" fill="${seg.fill}"${rxAttr}/>`;
       }
-
-      const tip = `${esc(s.raw)}\nPrompt: ${fmtTok(s.pt)} (Cache: ${fmtTok(s.cached)})\nCompletion: ${fmtTok(s.ct)}\n合计: ${fmtTok(s.tt)} Tokens`;
-      out += `<g>${barSvg}<title>${tip}</title></g>`;
+      out += `<g>${barSvg}</g>`;
     }
   }
 
@@ -2754,7 +2838,7 @@ function renderTokBarChart(series, hours) {
   for (let k = 0; k <= 3; k++) {
     const t = t0 + span * (k / 3);
     const d = new Date(t);
-    const lab = (hours <= 24)
+    const lab = isHourly
       ? String(d.getHours()).padStart(2, '0') + ':00'
       : (d.getMonth() + 1) + '/' + d.getDate();
     const cx = PL + (k / 3) * iw;
@@ -2762,7 +2846,122 @@ function renderTokBarChart(series, hours) {
   }
 
   out += '</svg>';
+  out += '<div class="ds-chart-tip" id="tokTip"></div>';
   host.innerHTML = out;
+
+  // 悬停交互事件绑定
+  const tip = host.querySelector('#tokTip');
+  const hoverBand = host.querySelector('#tokHoverBand');
+
+  const hideTip = () => {
+    if (hoverBand) hoverBand.style.opacity = '0';
+    if (tip) tip.style.opacity = '0';
+  };
+
+  host.onmouseleave = hideTip;
+  host.onmousemove = (e) => {
+    const rect = host.getBoundingClientRect();
+    if (!rect.width || !rect.height) return;
+    const mouseX = e.clientX - rect.left;
+    const mouseY = e.clientY - rect.top;
+
+    const scaleX = W / rect.width;
+    const svgX = mouseX * scaleX;
+
+    if (svgX < PL - 10 || svgX > W - PR + 10 || mouseY < 0 || mouseY > rect.height) {
+      hideTip();
+      return;
+    }
+
+    let idx = Math.floor((svgX - PL) / slotWidth);
+    if (idx < 0) idx = 0;
+    if (idx >= slots.length) idx = slots.length - 1;
+
+    const s = slots[idx];
+    const bandX = PL + idx * slotWidth;
+
+    if (hoverBand) {
+      hoverBand.setAttribute('x', bandX.toFixed(1));
+      hoverBand.setAttribute('width', slotWidth.toFixed(1));
+      hoverBand.style.opacity = '1';
+    }
+
+    if (tip) {
+      const dateStr = isHourly
+        ? s.raw.replace('T', ' ') + ':00'
+        : s.raw.slice(0, 10);
+      let content = `<div class="tip-title">${esc(dateStr)}</div>`;
+
+      if (currentTokChartMode === 'model') {
+        content += `
+          <div class="tip-row" style="margin-bottom:6px;">
+            <span class="tip-label">总消耗 Token</span>
+            <span class="tip-val" style="color:var(--ink);">${fmtTok(s.tt)}</span>
+          </div>
+        `;
+        const mEntries = Object.entries(s.models || {}).filter(([_, v]) => v > 0);
+        mEntries.sort((a, b) => b[1] - a[1]);
+        if (mEntries.length > 0) {
+          const topList = mEntries.slice(0, 4);
+          for (const [mName, mTok] of topList) {
+            const color = modelColorMap[mName] || COLOR_OTHER;
+            const shortName = mName.length > 13 ? mName.slice(0, 12) + '…' : mName;
+            content += `
+              <div class="tip-row">
+                <span class="tip-label" title="${esc(mName)}"><i class="sw" style="background:${color};"></i>${esc(shortName)}</span>
+                <span class="tip-val">${fmtTok(mTok)}</span>
+              </div>
+            `;
+          }
+          const otherSum = mEntries.slice(4).reduce((acc, cur) => acc + cur[1], 0);
+          if (otherSum > 0) {
+            content += `
+              <div class="tip-row">
+                <span class="tip-label"><i class="sw" style="background:${COLOR_OTHER};"></i>其他模型</span>
+                <span class="tip-val">${fmtTok(otherSum)}</span>
+              </div>
+            `;
+          }
+        } else {
+          content += `<div class="tip-row"><span class="tip-label" style="color:var(--ink-3);">无模型消耗明细</span></div>`;
+        }
+      } else {
+        const hr = s.pt > 0 ? (s.cached / s.pt * 100) : 0;
+        content += `
+          <div class="tip-row" style="margin-bottom:6px;">
+            <span class="tip-label">总消耗 Token</span>
+            <span class="tip-val" style="color:var(--ink);">${fmtTok(s.tt)}</span>
+          </div>
+          <div class="tip-row">
+            <span class="tip-label"><i class="sw" style="background:#2563eb;"></i>Prompt</span>
+            <span class="tip-val">${fmtTok(s.pt)}</span>
+          </div>
+          <div class="tip-row">
+            <span class="tip-label"><i class="sw" style="background:#60a5fa;"></i>Cache 命中</span>
+            <span class="tip-val" style="color:#2563eb;">${fmtTok(s.cached)} <span style="font-size:10px;font-weight:normal;color:var(--ink-3)">(${hr.toFixed(0)}%)</span></span>
+          </div>
+          <div class="tip-row">
+            <span class="tip-label"><i class="sw" style="background:#10b981;"></i>Completion</span>
+            <span class="tip-val" style="color:#10b981;">${fmtTok(s.ct)}</span>
+          </div>
+        `;
+      }
+
+      tip.innerHTML = content;
+
+      const tipW = tip.offsetWidth || 150;
+      const cssX = ((bandX + slotWidth / 2) / W) * rect.width;
+      let leftPx = cssX + 12;
+      if (leftPx + tipW > rect.width - 8) {
+        leftPx = cssX - tipW - 12;
+      }
+      const topPx = Math.max(6, Math.min(rect.height - 85, mouseY - 30));
+
+      tip.style.left = Math.max(4, leftPx) + 'px';
+      tip.style.top = topPx + 'px';
+      tip.style.opacity = '1';
+    }
+  };
 }
 
 async function loadUsage() {
