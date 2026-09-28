@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/DGZSbot/ai-icon/refs/heads/main/WorkBuddy.png" alt="WorkBuddy Gateway" width="120">
+  <img src="assets/logo/dalizi_logo.png" alt="WorkBuddy Gateway" width="130" style="border-radius: 16px;">
 </p>
 
 <h1 align="center">WorkBuddy Gateway</h1>
