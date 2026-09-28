@@ -2346,98 +2346,8 @@ function getTimeWindowSpan(pts, hours) {
   return { t0: tMin, t1: tMax, span: Math.max(3600000, tMax - tMin) };
 }
 
-/* 1. DeepSeek 风格：API 请求次数面积折线图 */
-function renderReqAreaChart(series, hours) {
-  const host = $('chartReqArea');
-  if (!host) return;
-
-  const pts = [];
-  for (const p of series) {
-    const t = parsePointTime(p);
-    if (t !== null) pts.push({ t, req: Number(p.requests || 0), raw: p.t, scope: p.scope });
-  }
-
-  if (!pts.length) {
-    host.innerHTML = '<div class="us-empty">暂无请求数据</div>';
-    return;
-  }
-
-  const W = 460, H = 160, PL = 54, PR = 16, PT = 15, PB = 28;
-  const iw = W - PL - PR, ih = H - PT - PB;
-  const { t0, span } = getTimeWindowSpan(pts, hours);
-
-  const maxVal = Math.max(4, ...pts.map(p => p.req));
-  const xOf = t => PL + Math.max(0, Math.min(iw, (t - t0) / span * iw));
-  const yOf = v => PT + ih - (v / maxVal * ih);
-
-  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="none">';
-  out += `<defs>
-    <linearGradient id="reqGrad" x1="0" y1="0" x2="0" y2="1">
-      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.32"/>
-      <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.01"/>
-    </linearGradient>
-  </defs>`;
-
-  // y 轴 3 条干净的横向网格线 + 文字（绝对不和图形重叠，取整格式化）
-  for (let i = 0; i <= 3; i++) {
-    const y = PT + ih - (ih * i / 3);
-    const tickVal = Math.round(maxVal * i / 3);
-    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(1) + '"/>';
-    out += '<text class="tk" x="' + (PL - 8) + '" y="' + (y + 3.5).toFixed(1) + '" text-anchor="end">' + fmtTok(tickVal) + '</text>';
-  }
-
-  // 坐标点计算
-  const coords = pts.map(p => ({ x: xOf(p.t), y: yOf(p.req), p }));
-  // 首尾补全（若窗口较大）
-  let pathD = '';
-  if (coords.length === 1) {
-    const c = coords[0];
-    pathD = `M ${PL} ${PT+ih} L ${c.x - 20} ${PT+ih} L ${c.x} ${c.y} L ${c.x + 20} ${PT+ih} L ${W-PR} ${PT+ih}`;
-  } else {
-    pathD = `M ${coords[0].x.toFixed(1)} ${coords[0].y.toFixed(1)}`;
-    for (let i = 1; i < coords.length; i++) {
-      const prev = coords[i - 1];
-      const cur = coords[i];
-      const mx = (prev.x + cur.x) / 2;
-      pathD += ` C ${mx.toFixed(1)} ${prev.y.toFixed(1)}, ${mx.toFixed(1)} ${cur.y.toFixed(1)}, ${cur.x.toFixed(1)} ${cur.y.toFixed(1)}`;
-    }
-  }
-
-  // 面积填充
-  const areaD = pathD + ` L ${coords[coords.length - 1].x.toFixed(1)} ${(PT + ih).toFixed(1)} L ${coords[0].x.toFixed(1)} ${(PT + ih).toFixed(1)} Z`;
-  out += '<path d="' + areaD + '" fill="url(#reqGrad)"/>';
-  // 曲线轮廓
-  out += '<path d="' + pathD + '" fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round"/>';
-
-  // 关键数据节点小圆圈
-  for (const c of coords) {
-    out += `<circle cx="${c.x.toFixed(1)}" cy="${c.y.toFixed(1)}" r="3" fill="#ffffff" stroke="#2563eb" stroke-width="2">` +
-      `<title>${esc(c.p.raw)}: ${c.p.req} 次请求</title></circle>`;
-  }
-
-  // X 轴基线
-  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) + '" y2="' + (PT + ih) + '"/>';
-
-  // X 轴日期刻度（等间距 4 个标尺，首尾不贴边）
-  for (let k = 0; k <= 3; k++) {
-    const t = t0 + span * (k / 3);
-    const d = new Date(t);
-    const lab = (hours <= 24)
-      ? String(d.getHours()).padStart(2, '0') + ':00'
-      : (d.getMonth() + 1) + '/' + d.getDate();
-    const cx = PL + (k / 3) * iw;
-    out += '<text class="tk" x="' + cx.toFixed(1) + '" y="' + (PT + ih + 15) + '" text-anchor="middle">' + esc(lab) + '</text>';
-  }
-
-  out += '</svg>';
-  host.innerHTML = out;
-}
-
-/* 2. DeepSeek 风格：Tokens 消耗与缓存堆叠柱状图（支持类型/模型双维度 + 日历补零 + 防重叠） */
-function renderTokBarChart(series, hours) {
-  const host = $('chartTokBar');
-  if (!host) return;
-
+/* 核心时序分槽函数：将原始 series 聚合填充入日历槽（hours<=48 为小时槽，>48 为日槽，按天汇总总量） */
+function prepareCalendarSlots(series, hours) {
   const rawPts = [];
   for (const p of series) {
     const t = parsePointTime(p);
@@ -2460,16 +2370,10 @@ function renderTokBarChart(series, hours) {
   }
 
   if (!rawPts.length) {
-    host.innerHTML = '<div class="us-empty">暂无 Token 消耗数据</div>';
-    if ($('chartTokLegend')) $('chartTokLegend').innerHTML = '';
-    return;
+    return { rawPts: [], slots: [], t0: 0, t1: 0, span: 0, isHourly: false };
   }
 
-  const W = 460, H = 160, PL = 54, PR = 16, PT = 15, PB = 28;
-  const iw = W - PL - PR, ih = H - PT - PB;
   const { t0, t1, span } = getTimeWindowSpan(rawPts, hours);
-
-  // 1. 确定粒度：hours <= 48 为小时槽；hours > 48 (及全历史) 为日槽
   const isHourly = (hours > 0 && hours <= 48);
   const pad = n => String(n).padStart(2, '0');
   const slots = [];
@@ -2530,7 +2434,6 @@ function renderTokBarChart(series, hours) {
     }
   }
 
-  // 2. 将 series 聚合填充入对应日历槽（实现日历补零与数据汇总）
   const slotMap = new Map();
   for (const s of slots) {
     slotMap.set(s.key, s);
@@ -2557,6 +2460,108 @@ function renderTokBarChart(series, hours) {
     }
   }
 
+  return { rawPts, slots, t0, t1, span, isHourly };
+}
+
+/* 1. DeepSeek 风格：API 请求次数面积折线图（基于日历时序槽，消除垂直折叠，按日/小时汇总） */
+function renderReqAreaChart(series, hours) {
+  const host = $('chartReqArea');
+  if (!host) return;
+
+  const { slots, t0, span, isHourly } = prepareCalendarSlots(series, hours);
+  if (!slots.length) {
+    host.innerHTML = '<div class="us-empty">暂无请求数据</div>';
+    return;
+  }
+
+  const W = 460, H = 160, PL = 54, PR = 16, PT = 15, PB = 28;
+  const iw = W - PL - PR, ih = H - PT - PB;
+
+  const maxVal = Math.max(4, ...slots.map(s => s.req));
+  const yOf = v => PT + ih - (v / maxVal * ih);
+  const xOf = i => PL + (slots.length > 1 ? (i / (slots.length - 1)) * iw : iw / 2);
+
+  let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="none">';
+  out += `<defs>
+    <linearGradient id="reqGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.32"/>
+      <stop offset="100%" stop-color="#3b82f6" stop-opacity="0.01"/>
+    </linearGradient>
+  </defs>`;
+
+  // y 轴 3 条干净的横向网格线 + 文字（绝对不和图形重叠，取整格式化）
+  for (let i = 0; i <= 3; i++) {
+    const y = PT + ih - (ih * i / 3);
+    const tickVal = Math.round(maxVal * i / 3);
+    out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk" x="' + (PL - 8) + '" y="' + (y + 3.5).toFixed(1) + '" text-anchor="end">' + fmtTok(tickVal) + '</text>';
+  }
+
+  // 坐标点计算（每槽一个聚合点，彻底消除同一天内多小时竖向折线）
+  const coords = slots.map((s, i) => ({ x: xOf(i), y: yOf(s.req), s }));
+
+  // 曲线路径计算
+  let pathD = '';
+  if (coords.length === 1) {
+    const c = coords[0];
+    pathD = `M ${PL} ${PT+ih} L ${c.x - 20} ${PT+ih} L ${c.x} ${c.y} L ${c.x + 20} ${PT+ih} L ${W-PR} ${PT+ih}`;
+  } else {
+    pathD = `M ${coords[0].x.toFixed(1)} ${coords[0].y.toFixed(1)}`;
+    for (let i = 1; i < coords.length; i++) {
+      const prev = coords[i - 1];
+      const cur = coords[i];
+      const mx = (prev.x + cur.x) / 2;
+      pathD += ` C ${mx.toFixed(1)} ${prev.y.toFixed(1)}, ${mx.toFixed(1)} ${cur.y.toFixed(1)}, ${cur.x.toFixed(1)} ${cur.y.toFixed(1)}`;
+    }
+  }
+
+  // 面积填充
+  const areaD = pathD + ` L ${coords[coords.length - 1].x.toFixed(1)} ${(PT + ih).toFixed(1)} L ${coords[0].x.toFixed(1)} ${(PT + ih).toFixed(1)} Z`;
+  out += '<path d="' + areaD + '" fill="url(#reqGrad)"/>';
+  // 曲线轮廓
+  out += '<path d="' + pathD + '" fill="none" stroke="#2563eb" stroke-width="2" stroke-linecap="round"/>';
+
+  // 关键数据节点小圆圈（点数多时只渲染有请求的峰值点和端点，保持清爽专业）
+  for (const c of coords) {
+    if (c.s.req > 0 || coords.length <= 15) {
+      out += `<circle cx="${c.x.toFixed(1)}" cy="${c.y.toFixed(1)}" r="3" fill="#ffffff" stroke="#2563eb" stroke-width="2">` +
+        `<title>${esc(c.s.raw)}: ${c.s.req} 次请求</title></circle>`;
+    }
+  }
+
+  // X 轴基线
+  out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) + '" y2="' + (PT + ih) + '"/>';
+
+  // X 轴日期刻度（等间距 4 个标尺，与 Token 图 100% 对齐）
+  for (let k = 0; k <= 3; k++) {
+    const t = t0 + span * (k / 3);
+    const d = new Date(t);
+    const lab = isHourly
+      ? String(d.getHours()).padStart(2, '0') + ':00'
+      : (d.getMonth() + 1) + '/' + d.getDate();
+    const cx = PL + (k / 3) * iw;
+    out += '<text class="tk" x="' + cx.toFixed(1) + '" y="' + (PT + ih + 15) + '" text-anchor="middle">' + esc(lab) + '</text>';
+  }
+
+  out += '</svg>';
+  host.innerHTML = out;
+}
+
+/* 2. DeepSeek 风格：Tokens 消耗与缓存堆叠柱状图（支持类型/模型双维度 + 日历补零 + 防重叠） */
+function renderTokBarChart(series, hours) {
+  const host = $('chartTokBar');
+  if (!host) return;
+
+  const { slots, t0, span, isHourly } = prepareCalendarSlots(series, hours);
+  if (!slots.length) {
+    host.innerHTML = '<div class="us-empty">暂无 Token 消耗数据</div>';
+    if ($('chartTokLegend')) $('chartTokLegend').innerHTML = '';
+    return;
+  }
+
+  const W = 460, H = 160, PL = 54, PR = 16, PT = 15, PB = 28;
+  const iw = W - PL - PR, ih = H - PT - PB;
+
   const maxVal = Math.max(10, ...slots.map(s => s.tt));
   let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="none">';
 
@@ -2567,7 +2572,6 @@ function renderTokBarChart(series, hours) {
     out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + y.toFixed(1) + '"/>';
     out += '<text class="tk" x="' + (PL - 8) + '" y="' + (y + 3.5).toFixed(1) + '" text-anchor="end">' + fmtTok(tickVal) + '</text>';
   }
-
   // 4. 严密的防重叠栅格算法 (Density Guard)
   const slotWidth = iw / slots.length;
   const minGap = Math.max(2, Math.min(6, slotWidth * 0.25));
