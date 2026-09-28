@@ -31,9 +31,10 @@ PLAN.md
 SPEC.md
 docs/
 
-# 设计/计划文档（但 README.md 必须进版本库）
+# 设计/计划文档（但 README.md 及双语必须进版本库）
 *.md
 !README.md
+!README_EN.md
 
 # Windows binaries
 /wb2api.exe

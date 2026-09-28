@@ -5,8 +5,12 @@
 <h1 align="center">WorkBuddy Gateway</h1>
 
 <p align="center">
-  <b>把腾讯 CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关 · 附 Web 管理面板</b><br>
-  Web 面板 · OAuth 浏览器登录 · 账号池轮转 · 熔断与冷却 · 会话粘性 · 定时签到 / 活跃 / 旅行 / 保活 · <b>成长任务一键完成（17/18）</b> · 流式 / 非流式
+  <b>把腾讯 CodeBuddy 账号变成 OpenAI 兼容 API 的多账号网关 · 附 Web 管理面板与系统托盘</b><br>
+  <b>An enhanced WorkBuddy to OpenAI API gateway & dashboard with Windows tray & automation</b>
+</p>
+
+<p align="center">
+  <a href="README.md">简体中文</a> | <a href="README_EN.md">English</a>
 </p>
 
 <p align="center">
@@ -14,6 +18,7 @@
   <img alt="API" src="https://img.shields.io/badge/API-OpenAI_Compatible-412991?style=flat-square">
   <img alt="Deploy" src="https://img.shields.io/badge/Deploy-Single_Binary%20%7C%20Docker-2496ED?style=flat-square">
   <img alt="Transport" src="https://img.shields.io/badge/Transport-SSE%20%2F%20Streaming-0DBD8B?style=flat-square">
+  <img alt="License" src="https://img.shields.io/badge/License-MIT-blue?style=flat-square">
 </p>
 
 ---
