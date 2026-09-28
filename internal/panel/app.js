@@ -1966,12 +1966,42 @@ function renderUsage(d) {
   // 1. DeepSeek 风格 4 核心 KPI 卡片
   const kpiEl = $('dsKpiGrid');
   if (kpiEl) {
-    const estCredits = (totalTokens / 1000 * 1.0);
+    // 腾讯 WorkBuddy 官方价格基准：加量包 50 元 / 1000 积分 = 0.05 元 / 积分
+    const OFFICIAL_CREDIT_PRICE = 0.05;
+    const OFFICIAL_MODEL_RATES = {
+      'kimi-k3-1': 1.62,
+      'glm-5.3': 0.79,
+      'deepseek-v4-pro': 0.51,
+      'deepseek-v4-flash': 0.11,
+      'glm-5.3-flash': 0.06,
+      'hy3': 0.0,
+    };
+
+    let estCredits = 0;
+    let savedCredits = 0;
+    if (Array.isArray(d.by_model) && d.by_model.length > 0) {
+      for (const m of d.by_model) {
+        const rate = OFFICIAL_MODEL_RATES[m.key] !== undefined ? OFFICIAL_MODEL_RATES[m.key] : 1.0;
+        const tt = Number(m.total_tokens || 0);
+        const ct = Number(m.cached_tokens || 0);
+        estCredits += (tt / 1000) * rate;
+        savedCredits += (ct * 0.9 / 1000) * rate;
+      }
+    } else {
+      estCredits = (totalTokens / 1000) * 1.0;
+      savedCredits = (cachedTokens * 0.9 / 1000) * 1.0;
+    }
+
+    const estCny = estCredits * OFFICIAL_CREDIT_PRICE;
+    const savedCny = savedCredits * OFFICIAL_CREDIT_PRICE;
+    const cnyStr = estCny >= 10 ? estCny.toFixed(2) : estCny.toFixed(3);
+    const savedCnyStr = savedCny >= 10 ? savedCny.toFixed(2) : savedCny.toFixed(3);
+
     kpiEl.innerHTML = `
       <div class="ds-kpi-card">
-        <div class="lbl"><span>预估消耗额度</span><span class="tag ok" style="font-size:10px;">CNY估算</span></div>
-        <div class="val">¥ ${(estCredits * 0.002).toFixed(3)}</div>
-        <div class="sub">折合约 ${estCredits.toFixed(1)} 积分 · 节省 ~${savedCredits.toFixed(1)} 积分</div>
+        <div class="lbl"><span>预估消耗额度</span><span class="tag ok" style="font-size:10px;">官方 ¥0.05/积分</span></div>
+        <div class="val">¥ ${cnyStr}</div>
+        <div class="sub">折合约 ${estCredits.toFixed(1)} 积分 · 节省 ~¥${savedCnyStr} (${savedCredits.toFixed(1)} 积分)</div>
       </div>
       <div class="ds-kpi-card">
         <div class="lbl"><span>API 请求次数</span><span style="font-size:11px;color:var(--ink-3);">含重试</span></div>
@@ -2069,9 +2099,24 @@ function setTokChartMode(mode) {
   filterAndRenderCharts();
 }
 
+// 统一获取所选时间窗口小时数，支持 'month' (本月至今)、'0' (全部历史) 及固定小时
+function getUsWindowHours() {
+  const sel = $('usWindow');
+  const val = sel ? sel.value : '720';
+  if (val === 'month') {
+    const now = new Date();
+    const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+    const diffHours = Math.ceil((now.getTime() - startOfMonth.getTime()) / 3600000);
+    return Math.max(1, diffHours);
+  }
+  if (val === '0' || val === 0) return 0;
+  const n = Number(val);
+  return Number.isFinite(n) ? n : 720;
+}
+
 function filterAndRenderCharts() {
   if (!usageDataCache) return;
-  const hours = Number(($('usWindow') && $('usWindow').value) || 72);
+  const hours = getUsWindowHours();
   const series = usageDataCache.series || [];
   renderReqAreaChart(series, hours);
   renderTokBarChart(series, hours);
@@ -2087,6 +2132,13 @@ function parsePointTime(p) {
 /* 核心修复：基于选定窗口计算真实时间轴跨度，避免单点挤在最左边 */
 function getTimeWindowSpan(pts, hours) {
   const now = Date.now();
+  const curWinVal = ($('usWindow') && $('usWindow').value) || '';
+  if (curWinVal === 'month') {
+    const dNow = new Date(now);
+    const startOfMonth = new Date(dNow.getFullYear(), dNow.getMonth(), 1, 0, 0, 0, 0);
+    const t0 = startOfMonth.getTime();
+    return { t0, t1: now, span: Math.max(3600000, now - t0) };
+  }
   if (hours > 0) {
     const tStart = now - hours * 3600 * 1000;
     return { t0: tStart, t1: now, span: hours * 3600 * 1000 };
@@ -2095,6 +2147,10 @@ function getTimeWindowSpan(pts, hours) {
     return { t0: now - 86400000, t1: now, span: 86400000 };
   }
   let tMin = pts[0].t, tMax = pts[pts.length - 1].t;
+  for (const p of pts) {
+    if (p.t < tMin) tMin = p.t;
+    if (p.t > tMax) tMax = p.t;
+  }
   if (tMin === tMax) {
     tMin -= 3600 * 1000 * 12;
     tMax += 3600 * 1000 * 12;
@@ -2518,7 +2574,7 @@ function renderTokBarChart(series, hours) {
 }
 
 async function loadUsage() {
-  const hours = ($('usWindow') && $('usWindow').value) || 72;
+  const hours = getUsWindowHours();
   try {
     const d = await api('usage?hours=' + encodeURIComponent(hours));
     renderUsage(d);
