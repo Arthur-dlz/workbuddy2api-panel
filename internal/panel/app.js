@@ -2059,6 +2059,16 @@ function renderUsage(d) {
   filterAndRenderCharts();
 }
 
+let currentTokChartMode = 'type'; // 'type' | 'model'
+
+function setTokChartMode(mode) {
+  if (currentTokChartMode === mode) return;
+  currentTokChartMode = mode;
+  if ($('tokModeType')) $('tokModeType').classList.toggle('active', mode === 'type');
+  if ($('tokModeModel')) $('tokModeModel').classList.toggle('active', mode === 'model');
+  filterAndRenderCharts();
+}
+
 function filterAndRenderCharts() {
   if (!usageDataCache) return;
   const hours = Number(($('usWindow') && $('usWindow').value) || 72);
@@ -2108,7 +2118,7 @@ function renderReqAreaChart(series, hours) {
     return;
   }
 
-  const W = 460, H = 160, PL = 48, PR = 16, PT = 15, PB = 28;
+  const W = 460, H = 160, PL = 54, PR = 16, PT = 15, PB = 28;
   const iw = W - PL - PR, ih = H - PT - PB;
   const { t0, span } = getTimeWindowSpan(pts, hours);
 
@@ -2179,7 +2189,7 @@ function renderReqAreaChart(series, hours) {
   host.innerHTML = out;
 }
 
-/* 2. DeepSeek 风格：Tokens 消耗与缓存堆叠柱状图 */
+/* 2. DeepSeek 风格：Tokens 消耗与缓存堆叠柱状图（支持类型/模型双维度 + 日历补零 + 防重叠） */
 function renderTokBarChart(series, hours) {
   const host = $('chartTokBar');
   if (!host) return;
@@ -2191,27 +2201,122 @@ function renderTokBarChart(series, hours) {
     const pt = Number(p.prompt_tokens || 0);
     const ct = Number(p.completion_tokens || 0);
     const cached = Number(p.cached_tokens || 0);
-    rawPts.push({ t, scope: p.scope, raw: p.t, pt, ct, cached, tt: Number(p.total_tokens || 0) || (pt + ct), req: p.requests || 0 });
+    const tt = Number(p.total_tokens || 0) || (pt + ct);
+    rawPts.push({
+      t,
+      scope: p.scope,
+      raw: p.t,
+      pt,
+      ct,
+      cached,
+      tt,
+      models: p.models || null,
+      req: Number(p.requests || 0),
+    });
   }
 
   if (!rawPts.length) {
     host.innerHTML = '<div class="us-empty">暂无 Token 消耗数据</div>';
+    if ($('chartTokLegend')) $('chartTokLegend').innerHTML = '';
     return;
   }
 
-  // 按时间严格升序排序
-  rawPts.sort((a, b) => a.t - b.t);
-
   const W = 460, H = 160, PL = 54, PR = 16, PT = 15, PB = 28;
   const iw = W - PL - PR, ih = H - PT - PB;
-  const { t0, span } = getTimeWindowSpan(rawPts, hours);
+  const { t0, t1, span } = getTimeWindowSpan(rawPts, hours);
 
-  const maxVal = Math.max(10, ...rawPts.map(p => p.tt));
-  const xOf = t => PL + Math.max(0, Math.min(iw, (t - t0) / span * iw));
+  // 1. 确定粒度：hours <= 48 为小时槽；hours > 48 (及全历史) 为日槽
+  const isHourly = (hours > 0 && hours <= 48);
+  const pad = n => String(n).padStart(2, '0');
+  const slots = [];
 
+  if (isHourly) {
+    const slotCount = Math.max(1, hours > 0 ? hours : 24);
+    const d1 = new Date(t1);
+    const endHour = new Date(d1.getFullYear(), d1.getMonth(), d1.getDate(), d1.getHours(), 0, 0, 0);
+    for (let i = 0; i < slotCount; i++) {
+      const cur = new Date(endHour.getTime() - (slotCount - 1 - i) * 3600 * 1000);
+      const key = `${cur.getFullYear()}-${pad(cur.getMonth() + 1)}-${pad(cur.getDate())}T${pad(cur.getHours())}`;
+      slots.push({
+        key,
+        raw: key,
+        t: cur.getTime(),
+        pt: 0,
+        ct: 0,
+        cached: 0,
+        tt: 0,
+        models: {},
+        req: 0,
+      });
+    }
+  } else {
+    const d0 = new Date(t0);
+    const d1 = new Date(t1);
+    const startDate = new Date(d0.getFullYear(), d0.getMonth(), d0.getDate());
+    const endDate = new Date(d1.getFullYear(), d1.getMonth(), d1.getDate());
+    let cur = new Date(startDate.getTime());
+    while (cur.getTime() <= endDate.getTime()) {
+      const key = `${cur.getFullYear()}-${pad(cur.getMonth() + 1)}-${pad(cur.getDate())}`;
+      slots.push({
+        key,
+        raw: key,
+        t: cur.getTime(),
+        pt: 0,
+        ct: 0,
+        cached: 0,
+        tt: 0,
+        models: {},
+        req: 0,
+      });
+      cur.setDate(cur.getDate() + 1);
+    }
+    if (!slots.length) {
+      const key = `${endDate.getFullYear()}-${pad(endDate.getMonth() + 1)}-${pad(endDate.getDate())}`;
+      slots.push({
+        key,
+        raw: key,
+        t: endDate.getTime(),
+        pt: 0,
+        ct: 0,
+        cached: 0,
+        tt: 0,
+        models: {},
+        req: 0,
+      });
+    }
+  }
+
+  // 2. 将 series 聚合填充入对应日历槽（实现日历补零与数据汇总）
+  const slotMap = new Map();
+  for (const s of slots) {
+    slotMap.set(s.key, s);
+  }
+
+  for (const p of rawPts) {
+    const key = isHourly ? (p.raw.length === 13 ? p.raw : p.raw + 'T00') : p.raw.slice(0, 10);
+    const slot = slotMap.get(key);
+    if (!slot) continue;
+
+    slot.pt += p.pt;
+    slot.ct += p.ct;
+    slot.cached += p.cached;
+    slot.tt += p.tt;
+    slot.req += p.req;
+
+    if (p.models && typeof p.models === 'object') {
+      for (const [mName, mTokens] of Object.entries(p.models)) {
+        const val = Number(mTokens || 0);
+        if (val > 0) {
+          slot.models[mName] = (slot.models[mName] || 0) + val;
+        }
+      }
+    }
+  }
+
+  const maxVal = Math.max(10, ...slots.map(s => s.tt));
   let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" preserveAspectRatio="none">';
 
-  // y 轴 3 条横向刻度线 + 文字（保持 8px 以上安全 Padding，数值严格四舍五入为整洁整数）
+  // 3. y 轴 3 条横向刻度线 + 文字（保持 8px 以上安全 Padding，数值四舍五入）
   for (let i = 0; i <= 3; i++) {
     const y = PT + ih - (ih * i / 3);
     const tickVal = Math.round(maxVal * i / 3);
@@ -2219,66 +2324,185 @@ function renderTokBarChart(series, hours) {
     out += '<text class="tk" x="' + (PL - 8) + '" y="' + (y + 3.5).toFixed(1) + '" text-anchor="end">' + fmtTok(tickVal) + '</text>';
   }
 
-  // 1. 柱宽适度收窄：参考 DeepSeek 设计，控制在 7~10px 纤细精致
-  const bw = Math.max(5, Math.min(9, iw / Math.max(24, rawPts.length * 3)));
-  const minGap = 4; // 相邻柱子之间至少保留 4 像素纯净间隙，绝不重叠
+  // 4. 严密的防重叠栅格算法 (Density Guard)
+  const slotWidth = iw / slots.length;
+  const minGap = Math.max(2, Math.min(6, slotWidth * 0.25));
+  const bw = Math.max(3, Math.min(24, slotWidth - minGap));
 
-  // 2. 防重叠自适应排列算法：当多个实例/时点时间极其接近时，自动侧向推开保持 4px 距离
-  let prevRight = PL - 999;
-  const pts = [];
-  for (let i = 0; i < rawPts.length; i++) {
-    const p = rawPts[i];
-    let idealCenter = xOf(p.t);
-    let left = idealCenter - bw / 2;
-    if (left < prevRight + minGap) {
-      left = prevRight + minGap;
+  // 5. 根据模式分支渲染
+  if (currentTokChartMode === 'model') {
+    // ── 按模型模式 ──
+    const modelTotals = {};
+    for (const s of slots) {
+      for (const [mName, mTok] of Object.entries(s.models || {})) {
+        const val = Number(mTok || 0);
+        if (val > 0) modelTotals[mName] = (modelTotals[mName] || 0) + val;
+      }
     }
-    if (left + bw > W - PR - 2) {
-      left = W - PR - bw - 2;
+    const sortedModels = Object.keys(modelTotals).sort((a, b) => modelTotals[b] - modelTotals[a]);
+    const top4 = sortedModels.slice(0, 4);
+
+    const MODEL_COLORS = ['#3b82f6', '#10b981', '#f59e0b', '#8b5cf6'];
+    const COLOR_OTHER = '#94a3b8';
+    const modelColorMap = {};
+    top4.forEach((m, idx) => {
+      modelColorMap[m] = MODEL_COLORS[idx % MODEL_COLORS.length];
+    });
+
+    const hasOther = sortedModels.length > 4 || slots.some(s => {
+      const top4Tok = top4.reduce((sum, m) => sum + (s.models[m] || 0), 0);
+      return s.tt > top4Tok;
+    });
+
+    // 动态更新图例
+    if ($('chartTokLegend')) {
+      let legendHtml = '';
+      top4.forEach(m => {
+        legendHtml += `<span><i class="sw" style="background:${modelColorMap[m]};"></i>${esc(m)}</span>`;
+      });
+      if (hasOther) {
+        legendHtml += `<span><i class="sw" style="background:${COLOR_OTHER};"></i>其他</span>`;
+      }
+      if (!top4.length && !hasOther) {
+        legendHtml = `<span><i class="sw" style="background:${COLOR_OTHER};"></i>暂无模型数据</span>`;
+      }
+      $('chartTokLegend').innerHTML = legendHtml;
     }
-    if (left < PL + 4) {
-      left = PL + 4;
+
+    // 渲染各槽模型堆叠柱
+    for (let i = 0; i < slots.length; i++) {
+      const s = slots[i];
+      if (s.tt <= 0) continue;
+
+      const x = PL + (i + 0.5) * slotWidth - bw / 2;
+      const hTot = ih * (s.tt / maxVal);
+
+      const slotBuckets = [];
+      let top4Sum = 0;
+      top4.forEach(m => {
+        const tok = Number(s.models[m] || 0);
+        if (tok > 0) {
+          slotBuckets.push({ name: m, tokens: tok, color: modelColorMap[m] });
+          top4Sum += tok;
+        }
+      });
+
+      let otherTokens = 0;
+      for (const [mName, mTok] of Object.entries(s.models || {})) {
+        if (!top4.includes(mName)) {
+          otherTokens += Number(mTok || 0);
+        }
+      }
+      if (s.tt > top4Sum + otherTokens) {
+        otherTokens += (s.tt - (top4Sum + otherTokens));
+      }
+      if (otherTokens > 0) {
+        slotBuckets.push({ name: '其他', tokens: otherTokens, color: COLOR_OTHER });
+      }
+      if (slotBuckets.length === 0) {
+        slotBuckets.push({ name: '其他', tokens: s.tt, color: COLOR_OTHER });
+      }
+
+      // 计算各模型分块高度，严格保证高度和等于 hTot
+      let allocatedH = 0;
+      for (let b = 0; b < slotBuckets.length; b++) {
+        if (b === slotBuckets.length - 1) {
+          slotBuckets[b].h = Math.max(0, hTot - allocatedH);
+        } else {
+          slotBuckets[b].h = hTot * (slotBuckets[b].tokens / s.tt);
+          allocatedH += slotBuckets[b].h;
+        }
+      }
+
+      const visible = slotBuckets.filter(b => b.h > 0.05);
+      if (visible.length === 0 && hTot > 0.05) {
+        visible.push({ name: '其他', tokens: s.tt, color: COLOR_OTHER, h: hTot });
+      }
+      if (visible.length > 0) {
+        let vAlloc = 0;
+        for (let b = 0; b < visible.length - 1; b++) vAlloc += visible[b].h;
+        visible[visible.length - 1].h = Math.max(0, hTot - vAlloc);
+      }
+
+      let currY = PT + ih;
+      let barSvg = '';
+      for (let b = 0; b < visible.length; b++) {
+        const bucket = visible[b];
+        const isTop = (b === visible.length - 1);
+        const rxAttr = isTop ? ' rx="2"' : '';
+        currY -= bucket.h;
+        barSvg += `<rect x="${x.toFixed(1)}" y="${currY.toFixed(1)}" width="${bw.toFixed(1)}" height="${bucket.h.toFixed(1)}" fill="${bucket.color}"${rxAttr}/>`;
+      }
+
+      let tip = `${esc(s.raw)}\n`;
+      for (const b of slotBuckets) {
+        tip += `${esc(b.name)}: ${fmtTok(b.tokens)}\n`;
+      }
+      tip += `合计: ${fmtTok(s.tt)} Tokens`;
+      out += `<g>${barSvg}<title>${tip}</title></g>`;
     }
-    prevRight = left + bw;
-    pts.push({ ...p, x: left });
+  } else {
+    // ── 按类型模式 ──
+    if ($('chartTokLegend')) {
+      $('chartTokLegend').innerHTML =
+        '<span><i class="sw" style="background:#2563eb;"></i>Prompt</span>' +
+        '<span><i class="sw" style="background:#60a5fa;"></i>Cache命中</span>' +
+        '<span><i class="sw" style="background:#10b981;"></i>Completion</span>';
+    }
+
+    // 渲染各槽类型堆叠柱：Prompt(#2563eb) -> Cache(#60a5fa) -> Completion(#10b981)
+    for (let i = 0; i < slots.length; i++) {
+      const s = slots[i];
+      if (s.tt <= 0) continue;
+
+      const x = PL + (i + 0.5) * slotWidth - bw / 2;
+      const hTot = ih * (s.tt / maxVal);
+
+      const realPrompt = Math.max(0, s.pt - s.cached);
+      const cached = Math.min(s.cached, s.pt);
+      const comp = s.ct;
+      const tokSum = realPrompt + cached + comp;
+
+      let hRealPrompt = 0, hCached = 0, hComp = 0;
+      if (tokSum > 0) {
+        hRealPrompt = hTot * (realPrompt / tokSum);
+        hCached = hTot * (cached / tokSum);
+        hComp = Math.max(0, hTot - hRealPrompt - hCached);
+      } else {
+        hRealPrompt = hTot;
+      }
+
+      const segments = [];
+      if (hRealPrompt > 0.05) segments.push({ h: hRealPrompt, fill: '#2563eb' });
+      if (hCached > 0.05) segments.push({ h: hCached, fill: '#60a5fa' });
+      if (hComp > 0.05) segments.push({ h: hComp, fill: '#10b981' });
+      if (segments.length === 0 && hTot > 0.05) segments.push({ h: hTot, fill: '#2563eb' });
+
+      if (segments.length > 0) {
+        let accH = 0;
+        for (let b = 0; b < segments.length - 1; b++) accH += segments[b].h;
+        segments[segments.length - 1].h = Math.max(0, hTot - accH);
+      }
+
+      let currY = PT + ih;
+      let barSvg = '';
+      for (let b = 0; b < segments.length; b++) {
+        const seg = segments[b];
+        const isTop = (b === segments.length - 1);
+        const rxAttr = isTop ? ' rx="2"' : '';
+        currY -= seg.h;
+        barSvg += `<rect x="${x.toFixed(1)}" y="${currY.toFixed(1)}" width="${bw.toFixed(1)}" height="${seg.h.toFixed(1)}" fill="${seg.fill}"${rxAttr}/>`;
+      }
+
+      const tip = `${esc(s.raw)}\nPrompt: ${fmtTok(s.pt)} (Cache: ${fmtTok(s.cached)})\nCompletion: ${fmtTok(s.ct)}\n合计: ${fmtTok(s.tt)} Tokens`;
+      out += `<g>${barSvg}<title>${tip}</title></g>`;
+    }
   }
 
-  // 3. 绘制柱体
-  for (const p of pts) {
-    const x = p.x;
-    const hTot = ih * (p.tt / maxVal);
-
-    // 三层堆叠：Prompt未命中(深蓝) + Cache命中(浅蓝) + Completion(翡翠绿)
-    const hPrompt = p.tt ? hTot * (p.pt / p.tt) : 0;
-    const hCached = p.tt ? hTot * (p.cached / p.tt) : 0;
-    const hRealPrompt = Math.max(0, hPrompt - hCached);
-    const hComp = Math.max(p.tt && p.ct ? 1.5 : 0, hTot - hPrompt);
-
-    let currY = PT + ih;
-
-    // 1. Completion (顶层翡翠绿)
-    if (hComp > 0) {
-      out += `<rect x="${x.toFixed(1)}" y="${(currY - hComp).toFixed(1)}" width="${bw.toFixed(1)}" height="${hComp.toFixed(1)}" fill="#10b981" rx="2"/>`;
-      currY -= hComp;
-    }
-    // 2. Cache 命中 (中层浅天蓝)
-    if (hCached > 0) {
-      out += `<rect x="${x.toFixed(1)}" y="${(currY - hCached).toFixed(1)}" width="${bw.toFixed(1)}" height="${hCached.toFixed(1)}" fill="#60a5fa" rx="2"/>`;
-      currY -= hCached;
-    }
-    // 3. Prompt (底层深蓝)
-    if (hRealPrompt > 0) {
-      out += `<rect x="${x.toFixed(1)}" y="${(currY - hRealPrompt).toFixed(1)}" width="${bw.toFixed(1)}" height="${hRealPrompt.toFixed(1)}" fill="#2563eb" rx="2"/>`;
-      currY -= hRealPrompt;
-    }
-
-    out += `<title>${esc(p.raw)}\nPrompt: ${fmtTok(p.pt)} (Cache: ${fmtTok(p.cached)})\nCompletion: ${fmtTok(p.ct)}\n合计: ${fmtTok(p.tt)} Tokens</title>`;
-  }
-
-  // X 轴基线
+  // 6. X 轴基线
   out += '<line class="ax" x1="' + PL + '" y1="' + (PT + ih) + '" x2="' + (W - PR) + '" y2="' + (PT + ih) + '"/>';
 
-  // X 轴日期刻度
+  // 7. X 轴日期刻度（与 renderReqAreaChart 完全同步）
   for (let k = 0; k <= 3; k++) {
     const t = t0 + span * (k / 3);
     const d = new Date(t);
@@ -2306,6 +2530,8 @@ async function loadUsage() {
 
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
 if ($('usWindow')) $('usWindow').onchange = loadUsage;
+if ($('tokModeType')) $('tokModeType').onclick = () => setTokChartMode('type');
+if ($('tokModeModel')) $('tokModeModel').onclick = () => setTokChartMode('model');
 
 /* ── 积分构成 ─────────────────────────────────────────────────────── */
 /* 一个账号的余额是若干积分包之和。包按来源命名（「国内运营裂变包」「拉新权益包」

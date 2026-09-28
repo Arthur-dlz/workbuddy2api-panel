@@ -343,6 +343,7 @@ type aggAcc struct {
 	latSamples int64
 	tpsSum     float64
 	tpsSamples int64
+	models     map[string]int64
 }
 
 func (g *aggAcc) add(b *bucket) {
@@ -356,6 +357,18 @@ func (g *aggAcc) add(b *bucket) {
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS
 	g.tpsSamples += b.TPSN
+	if b.Model != "" {
+		tt := b.TT
+		if tt == 0 && (b.PT > 0 || b.CT > 0) {
+			tt = b.PT + b.CT
+		}
+		if tt > 0 {
+			if g.models == nil {
+				g.models = make(map[string]int64)
+			}
+			g.models[b.Model] += tt
+		}
+	}
 }
 
 func (g *aggAcc) finish() Agg {
@@ -382,9 +395,10 @@ type KeyedAgg struct {
 
 // Point 时序上的一个点。
 type Point struct {
-	T     string `json:"t"`
-	Scope string `json:"scope"` // "hour" | "day"
+	T      string           `json:"t"`
+	Scope  string           `json:"scope"` // "hour" | "day"
 	Agg
+	Models map[string]int64 `json:"models,omitempty"`
 }
 
 // Snapshot 面板一次拉取的全部用量视图数据。
@@ -533,7 +547,12 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 	}
 	sort.Strings(dayKeys)
 	for _, k := range dayKeys {
-		snap.Series = append(snap.Series, Point{T: k, Scope: "day", Agg: daySeries[k].finish()})
+		snap.Series = append(snap.Series, Point{
+			T:      k,
+			Scope:  "day",
+			Agg:    daySeries[k].finish(),
+			Models: daySeries[k].models,
+		})
 	}
 	hourKeys := make([]string, 0, len(hourSeries))
 	for k := range hourSeries {
@@ -541,7 +560,12 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 	}
 	sort.Strings(hourKeys)
 	for _, k := range hourKeys {
-		snap.Series = append(snap.Series, Point{T: k, Scope: "hour", Agg: hourSeries[k].finish()})
+		snap.Series = append(snap.Series, Point{
+			T:      k,
+			Scope:  "hour",
+			Agg:    hourSeries[k].finish(),
+			Models: hourSeries[k].models,
+		})
 	}
 
 	if r.path != "" {

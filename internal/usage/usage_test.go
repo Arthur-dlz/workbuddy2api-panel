@@ -37,6 +37,9 @@ func TestAddAndTotals(t *testing.T) {
 	if s.ByAccount[0].Realm == "" {
 		t.Fatal("by_account 行缺 realm 标注")
 	}
+	if len(s.Series) == 0 || s.Series[0].Models["glm-5.2"] != 165 {
+		t.Fatalf("series[0].Models[glm-5.2] = %v, want 165", s.Series[0].Models["glm-5.2"])
+	}
 }
 
 // Rollup 把超出 hourlyKeep 的小时桶折叠为日桶，且幂等：重复折叠不重复计数。
@@ -128,5 +131,112 @@ func TestLifecycleFlush(t *testing.T) {
 	r.Stop()
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("Stop 后应有落盘文件: %v", err)
+	}
+}
+
+// TestSeriesModelsBreakdown 验证 Snapshot 生成的时序点正确包含各模型 total_tokens 拆解，
+// 且 JSON 序列化符合前端契约，旧聚合字段保持严格向后兼容。
+func TestSeriesModelsBreakdown(t *testing.T) {
+	r := New("")
+	now := time.Now()
+
+	// 1. 同一小时内分别记录 glm-5.2、kimi-k1.5、deepseek-chat
+	// glm-5.2: 上游没有 total, pt=100, ct=50 -> 兜底 tt=150
+	r.Add(now, "cn", "u1", "glm-5.2", "master", Delta{
+		PromptTokens:     100,
+		HasPromptTokens:  true,
+		CompletionTokens: 50,
+		HasCompletion:    true,
+	}, true)
+
+	// kimi-k1.5: 上游显式给 total=300 (pt=200, ct=100)
+	r.Add(now, "cn", "u2", "kimi-k1.5", "master", Delta{
+		PromptTokens:     200,
+		HasPromptTokens:  true,
+		CompletionTokens: 100,
+		HasCompletion:    true,
+		TotalTokens:      300,
+		HasTotal:         true,
+	}, true)
+
+	// deepseek-chat: pt=60, ct=40 -> 兜底 tt=100
+	r.Add(now, "cn", "u3", "deepseek-chat", "master", Delta{
+		PromptTokens:     60,
+		HasPromptTokens:  true,
+		CompletionTokens: 40,
+		HasCompletion:    true,
+	}, true)
+
+	// 失败重试/0 Token 请求：不计入 models
+	r.Add(now, "cn", "u4", "fail-model", "master", Delta{}, false)
+
+	// 2. 验证 Snapshot(24) 时序点
+	s := r.Snapshot(24, nil)
+	if len(s.Series) != 1 {
+		t.Fatalf("series 点数 = %d, want 1", len(s.Series))
+	}
+	p := s.Series[0]
+	if p.Scope != "hour" {
+		t.Fatalf("series[0].Scope = %s, want hour", p.Scope)
+	}
+	if p.TotalTokens != 550 {
+		t.Fatalf("series[0].TotalTokens = %d, want 550 (150+300+100)", p.TotalTokens)
+	}
+	if len(p.Models) != 3 {
+		t.Fatalf("series[0].Models 种类数 = %d, want 3", len(p.Models))
+	}
+	if p.Models["glm-5.2"] != 150 {
+		t.Errorf("Models[glm-5.2] = %d, want 150", p.Models["glm-5.2"])
+	}
+	if p.Models["kimi-k1.5"] != 300 {
+		t.Errorf("Models[kimi-k1.5] = %d, want 300", p.Models["kimi-k1.5"])
+	}
+	if p.Models["deepseek-chat"] != 100 {
+		t.Errorf("Models[deepseek-chat] = %d, want 100", p.Models["deepseek-chat"])
+	}
+	if _, exists := p.Models["fail-model"]; exists {
+		t.Errorf("0 token 失败模型不应存在于 Models 中: %v", p.Models["fail-model"])
+	}
+
+	// 3. 验证 JSON 结构与契约规范
+	raw, err := json.Marshal(s.Series)
+	if err != nil {
+		t.Fatalf("json.Marshal(s.Series) 失败: %v", err)
+	}
+	var out []map[string]any
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("json.Unmarshal 失败: %v", err)
+	}
+	modelsMap, ok := out[0]["models"].(map[string]any)
+	if !ok {
+		t.Fatalf("序列化后未找到 models 映射: %+v", out[0])
+	}
+	if int64(modelsMap["kimi-k1.5"].(float64)) != 300 {
+		t.Errorf("json models[kimi-k1.5] = %v, want 300", modelsMap["kimi-k1.5"])
+	}
+
+	// 4. 验证日点聚合中的 models breakdown
+	oldDay := now.AddDate(0, 0, -100)
+	r.Add(oldDay, "cn", "u1", "claude-3.5", "master", Delta{
+		PromptTokens:     500,
+		HasPromptTokens:  true,
+		CompletionTokens: 200,
+		HasCompletion:    true,
+	}, true)
+	r.Rollup(now)
+
+	all := r.Snapshot(0, nil)
+	var dayPoint *Point
+	for i := range all.Series {
+		if all.Series[i].Scope == "day" {
+			dayPoint = &all.Series[i]
+			break
+		}
+	}
+	if dayPoint == nil {
+		t.Fatal("全部历史中未找到折叠后的日点")
+	}
+	if dayPoint.Models["claude-3.5"] != 700 {
+		t.Errorf("dayPoint.Models[claude-3.5] = %d, want 700", dayPoint.Models["claude-3.5"])
 	}
 }
