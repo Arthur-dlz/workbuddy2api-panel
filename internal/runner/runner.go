@@ -31,8 +31,8 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
-// appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.11.9-panel"
+// appVersion 网关版本（正式独立版本），透出到 /panel/api/overview。
+const appVersion = "1.0.0"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -320,11 +320,11 @@ func Run() {
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("workbuddy2api listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
+	log.Printf("WorkBuddy Gateway listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
 	if runtime.GOOS == "windows" && !*noTray {
 		go func() {
 			_ = tray.Run(tray.Config{
-				Title:  "WorkBuddy 网关",
+				Title:  "WorkBuddy Gateway",
 				Port:   cfg.Port,
 				APIKey: cfg.APIKey,
 				OnExit: func() {
