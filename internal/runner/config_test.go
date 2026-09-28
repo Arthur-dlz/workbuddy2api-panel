@@ -825,3 +825,108 @@ func TestPortAndModelsConfig(t *testing.T) {
 	}
 }
 
+func TestScheduleGrowthHoursDecoupledFromBlackcatHours(t *testing.T) {
+	dir := t.TempDir()
+	// Case 1: blackcat_hours explicitly set, growth_hours absent -> growth_hours should fall back to [1]
+	fp1 := filepath.Join(dir, "c1.json")
+	if err := os.WriteFile(fp1, []byte(`{"schedule":{"blackcat_hours":[20]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c1, err := Load(fp1)
+	if err != nil {
+		t.Fatalf("load c1: %v", err)
+	}
+	if len(c1.Schedule.BlackcatHours) != 1 || c1.Schedule.BlackcatHours[0] != 20 {
+		t.Errorf("blackcat_hours=%v, want [20]", c1.Schedule.BlackcatHours)
+	}
+	if len(c1.Schedule.GrowthHours) != 1 || c1.Schedule.GrowthHours[0] != 1 {
+		t.Errorf("growth_hours=%v, want default [1]", c1.Schedule.GrowthHours)
+	}
+
+	// Case 2: growth_hours explicitly set, blackcat_hours absent -> blackcat_hours should fall back to [23]
+	fp2 := filepath.Join(dir, "c2.json")
+	if err := os.WriteFile(fp2, []byte(`{"schedule":{"growth_hours":[3]}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c2, err := Load(fp2)
+	if err != nil {
+		t.Fatalf("load c2: %v", err)
+	}
+	if len(c2.Schedule.GrowthHours) != 1 || c2.Schedule.GrowthHours[0] != 3 {
+		t.Errorf("growth_hours=%v, want [3]", c2.Schedule.GrowthHours)
+	}
+	if len(c2.Schedule.BlackcatHours) != 1 || c2.Schedule.BlackcatHours[0] != 23 {
+		t.Errorf("blackcat_hours=%v, want default [23]", c2.Schedule.BlackcatHours)
+	}
+}
+
+func TestRestartRequiredFieldsPrecision(t *testing.T) {
+	// 1. nil cases
+	if fields := restartRequiredFields(nil, Default()); len(fields) != 0 {
+		t.Errorf("expected nil/empty for nil oldCfg, got %v", fields)
+	}
+	if fields := restartRequiredFields(Default(), nil); len(fields) != 0 {
+		t.Errorf("expected nil/empty for nil newCfg, got %v", fields)
+	}
+
+	// 2. identical configs -> no restart required
+	cfgA := Default()
+	if fields := restartRequiredFields(cfgA, cfgA); len(fields) != 0 {
+		t.Errorf("identical configs must require 0 restart fields, got %v", fields)
+	}
+
+	// 3. modifying hot-reloadable fields (schedule, balance refresh, models, etc.) -> 0 restart fields
+	cfgOld := Default()
+	cfgNew := Default()
+	cfgNew.Schedule.CheckinHours = []int{8, 12, 18}
+	cfgNew.Schedule.GrowthHours = []int{2}
+	cfgNew.Schedule.CheckinEnabled = false
+	cfgNew.Schedule.BalanceRefreshMinutes = 10
+	cfgNew.Models = map[string]string{"foo": "bar"}
+	cfgNew.Pool.BreakerThreshold = 5
+	cfgNew.Pool.PreferExpiring = false
+
+	if fields := restartRequiredFields(cfgOld, cfgNew); len(fields) != 0 {
+		t.Errorf("hot reloadable changes must not require restart, got: %v", fields)
+	}
+
+	// 4. modifying restart fields
+	cfgRestart := Default()
+	cfgRestart.Listen = ":8080"
+	cfgRestart.Port = 8080
+	cfgRestart.AuthDir = "auths_custom"
+	cfgRestart.StateFile = "state_custom.json"
+	cfgRestart.Upstream.TimeoutSeconds = 99
+	cfgRestart.Upstream.HeaderTimeoutSeconds = 88
+	cfgRestart.Upstream.IdleTimeoutSeconds = 77
+	cfgRestart.Upstream.UserAgent = "custom-ua"
+	cfgRestart.Upstash.URL = "https://upstash.custom"
+	cfgRestart.SessionSticky.TTL = "1h"
+	cfgRestart.SessionSticky.GCInterval = "10m"
+	cfgRestart.Prompt.Mode = "custom"
+	cfgRestart.Prompt.File = "prompt.txt"
+
+	fields := restartRequiredFields(cfgOld, cfgRestart)
+	expectedFields := []string{
+		"listen", "port", "auth_dir", "state_file",
+		"upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds",
+		"upstream.user_agent", "upstash",
+		"session_sticky.ttl", "session_sticky.gc_interval",
+		"prompt.mode", "prompt.file",
+	}
+
+	fieldMap := make(map[string]bool)
+	for _, f := range fields {
+		fieldMap[f] = true
+	}
+	for _, exp := range expectedFields {
+		if !fieldMap[exp] {
+			t.Errorf("missing expected restart field %q in %v", exp, fields)
+		}
+	}
+	if len(fields) != len(expectedFields) {
+		t.Errorf("got %d fields (%v), want %d fields (%v)", len(fields), fields, len(expectedFields), expectedFields)
+	}
+}
+
+

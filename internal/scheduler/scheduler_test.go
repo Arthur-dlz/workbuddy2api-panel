@@ -66,6 +66,7 @@ func TestNextWakeSameInstantFiresAll(t *testing.T) {
 		TravelDisabled:   true,
 		ActivityDisabled: true,
 		BlackcatDisabled: true,
+		GrowthDisabled:   true,
 	})
 	at, kinds := s.nextWake(time.Date(2026, 9, 11, 21, 30, 0, 0, time.Local))
 	if want := time.Date(2026, 9, 11, 22, 0, 0, 0, time.Local); !at.Equal(want) {
@@ -128,6 +129,7 @@ func TestNextWakeBothDisabledNothingScheduled(t *testing.T) {
 		ActivityDisabled:  true,
 		KeepaliveDisabled: true,
 		BlackcatDisabled:  true,
+		GrowthDisabled:    true,
 		CheckinHours:      []int{9, 21},
 		KeepaliveHours:    []int{22},
 	})
@@ -439,6 +441,13 @@ func TestNextWakeGrowthSlot(t *testing.T) {
 		if k == taskGrowth {
 			t.Fatal("禁用后 growth 仍在候选")
 		}
+	}
+}
+
+func TestNewDefaultGrowthHours(t *testing.T) {
+	s := New(Config{})
+	if len(s.cfg.GrowthHours) != 1 || s.cfg.GrowthHours[0] != 1 {
+		t.Fatalf("expected default GrowthHours to be [1], got %v", s.cfg.GrowthHours)
 	}
 }
 

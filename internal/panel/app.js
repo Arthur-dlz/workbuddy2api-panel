@@ -334,8 +334,8 @@ function rateCell(m) {
 }
 
 /* ── 模型路由 (中转) ───────────────────────────────────────────────── */
-let routesLoaded = [];
-let tokensLoaded = [];
+let routesLoaded = null;
+let tokensLoaded = null;
 let circuitCache = []; // 模型级熔断降级状态缓存
 
 async function fetchCircuitStatus() {
@@ -440,20 +440,126 @@ async function saveRoutesConfig() {
   }
 }
 
+/* ── 模型厂商智能分组引擎 ───────────────────────────────────────────── */
+const VENDOR_GROUPS = [
+  {
+    name: '🌟 官方智能调度',
+    match: (id, name) => /^(auto|default-model|fast-model|balanced-model|primary-model|deep-model)($|-)/i.test(id) || /^(auto|default|fast|balanced|primary|deep)-model/i.test(name)
+  },
+  {
+    name: '🤖 DeepSeek (深度求索)',
+    match: (id, name) => /deepseek/i.test(id) || /deepseek/i.test(name)
+  },
+  {
+    name: '🔮 Kimi (月之暗面)',
+    match: (id, name) => /kimi/i.test(id) || /kimi/i.test(name)
+  },
+  {
+    name: '⚡ 智谱 GLM',
+    match: (id, name) => /glm/i.test(id) || /glm/i.test(name) || /智谱/i.test(name)
+  },
+  {
+    name: '🐉 腾讯混元 (Hunyuan)',
+    match: (id, name) => /(^|-)(hy\d|hunyuan)/i.test(id) || /^hy\d/i.test(id) || /hunyuan|混元/i.test(name) || /^hy\d/i.test(name)
+  },
+  {
+    name: '🌀 MiniMax (稀宇科技)',
+    match: (id, name) => /minimax/i.test(id) || /minimax/i.test(name)
+  },
+  {
+    name: '🧠 OpenAI (GPT)',
+    match: (id, name) => /(^|-)(gpt|o1|o3|openai)/i.test(id) || /openai|gpt/i.test(name)
+  },
+  {
+    name: '🎭 Anthropic Claude',
+    match: (id, name) => /claude/i.test(id) || /claude/i.test(name)
+  },
+  {
+    name: '♊ Google Gemini',
+    match: (id, name) => /gemini/i.test(id) || /gemini/i.test(name)
+  },
+  {
+    name: '📦 其他模型',
+    match: () => true
+  }
+];
+
+function modelSortScore(m) {
+  let score = 0;
+  const id = (m._id || m.raw_id || m.id || '').toLowerCase();
+  const name = (m.name || '').toLowerCase();
+  const desc = (m.description || '').toLowerCase();
+  const text = id + ' ' + name + ' ' + desc;
+  if (/旗舰|flagship/.test(text)) score += 500;
+  if (/\b(pro|max|ultra|plus)\b/.test(text)) score += 300;
+  if (/preview/.test(text)) score += 100;
+  if (/flash|lite|mini|极速|轻量/.test(text)) score -= 200;
+  if (m.credits) {
+    const num = parseFloat(String(m.credits).replace(/[^0-9.]/g, ''));
+    if (!isNaN(num)) score += num * 100;
+  }
+  const verMatch = text.match(/v?(\d+(\.\d+)?)/);
+  if (verMatch) {
+    score += parseFloat(verMatch[1]) * 10;
+  }
+  return score;
+}
+
+function buildGroupedModelOptions(models, selectedValue, placeholder) {
+  let html = '';
+  if (placeholder) {
+    html += `<option value="">${esc(placeholder)}</option>`;
+  }
+  const list = Array.isArray(models) ? models : [];
+  const curVal = selectedValue != null ? String(selectedValue).trim() : '';
+  let found = false;
+
+  const items = list.map(m => {
+    const rawId = m.raw_id || (m.id ? String(m.id).replace(/^(cn|global):/, '') : '');
+    if (curVal && rawId === curVal) found = true;
+    return Object.assign({}, m, { _id: rawId });
+  });
+
+  if (curVal && !found) {
+    html += `<option value="${esc(curVal)}" selected>[已绑定] ${esc(curVal)} (上游暂未列出)</option>`;
+  }
+
+  const groups = VENDOR_GROUPS.map(g => ({ name: g.name, match: g.match, items: [] }));
+  for (const item of items) {
+    const id = item._id;
+    const name = item.name || id;
+    for (const g of groups) {
+      if (g.match(id, name)) {
+        g.items.push(item);
+        break;
+      }
+    }
+  }
+
+  for (const g of groups) {
+    if (!g.items.length) continue;
+    g.items.sort((a, b) => modelSortScore(b) - modelSortScore(a));
+    html += `<optgroup label="${esc(g.name)}">`;
+    for (const m of g.items) {
+      const id = m._id;
+      const cr = m.credits ? ('[' + m.credits + '] ') : '';
+      const name = m.name || id;
+      const desc = m.description ? (' - ' + m.description.slice(0, 35)) : '';
+      const isSel = (id === curVal) ? ' selected' : '';
+      html += `<option value="${esc(id)}"${isSel}>${esc(cr)}${esc(name)} (${esc(id)})${esc(desc)}</option>`;
+    }
+    html += `</optgroup>`;
+  }
+  return html;
+}
+
 async function populateRouteTargetModels(curTarget) {
   const models = await fetchUpstreamModels(false);
   const sel = $('routeTargetSelect');
   const fbSel = $('routeFallbackSelect');
   const dl = $('targetModelList');
   if (sel) {
-    sel.innerHTML = '<option value="">-- 选择腾讯官方真实模型 (动态拉取) --</option>' +
-      models.map(m => {
-        const id = m.raw_id || m.id.replace(/^(cn|global):/, '');
-        const cr = m.credits ? ('[' + m.credits + '] ') : '';
-        const name = m.name || id;
-        const selAttr = (id === curTarget) ? ' selected' : '';
-        return `<option value="${esc(id)}"${selAttr}>${esc(cr)}${esc(name)} (${esc(id)})</option>`;
-      }).join('');
+    sel.innerHTML = buildGroupedModelOptions(models, curTarget, '-- 选择腾讯官方真实模型 (动态拉取) --');
     sel.onchange = () => {
       if (sel.value) {
         $('routeTarget').value = sel.value;
@@ -465,13 +571,7 @@ async function populateRouteTargetModels(curTarget) {
     if (curTarget) sel.value = curTarget;
   }
   if (fbSel) {
-    fbSel.innerHTML = '<option value="">-- 从上游真实模型中自选备用降级模型 --</option>' +
-      models.map(m => {
-        const id = m.raw_id || m.id.replace(/^(cn|global):/, '');
-        const cr = m.credits ? ('[' + m.credits + '] ') : '';
-        const name = m.name || id;
-        return `<option value="${esc(id)}">${esc(cr)}${esc(name)} (${esc(id)})</option>`;
-      }).join('');
+    fbSel.innerHTML = buildGroupedModelOptions(models, '', '-- 从上游真实模型中自选备用降级模型 --');
   }
   if (dl) {
     dl.innerHTML = models.map(m => {
@@ -504,7 +604,7 @@ function renderRouteFallbackChips() {
 async function openRouteModal(idx, prefilledTarget) {
   $('routeEditIndex').value = String(idx);
   let curTarget = prefilledTarget || '';
-  if (idx >= 0 && routesLoaded[idx]) {
+  if (idx >= 0 && routesLoaded && routesLoaded[idx]) {
     const r = routesLoaded[idx];
     $('routeModalTitle').textContent = '编辑模型路由';
     $('routeId').value = r.id || '';
@@ -644,18 +744,14 @@ async function populateTokenBindModelSelect(selectedModel, forceRefresh) {
   sel.innerHTML = '<option value="">正在从腾讯官方上游实时探测真实模型...</option>';
   const models = await fetchUpstreamModels(forceRefresh);
   if (!models || !models.length) {
-    sel.innerHTML = '<option value="">(未能拉取到官方模型，请先检查账号池是否正常)</option>';
+    if (selectedModel) {
+      sel.innerHTML = buildGroupedModelOptions([], selectedModel, '-- 请选择腾讯官方真实模型 (唯一绑定) --');
+    } else {
+      sel.innerHTML = '<option value="">(未能拉取到官方模型，请先检查账号池是否正常)</option>';
+    }
     return;
   }
-  sel.innerHTML = '<option value="">-- 请选择腾讯官方真实模型 (唯一绑定) --</option>' +
-    models.map(m => {
-      const id = m.raw_id || m.id.replace(/^(cn|global):/, '');
-      const cr = m.credits ? ('[' + m.credits + '] ') : '';
-      const name = m.name || id;
-      const desc = m.description ? (' - ' + m.description.slice(0, 35)) : '';
-      const selAttr = (id === selectedModel) ? ' selected' : '';
-      return `<option value="${esc(id)}"${selAttr}>${esc(cr)}${esc(name)} (${esc(id)})${esc(desc)}</option>`;
-    }).join('');
+  sel.innerHTML = buildGroupedModelOptions(models, selectedModel, '-- 请选择腾讯官方真实模型 (唯一绑定) --');
 }
 
 function renderTokens() {
@@ -744,7 +840,7 @@ function generateRandomTokenKey() {
 async function openTokenModal(idx, prefilledBindModel) {
   $('tokenEditIndex').value = String(idx);
   let curBind = prefilledBindModel || '';
-  if (idx >= 0 && tokensLoaded[idx]) {
+  if (idx >= 0 && tokensLoaded && tokensLoaded[idx]) {
     const t = tokensLoaded[idx];
     $('tokenModalTitle').textContent = '编辑 API 令牌';
     $('tokenName').value = t.name || '';
@@ -815,7 +911,7 @@ $('tblRoutes').onclick = async e => {
     return;
   }
   const idx = Number(btn.dataset.idx);
-  if (isNaN(idx) || !routesLoaded[idx]) return;
+  if (isNaN(idx) || !routesLoaded || !routesLoaded[idx]) return;
   if (act === 'toggle-route') {
     routesLoaded[idx].enabled = !routesLoaded[idx].enabled;
     renderModelRoutes();
@@ -849,7 +945,7 @@ $('tblTokens').onclick = async e => {
   }
   const act = btn.dataset.act;
   const idx = Number(btn.dataset.idx);
-  if (isNaN(idx) || !tokensLoaded[idx]) return;
+  if (isNaN(idx) || !tokensLoaded || !tokensLoaded[idx]) return;
   if (act === 'toggle-token') {
     tokensLoaded[idx].enabled = !tokensLoaded[idx].enabled;
     renderTokens();
@@ -1117,7 +1213,13 @@ function collectConfig() {
     else {
       const raw = el.value.trim();
       if (raw === '') v = undefined;
-      else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
+      else if (name.endsWith('_hours')) {
+        try {
+          v = parseHours(raw);
+        } catch (_) {
+          v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
+        }
+      }
       else v = raw;
     }
     if (v !== undefined) put(out, path, v);
@@ -1133,18 +1235,46 @@ function collectConfig() {
       out.models = {};
     }
   }
-  if (tokensLoaded !== undefined && tokensLoaded !== null) {
+  if (Array.isArray(tokensLoaded) && tokensLoaded.length > 0) {
     out.tokens = tokensLoaded;
-  } else if (cfgLoaded && cfgLoaded.tokens) {
+  } else if (cfgLoaded && Array.isArray(cfgLoaded.tokens)) {
     out.tokens = cfgLoaded.tokens;
   }
-  if (routesLoaded !== undefined && routesLoaded !== null) {
+  if (Array.isArray(routesLoaded) && routesLoaded.length > 0) {
     out.model_routes = routesLoaded;
-  } else if (cfgLoaded && cfgLoaded.model_routes) {
+  } else if (cfgLoaded && Array.isArray(cfgLoaded.model_routes)) {
     out.model_routes = cfgLoaded.model_routes;
   }
   return out;
 }
+
+/* 时点字段即时校验与解析 (0..23 整点) */
+const HOUR_FIELDS = ['checkin_hours', 'growth_hours', 'travel_hours', 'activity_hours', 'keepalive_hours'];
+
+function parseHours(raw) {
+  if (!raw || !raw.trim()) return [];
+  const parts = raw.trim().split(/[,，\s]+/).filter(Boolean);
+  const nums = [];
+  for (const p of parts) {
+    if (!/^\d+$/.test(p)) {
+      throw new Error(`包含非数字字符 "${p}"，时点必须为 0~23 的整数`);
+    }
+    const n = Number(p);
+    if (!Number.isInteger(n) || n < 0 || n > 23) {
+      throw new Error(`时点 "${p}" 超出范围，必须在 0 到 23 之间`);
+    }
+    nums.push(n);
+  }
+  return nums;
+}
+
+function focusField(el) {
+  if (!el) return;
+  const parentDetails = el.closest('details');
+  if (parentDetails) parentDetails.open = true;
+  el.focus();
+}
+
 /* Go 时长字段即时校验：空 = 沿用现值（collectConfig 跳过发送）；非空必须是
    ParseDuration 语法（30m / 2h / 600s / 1h30m，可组合可带小数）。与后端
    config.go normalize() 的 time.ParseDuration 同口径，脏值在前端就地标红，
@@ -1170,6 +1300,22 @@ function markDurationFields() {
 }
 $('cfgForm').addEventListener('input', ev => {
   if (DURATION_FIELDS.includes(ev.target.name)) markDurationFields();
+  if (HOUR_FIELDS.includes(ev.target.name)) {
+    const el = ev.target;
+    if (el.value.trim()) {
+      try {
+        parseHours(el.value);
+        el.classList.remove('invalid');
+        el.title = '';
+      } catch (err) {
+        el.classList.add('invalid');
+        el.title = err.message;
+      }
+    } else {
+      el.classList.remove('invalid');
+      el.title = '';
+    }
+  }
 });
 $('btnEye').onclick = () => {
   const el = $('cfgKey');
@@ -1180,12 +1326,27 @@ $('btnEye').onclick = () => {
 $('btnCfgReload').onclick = loadConfig;
 $('cfgForm').onsubmit = async ev => {
   ev.preventDefault();
+  // 时点字段格式与范围校验：0..23 整数
+  for (const name of HOUR_FIELDS) {
+    const el = $('cfgForm').elements[name];
+    if (!el || !el.value.trim()) continue;
+    try {
+      parseHours(el.value);
+      el.classList.remove('invalid');
+    } catch (err) {
+      focusField(el);
+      el.classList.add('invalid');
+      const label = el.closest('.fld')?.querySelector('.lb')?.textContent || name;
+      toast(`「${label}」${err.message}`, 'err');
+      return;
+    }
+  }
   // 时长字段脏值拦截：标红 + toast 点名，不发保存请求（后端同样会拒，这里前置）。
   markDurationFields();
   const firstBad = DURATION_FIELDS.find(durationBad);
   if (firstBad) {
     const el = $('cfgForm').elements[firstBad];
-    el.focus();
+    focusField(el);
     toast('「' + (el.closest('.fld')?.querySelector('.lb')?.textContent || firstBad) + '」' + DURATION_TIP, 'err');
     return;
   }
@@ -1197,7 +1358,7 @@ $('cfgForm').onsubmit = async ev => {
         throw new Error('必须是 JSON 对象（如 {"别名": "上游模型"}）');
       }
     } catch (e) {
-      modelsEl.focus();
+      focusField(modelsEl);
       toast('模型映射 JSON 格式无效：' + e.message, 'err');
       return;
     }
@@ -1216,6 +1377,33 @@ $('cfgForm').onsubmit = async ev => {
   } catch (e) { toast('保存失败：' + e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '保存配置'; }
 };
+
+// 快捷预设药丸按钮交互
+document.addEventListener('click', ev => {
+  const btn = ev.target.closest('.pill-btn');
+  if (!btn) return;
+  const inputName = btn.dataset.input;
+  const switchName = btn.dataset.switch;
+  const val = btn.dataset.val;
+  if (!inputName) return;
+
+  const f = $('cfgForm');
+  const input = f ? f.elements[inputName] : null;
+  if (input) {
+    input.value = val;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+  }
+  if (switchName && f) {
+    const sw = f.elements[switchName];
+    if (sw && !sw.checked) {
+      sw.checked = true;
+      sw.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+  }
+  const btnText = btn.textContent.trim();
+  toast(`已设定预设：${btnText}`, 'ok');
+});
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 function openAdd() {

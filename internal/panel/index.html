@@ -480,6 +480,14 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     margin-top: 6px; background: var(--surface-2); }
   .pk-card .expirybar i { display: block; height: 100%; min-width: 2px; }
 
+  /* 设置页快捷药丸与高级折叠 */
+  .pill-row { display:flex; flex-wrap:wrap; align-items:center; gap:6px; margin-top:6px; }
+  .pill-tip { font-size:11px; color:var(--ink-3); }
+  .pill-btn { background:var(--surface-2); border:1px solid var(--line-soft); border-radius:12px; padding:2px 8px; font-size:11px; color:var(--ink-2); cursor:pointer; transition:all .15s; }
+  .pill-btn:hover { border-color:var(--accent); color:var(--accent); background:var(--surface-1); }
+  .cfg-adv summary { cursor:pointer; padding:12px 16px; user-select:none; display:flex; align-items:center; }
+  .cfg-adv[open] summary { border-bottom: 1px solid var(--line-soft); }
+  .cfg-adv summary h3 { font-size: 13.5px; font-weight: 600; margin: 0; }
 </style>
 </head>
 <body>
@@ -810,8 +818,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <!-- 配置 -->
     <section class="view" id="view-config" hidden>
       <form id="cfgForm">
+        <!-- 卡片 1: 常用服务与鉴权 -->
         <div class="box">
-          <header><h3>服务</h3><span class="grow"></span><span class="note" id="cfgPath"></span></header>
+          <header><h3>常用服务与鉴权</h3><span class="grow"></span><span class="note" id="cfgPath"></span></header>
           <div class="pad">
             <div class="grid2">
               <label class="fld"><span class="lb">监听地址</span>
@@ -825,17 +834,12 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">API 密钥</span>
                 <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 不鉴权">
                 <button type="button" class="xs" id="btnEye">显示</button></div>
-                <span class="hint">立即生效（含面板自身）</span></label>
+                <span class="hint">立即生效（含面板自身与客户端通用鉴权）</span></label>
               <label class="fld"><span class="lb">单账号明细默认展示条数</span>
                 <input name="package_detail_limit" type="number" min="1" placeholder="5">
                 <span class="hint">积分构成页按最早到期展示，其余未用完包聚合</span></label>
             </div>
-          </div>
-        </div>
-
-        <div class="box">
-          <header><h3>自定义模型映射</h3></header>
-          <div class="pad">
+            <div class="hr"></div>
             <label class="fld"><span class="lb">模型别名映射 (JSON 对象)</span>
               <textarea name="models_json" rows="4" style="font-family:monospace;font-size:12px;" placeholder='{
   "deepseek-chat": "deepseek-v4-pro",
@@ -845,8 +849,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           </div>
         </div>
 
+        <!-- 卡片 2: 自动化定时任务 -->
         <div class="box">
-          <header><h3>定时任务</h3></header>
+          <header><h3>自动化定时任务</h3></header>
           <div class="pad">
             <div class="grid2">
               <div>
@@ -854,12 +859,43 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                   <input type="checkbox" name="checkin_enabled"></div>
                 <label class="fld"><span class="lb">签到时点（小时，逗号分隔）</span>
                   <input name="checkin_hours" placeholder="9, 21"></label>
+                <div class="pill-row">
+                  <span class="pill-tip">快捷预设:</span>
+                  <button type="button" class="pill-btn" data-input="checkin_hours" data-switch="checkin_enabled" data-val="9, 21">早九晚九 (9, 21) [推荐]</button>
+                  <button type="button" class="pill-btn" data-input="checkin_hours" data-switch="checkin_enabled" data-val="8">每日早八 (8)</button>
+                  <button type="button" class="pill-btn" data-input="checkin_hours" data-switch="checkin_enabled" data-val="0, 8, 16">每 8 小时 (0, 8, 16)</button>
+                  <button type="button" class="pill-btn" data-input="checkin_hours" data-switch="checkin_enabled" data-val="0, 12">每 12 小时 (0, 12)</button>
+                </div>
               </div>
+              <div>
+                <div class="switch"><span class="lb">成长任务自动执行</span>
+                  <input type="checkbox" name="growth_enabled" checked></div>
+                <label class="fld"><span class="lb">执行时点（小时，逗号分隔）</span>
+                  <input name="growth_hours" placeholder="1">
+                  <span class="hint">每日到点自动「扫描 + 执行全部待办」（零点任务刷新后执行，避开零点高峰）</span></label>
+                <div class="pill-row">
+                  <span class="pill-tip">快捷预设:</span>
+                  <button type="button" class="pill-btn" data-input="growth_hours" data-switch="growth_enabled" data-val="1">凌晨一点 (1) [推荐]</button>
+                  <button type="button" class="pill-btn" data-input="growth_hours" data-switch="growth_enabled" data-val="2">凌晨两点 (2)</button>
+                  <button type="button" class="pill-btn" data-input="growth_hours" data-switch="growth_enabled" data-val="12">中午十二点 (12)</button>
+                </div>
+              </div>
+            </div>
+            <div class="hr"></div>
+            <div class="grid2">
               <div>
                 <div class="switch"><span class="lb">Token 保活</span>
                   <input type="checkbox" name="keepalive_enabled"></div>
                 <label class="fld"><span class="lb">保活时点（小时，逗号分隔）</span>
-                  <input name="keepalive_hours" placeholder="22"></label>
+                  <input name="keepalive_hours" placeholder="22">
+                  <span class="hint">防止账号凭证长期不用而失效</span></label>
+              </div>
+              <div>
+                <div class="switch"><span class="lb">后台刷新余额</span>
+                  <input type="checkbox" name="balance_refresh_enabled"></div>
+                <label class="fld"><span class="lb">刷新间隔（分钟）</span>
+                  <input name="balance_refresh_minutes" type="number" min="1" placeholder="5">
+                  <span class="hint">定时同步各账号剩余积分与到期明细</span></label>
               </div>
             </div>
             <div class="hr"></div>
@@ -879,27 +915,18 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                   <span class="hint">点亮连登 + 解锁领养前置</span></label>
               </div>
             </div>
-            <div class="hr"></div>
-            <div class="grid2">
-              <div class="switch"><span class="lb">后台刷新余额</span>
-                <input type="checkbox" name="balance_refresh_enabled"></div>
-              <label class="fld"><span class="lb">刷新间隔（分钟）</span>
-                <input name="balance_refresh_minutes" type="number" min="1" placeholder="5"></label>
-            </div>
-            <div class="hr"></div>
-            <div class="grid2">
-              <div class="switch"><span class="lb">成长任务自动执行</span>
-                <input type="checkbox" name="growth_enabled" checked></div>
-              <label class="fld"><span class="lb">执行时点（小时，逗号分隔）</span>
-                <input name="growth_hours" placeholder="1">
-                <span class="hint">每日到点自动「扫描 + 执行全部待办」（Sequential 任务链零点解锁后自动推进，建议零点后）</span></label>
-            </div>
           </div>
         </div>
 
-        <div class="box">
-          <header><h3>账号池与流量治理</h3></header>
+        <!-- 卡片 3: 高级调度与安全防风控 (折叠收纳，默认收起) -->
+        <details class="box cfg-adv">
+          <summary>
+            <h3>高级调度与安全防风控 (点击展开)</h3>
+            <span class="grow"></span>
+            <span class="hint" style="margin:0;">包含熔断降级、在途并发、超时与指纹脱敏等高级参数</span>
+          </summary>
           <div class="pad">
+            <h4 style="margin:0 0 12px;font-size:13px;color:var(--ink-2);">账号池与流量治理</h4>
             <div class="grid3">
               <label class="fld"><span class="lb">单账号最大在途</span>
                 <input name="max_in_flight" type="number" min="0" placeholder="3">
@@ -948,12 +975,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             </div>
             <div class="switch"><span class="lb">快过期积分优先</span>
               <input type="checkbox" name="prefer_expiring"></div>
-          </div>
-        </div>
 
-        <div class="box">
-          <header><h3>上游与高级</h3></header>
-          <div class="pad">
+            <div class="hr"></div>
+            <h4 style="margin:12px 0;font-size:13px;color:var(--ink-2);">上游高级与网络防风控</h4>
             <div class="grid3">
               <label class="fld"><span class="lb">短请求超时</span>
                 <input name="timeout_seconds" type="number" min="1" placeholder="120">
@@ -991,7 +1015,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <input type="checkbox" name="session_sticky_enabled"></div>
             <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
           </div>
-        </div>
+        </details>
 
         <div class="savebar">
           <span class="grow"></span>

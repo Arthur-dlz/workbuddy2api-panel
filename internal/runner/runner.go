@@ -371,6 +371,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err != nil {
 		return nil, fmt.Errorf("read current config: %w", err)
 	}
+	oldCfg, _ := ParseConfig(oldRaw)
 	var cur, incoming map[string]any
 	if err := json.Unmarshal(oldRaw, &cur); err != nil {
 		cur = map[string]any{}
@@ -447,31 +448,55 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		!newCfg.Schedule.GrowthEnabled)
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 
-	return restartRequiredFields(newCfg), nil
+	return restartRequiredFields(oldCfg, newCfg), nil
 }
 
 // restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。
-// 恒返回完整清单中的"与当前进程装配期依赖相关"的项——面板据此提示用户。
-func restartRequiredFields(c *Config) []string {
+// 对比新旧配置，仅返回实际发生变更且无法热生效的项——面板据此提示用户。
+func restartRequiredFields(oldCfg, newCfg *Config) []string {
+	if oldCfg == nil || newCfg == nil {
+		return nil
+	}
 	var out []string
-	// 这些字段在进程内被监听地址/HTTP client/目录句柄等装配期对象捕获。
-	if c.Listen != "" {
+	if oldCfg.Listen != newCfg.Listen {
 		out = append(out, "listen")
 	}
-	if c.Port != 0 {
+	if oldCfg.Port != newCfg.Port {
 		out = append(out, "port")
 	}
-	if c.AuthDir != "" {
+	if oldCfg.AuthDir != newCfg.AuthDir {
 		out = append(out, "auth_dir")
 	}
-	if c.StateFile != "" {
+	if oldCfg.StateFile != newCfg.StateFile {
 		out = append(out, "state_file")
 	}
-	out = append(out, "upstream.timeout_seconds", "upstream.header_timeout_seconds", "upstream.idle_timeout_seconds")
-	if c.Upstash.URL != "" || c.Upstash.Token != "" {
+	if oldCfg.Upstream.TimeoutSeconds != newCfg.Upstream.TimeoutSeconds {
+		out = append(out, "upstream.timeout_seconds")
+	}
+	if oldCfg.Upstream.HeaderTimeoutSeconds != newCfg.Upstream.HeaderTimeoutSeconds {
+		out = append(out, "upstream.header_timeout_seconds")
+	}
+	if oldCfg.Upstream.IdleTimeoutSeconds != newCfg.Upstream.IdleTimeoutSeconds {
+		out = append(out, "upstream.idle_timeout_seconds")
+	}
+	if oldCfg.Upstream.UserAgent != newCfg.Upstream.UserAgent {
+		out = append(out, "upstream.user_agent")
+	}
+	if oldCfg.Upstash.URL != newCfg.Upstash.URL || oldCfg.Upstash.Token != newCfg.Upstash.Token {
 		out = append(out, "upstash")
 	}
-	out = append(out, "session_sticky.ttl", "session_sticky.gc_interval")
+	if oldCfg.SessionSticky.TTL != newCfg.SessionSticky.TTL {
+		out = append(out, "session_sticky.ttl")
+	}
+	if oldCfg.SessionSticky.GCInterval != newCfg.SessionSticky.GCInterval {
+		out = append(out, "session_sticky.gc_interval")
+	}
+	if oldCfg.Prompt.Mode != newCfg.Prompt.Mode {
+		out = append(out, "prompt.mode")
+	}
+	if oldCfg.Prompt.File != newCfg.Prompt.File {
+		out = append(out, "prompt.file")
+	}
 	return out
 }
 
