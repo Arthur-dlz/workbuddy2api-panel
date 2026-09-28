@@ -182,7 +182,7 @@ func rewriteModel(body []byte, bare string) []byte {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return body
 	}
-	if cur, ok := obj["model"].(string); !ok || cur == bare {
+	if cur, ok := obj["model"].(string); ok && cur == bare {
 		return body
 	}
 	obj["model"] = bare
