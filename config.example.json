@@ -1,7 +1,7 @@
 {
   "port": 9527,
   "listen": ":9527",
-  "api_key": "sk-local-workbuddy-key-2026",
+  "api_key": "your-custom-api-key",
   "models": {
     "deepseek-chat": "deepseek-v4-pro",
     "deepseek-reasoner": "deepseek-v4-pro"
@@ -54,28 +54,28 @@
   ],
   "tokens": [
     {
-      "key": "sk-local-workbuddy-key-2026",
+      "key": "sk-your-admin-token",
       "name": "主管理令牌 (全部模型)",
       "enabled": true,
       "models": ["*"],
       "rpm": 0
     },
     {
-      "key": "sk-wb-deepseek-pro",
+      "key": "sk-example-deepseek",
       "name": "WorkBuddy-DeepSeek-Pro",
       "bind_model": "deepseek-v4-pro",
       "enabled": true,
       "rpm": 60
     },
     {
-      "key": "sk-wb-kimi-k3",
+      "key": "sk-example-kimi",
       "name": "WorkBuddy-Kimi-K3",
       "bind_model": "kimi-k3-1",
       "enabled": true,
       "rpm": 60
     },
     {
-      "key": "sk-wb-glm-53",
+      "key": "sk-example-glm",
       "name": "WorkBuddy-GLM-5.3",
       "bind_model": "glm-5.3",
       "enabled": true,
