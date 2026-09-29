@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -404,8 +405,16 @@ func parseRetryNumber(v, headerName string) (time.Duration, bool) {
 	}
 	switch headerName {
 	case "Retry-After":
+		// 先做上限校验再乘 time.Second：16 位数字乘 1e9 会溢出 int64 回绕成
+		// 小正数，进而通过调用方的 retryAfterSanity 校验被当作合法等待时长。
+		if n > int64(retryAfterSanity/time.Second) {
+			return 0, false
+		}
 		return time.Duration(n) * time.Second, true
 	case "Retry-After-Ms":
+		if n > int64(retryAfterSanity/time.Millisecond) {
+			return 0, false
+		}
 		return time.Duration(n) * time.Millisecond, true
 	default: // X-Ratelimit-Reset：epoch → 剩余量
 		sec := n
@@ -622,7 +631,8 @@ type Client struct {
 	globalModels fetchGlobalModelsCache
 
 	// SanitizeFingerprints 出站请求体黑名单指纹脱敏开关（默认 true；false 完全还原）。
-	SanitizeFingerprints bool
+	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
+	SanitizeFingerprints atomic.Bool
 
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
@@ -674,10 +684,9 @@ type Client struct {
 // kongjianguan 4 连击实测经验）。
 func New() *Client {
 	tr := newTransport()
-	return &Client{
+	c := &Client{
 		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		SanitizeFingerprints: true,
 		ChatBaseCN:           "https://copilot.tencent.com",
 		BillingBaseCN:        "https://www.codebuddy.cn",
 		WebBaseCN:            "https://www.workbuddy.cn",
@@ -685,6 +694,8 @@ func New() *Client {
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
 		GlobalEnabled: true,
 	}
+	c.SanitizeFingerprints.Store(true)
+	return c
 }
 
 // chatHTTP 返回聊天专用 client；未设置（如测试只注入 HTTP）时回落 HTTP。
@@ -778,7 +789,7 @@ func (c *Client) prepareBody(body []byte, realm, uid, conversationID string) []b
 		//（issue #84：往 WorkBuddy 上游发 low/max 非法，须降级到 high）。
 		efforts, defs = globalEffortMap(efforts, defs)
 	}
-	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints, efforts, defs)
+	body = PrepareBodyOptWithEffortsAndDefault(body, c.SanitizeFingerprints.Load(), efforts, defs)
 	// prompt_cache_key 注入（P0 费用优化，费用降 ~17×）：按账号隔离的稳定缓存键，
 	// 让同一客户端对同一账号的连续请求命中上游前缀缓存。
 	body = InjectPromptCacheKey(body, uid, conversationID)
@@ -1862,7 +1873,14 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
-	data, err := c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+	// 余额查询同样做瞬时错误有界重试（签到后紧接着的 user-resource 偶发 500/EOF 会让
+	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。
+	var data json.RawMessage
+	err = c.retryBillingTransient(func() error {
+		var e error
+		data, e = c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+		return e
+	})
 	if err != nil {
 		return 0, 0, 0, time.Time{}, 0, err
 	}
@@ -1965,9 +1983,13 @@ func packageRemainUsed(a respAccount) (remain, used, size int64) {
 }
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
+// 偶发上游 5xx（code 10000）或 EOF 瞬时断网做有界重试（见 retryBillingTransient）——
+// 单次抖动不再让该账号整天漏签；「已签到」等业务错误不重试。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
-	return err
+	return c.retryBillingTransient(func() error {
+		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
+		return err
+	})
 }
 
 // IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。

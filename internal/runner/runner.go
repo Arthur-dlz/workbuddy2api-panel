@@ -142,7 +142,7 @@ func Run() {
 	}
 	// 聊天 SSE 流中空闲上限（S3 空闲监控读取）。
 	up.IdleTimeout = time.Duration(cfg.Upstream.IdleTimeoutSeconds) * time.Second
-	up.SanitizeFingerprints = cfg.Features.SanitizeBlacklistFingerprints
+	up.SanitizeFingerprints.Store(cfg.Features.SanitizeBlacklistFingerprints)
 	// 出站 UA 与归属头（issue #42 + 上游同步）：
 	// UserAgent 非空则完全覆盖；ClientVersion/CliVersion 缺省对齐官方形态；
 	// ClientName 非空时 chat 路径注入 X-IDE-* 四头（用量归因对齐官方桌面端）。
@@ -429,7 +429,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		ModelRoutes:          newCfg.ModelRoutes,
 		Tokens:               newCfg.Tokens,
 	})
-	up.SanitizeFingerprints = newCfg.Features.SanitizeBlacklistFingerprints
+	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)

@@ -543,11 +543,18 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+	resp := map[string]any{"ok": true}
 	checkinMsg := ""
 	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
+		if upstream.IsAlreadyCheckin(err) {
+			p.cfg.Pool.NoteCheckinDone(uid)
+			resp["checkin_done"] = true
+		}
+	} else {
+		p.cfg.Pool.NoteCheckinDone(uid)
+		resp["checkin_done"] = true
 	}
-	resp := map[string]any{"ok": true}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}

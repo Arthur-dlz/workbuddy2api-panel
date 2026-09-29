@@ -43,21 +43,32 @@ type TravelState struct {
 
 // growthJSON 发 growth 域请求并解信封；body 为 nil 时不带请求体。
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
+// 接入瞬时错误有界重试（防上游网关空闲连接掐断报 EOF）。
 func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
-	var rdr io.Reader
+	var raw []byte
 	if body != nil {
-		raw, err := json.Marshal(body)
+		var err error
+		raw, err = json.Marshal(body)
 		if err != nil {
 			return nil, err
 		}
-		rdr = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequest(method, c.chatBase(a)+path, rdr)
-	if err != nil {
-		return nil, err
-	}
-	c.BillingHeaders(req, a)
-	return c.doJSON(req)
+	var data json.RawMessage
+	err := c.retryTransportTransient(func() error {
+		var rdr io.Reader
+		if raw != nil {
+			rdr = bytes.NewReader(raw)
+		}
+		req, err := http.NewRequest(method, c.chatBase(a)+path, rdr)
+		if err != nil {
+			return err
+		}
+		c.BillingHeaders(req, a)
+		var e error
+		data, e = c.doJSON(req)
+		return e
+	})
+	return data, err
 }
 
 // TravelStatus 查询猫猫旅行状态。

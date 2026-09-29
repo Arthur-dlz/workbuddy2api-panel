@@ -84,21 +84,31 @@ func (c *Client) ListTasksMP(a *auth.Auth) ([]Task, error) {
 // growthJSONMP 发 growth 域请求（小程序口径：叠加 X-Client-Platform: miniprogram）
 // 并解信封。语义同 growthJSON。
 func (c *Client) growthJSONMP(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
-	var rdr io.Reader
+	var raw []byte
 	if body != nil {
-		raw, err := json.Marshal(body)
+		var err error
+		raw, err = json.Marshal(body)
 		if err != nil {
 			return nil, err
 		}
-		rdr = bytes.NewReader(raw)
 	}
-	req, err := http.NewRequest(method, c.chatBase(a)+path, rdr)
-	if err != nil {
-		return nil, err
-	}
-	c.BillingHeaders(req, a)
-	req.Header.Set("X-Client-Platform", mpPlatform)
-	return c.doJSON(req)
+	var data json.RawMessage
+	err := c.retryTransportTransient(func() error {
+		var rdr io.Reader
+		if raw != nil {
+			rdr = bytes.NewReader(raw)
+		}
+		req, err := http.NewRequest(method, c.chatBase(a)+path, rdr)
+		if err != nil {
+			return err
+		}
+		c.BillingHeaders(req, a)
+		req.Header.Set("X-Client-Platform", mpPlatform)
+		var e error
+		data, e = c.doJSON(req)
+		return e
+	})
+	return data, err
 }
 
 // AcceptTasksMP 接受小程序限定任务（mp 头；缺头实测 task not found）。

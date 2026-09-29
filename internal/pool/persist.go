@@ -159,6 +159,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			softStreak:               s.SoftStreak,
 			sessionDeadFails:         s.SessionDeadFails,
 			consecutiveFails:         s.ConsecutiveFails,
+			lastCheckinDay:           s.LastCheckinDay,
 		}
 		// 到期快照按当前时刻惰性清洗：已过期、零剩余或超出总余额的脏数据不恢复。
 		if e.creditsExpiring < 0 {
@@ -299,6 +300,7 @@ func (p *Pool) stateOverviewLocked() stateFile {
 			CreditsExpiring:          e.creditsExpiring,
 			CreditsEarliestExpiry:    e.creditsEarliestExpiry,
 			CreditsEarliestRemaining: e.creditsEarliestRemaining,
+			LastCheckinDay:           e.lastCheckinDay,
 		}
 		// 熔断截止：仅未过期才落盘（指针 nil 才能被 omitempty 真省略）。
 		if !e.breakerUntil.IsZero() && now.Before(e.breakerUntil) {

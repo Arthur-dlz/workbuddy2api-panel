@@ -12,7 +12,9 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
@@ -59,6 +61,85 @@ func (c *Client) billingMeterJSON(a *auth.Auth, paths []string, method string, b
 		}
 	}
 	return nil, lastErr
+}
+
+// billingRetryDelay 签到/余额/任务等维护类计费调用瞬时错误重试的间隔基数。
+// 独立变量供测试缩短（生产固定 2s：第 1 次重试等 2s、第 2 次等 4s）。
+var billingRetryDelay = 2 * time.Second
+
+// isTransientBillingErr 报告 err 是否值得对计费维护类调用做有界重试：
+// 上游 5xx（ErrServer，实测偶发 "code 10000 / API request failed with status
+// code: 500"）或网络层错误（非 *Error 的传输失败，如 EOF/reset）。业务错误（code!=0 的
+// 已签到/参数错、4xx、限流）不重试——重试只会原样再失败一次。
+func isTransientBillingErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *Error
+	if errors.As(err, &ue) {
+		return ue.Kind == ErrServer
+	}
+	return true
+}
+
+// isTransientTransportErr 判定是否为传输层/连接池半死导致的瞬态断连（如 APISIX/NGW 掐断空闲 TCP 后的 EOF、连接重置）。
+// 这类错误重试前清空空闲连接池即可自愈，且不是 HTTP 层服务端错误或业务错误。
+func isTransientTransportErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ue *Error
+	if errors.As(err, &ue) {
+		return false // 已经拿到 HTTP 响应并解出业务包的，不是底层传输断开
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, net.ErrClosed) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "eof") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "closed network connection")
+}
+
+// retryTransportTransient 对成长/任务等请求做底层传输断连有界重试（专治长连接空闲被上游网关掐断报 EOF）。
+// 不重试 5xx 与业务错误，避免影响只读探针（如连登自检）。
+func (c *Client) retryTransportTransient(fn func() error) error {
+	err := fn()
+	if err == nil || !isTransientTransportErr(err) {
+		return err
+	}
+	for i := 1; i <= 2; i++ {
+		if c != nil && c.HTTP != nil {
+			roundTripCloseIdle(c.HTTP.Transport)
+		}
+		time.Sleep(time.Duration(i) * billingRetryDelay)
+		if err = fn(); err == nil || !isTransientTransportErr(err) {
+			return err
+		}
+	}
+	return err
+}
+
+// retryBillingTransient 对低频维护调用（签到/余额）做瞬时错误有界重试：
+// 最多补打 2 次（间隔 2s、4s），首次成功或非瞬时错误立即返回。
+// 重试前清理空闲连接池，避免连续命中已被上游网关掐断的半死连接。chat 热路径
+// 不用本策略——它有自己的换号轮转语义，重试会放大在途请求。
+func (c *Client) retryBillingTransient(fn func() error) error {
+	err := fn()
+	if err == nil || !isTransientBillingErr(err) {
+		return err
+	}
+	for i := 1; i <= 2; i++ {
+		if c != nil && c.HTTP != nil {
+			roundTripCloseIdle(c.HTTP.Transport)
+		}
+		time.Sleep(time.Duration(i) * billingRetryDelay)
+		if err = fn(); err == nil || !isTransientBillingErr(err) {
+			return err
+		}
+	}
+	return err
 }
 
 // chatRequestEvent 客户端 chat_request_send 事件完整形状（与 probe_active.py chat_event 对齐）。

@@ -8,6 +8,23 @@ import (
 	"time"
 )
 
+// NoteCheckinDone 标记账号今日已签到（签到成功与上游"今天已签到"幂等拒绝均算）。
+// 供面板签到按钮显示"已签"状态，次日自动失效。
+func (p *Pool) NoteCheckinDone(uid string) {
+	if uid == "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if e, ok := p.byUID[uid]; ok {
+		day := time.Now().Format("2006-01-02")
+		if e.lastCheckinDay != day {
+			e.lastCheckinDay = day
+			p.dirty.Store(true)
+		}
+	}
+}
+
 func (p *Pool) SetCredits(uid string, credits, total int64) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

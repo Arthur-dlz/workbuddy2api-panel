@@ -86,6 +86,7 @@ type Status struct {
 	Realm           string     `json:"realm,omitempty"`
 	Disabled        bool       `json:"disabled"`
 	DisabledReason  string     `json:"disabled_reason,omitempty"` // 仅 disabled 账号：禁用原因（运维可见）
+	CheckinDone     bool       `json:"checkin_done,omitempty"`     // 今日是否已签到（供面板签到按钮显示"已签"状态）
 	SuccessCount    int64      `json:"success_count,omitempty"`
 	ErrTotal        int64      `json:"err_total,omitempty"`
 	LastSuccessTime time.Time  `json:"last_success,omitempty"`
@@ -181,7 +182,10 @@ type entry struct {
 	until                    time.Time // 冷却截止（即时冷却：CoolSoft 429 / CoolHard 余额耗尽）
 	disabled                 bool
 	reason                   string
-	lastUsed                 time.Time // 最近被选中时刻（防并发撞号）
+	// lastCheckinDay 最近一次签到成功的本地日期（"2006-01-02"）。签到成功与上游
+	// "今日已签到"幂等拒绝均视为已签。供面板签到按钮显示"已签"状态，次日自动失效。
+	lastCheckinDay string
+	lastUsed       time.Time // 最近被选中时刻（防并发撞号）
 	// usedSeq 单调递增的选中序号：每次被 pick 选中时取 p.pickSeq 自增值。
 	// Windows 等平台 time.Now() 精度有限（~0.5ms），高并发/快速连续选号时多个
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
@@ -434,6 +438,8 @@ type stateAccount struct {
 	// RetryCount 已熔断次数（指数退避的指数）。持久化以保留"越熔越长"的退避累积——
 	// 重启归零会让反复熔断只从最小退避开始。恢复时若 BreakerUntil 已过期则归零。
 	RetryCount int `json:"retry_count,omitempty"`
+	// LastCheckinDay 最近一次签到成功的本地日期（entry.lastCheckinDay 同源）。
+	LastCheckinDay string `json:"last_checkin_day,omitempty"`
 	// CreditsExpiring 快过期积分子集（credits 的子集）。持久化以保留到期路由
 	// （最早到期路由）的偏好——重启后到下次签到之间不应失忆。
 	CreditsExpiring int64 `json:"credits_expiring"`
