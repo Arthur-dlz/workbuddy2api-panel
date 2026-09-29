@@ -46,13 +46,19 @@ WorkBuddy Gateway 是一个自托管的 **OpenAI 兼容反向代理网关**，�
 | 🛡️ **熔断与冷却** | 429 软冷却 600s 起指数退避（封顶 `soft_rate_max`）、404 固定 60s 短冷却、402 硬冷却至次日 04:00、连续失败熔断、在途租约限流 |
 | 🧲 **会话粘性** | 同一会话（`conversation_id`）尽量绑定同一账号，TTL 滚动续期，失败自动解绑，可镜像 Redis 防重启丢失 |
 | ⏰ **定时任务** | 签到（09/21 点，末尾自动跑**连登管家**：兑换已解锁档位 + 抽完抽奖次数）+ 活跃上报（10 点，点亮连登 / 解锁领养 + streak 自检）+ 猫猫旅行（09/21 点，独立排程）+ token 保活（22 点），四类独立开关 |
+| 🪟 **原生 Windows 托盘** | 系统任务栏托盘常驻（单击/双击/右键），静默无黑框后台运行，提供一键打开面板、复制 API 地址与 Key 菜单 |
+| 🌊 **长连接 EOF 自愈** | 任务中心与成长请求内建底层传输断连自动重试与空闲池清空（专治 APISIX 掐断空闲 TCP 报 `EOF`），秒级自愈 |
+| 📋 **今日已签状态感知** | 账号池持久化跟踪 `lastCheckinDay`，面板签到按钮实时呈现「已签」视觉反馈，防重复误操作 |
+| 🥧 **$\pi$ 抖动轮询调度** | 创新性引入 $\pi$ 序列步进算法对各账号余额后台轮询做错峰离散，防止并发惊群，平滑分散上游负载 |
+| 📈 **DeepSeek 用量日历槽** | 精准对齐官方实际 `usage.credit` 扣费账本，提供 DeepSeek 风格日历用量图表与前缀缓存命中率统计 |
+| ⏱️ **睡眠唤醒时钟校准** | 排程槽位采用分段睡眠重评墙钟，彻底消除 Windows 机器睡眠休眠导致单调时钟被冻结滞后的缺陷 |
 | ⚡ **流式 + 非流式** | 出站强制 `stream:true`；SSE 帧按规范白名单重建；非流式由本地聚合为单响应 |
 | 🧠 **推理模型兼容** | DeepSeek 思维链注入（`thinking.type=enabled` + 默认档）、`reasoning_content` 多轮回填、effort 档位自动降级 |
 | 💬 **系统提示词体系** | 网关自有提示词替换客户端 system（默认 `custom`），从源头消灭 system 来源的内容误报；`passthrough` 遇拦截自动降级重试 |
 | 🗑️ **指纹脱敏** | 出站请求体黑名单指纹字段清洗（可关闭），与提示词体系两层叠加 |
 | 📊 **可观测** | 每请求一行表格日志（TTFB / token 速率 / uid）；`/healthz` 带 `service` 身份标识可接负载均衡 / 宿主探活 |
 | 💾 **状态持久化** | 池状态本地原子落盘 + Upstash Redis 异步镜像（可选），重启择新恢复 |
-| 🖥️ **Web 管理面板** | 内嵌单页面板（明暗主题），账号运维 / 模型档位查询 / 在线改配置（热生效）/ 运行日志 / 积分任务，见 [Web 管理面板](#-web-管理面板) |
+| 🖥️ **Web 管理面板** | 内嵌单页面板（明暗主题），账号运维 / 手机号脱敏与自定义昵称 / 模型档位查询 / 在线改配置（热生效）/ 运行日志 / 积分任务，见 [Web 管理面板](#-web-管理面板) |
 
 ## 🎯 成长任务一键完成（17/18）
 
@@ -163,7 +169,18 @@ WorkBuddy Gateway 是一个自托管的 **OpenAI 兼容反向代理网关**，�
 | 粘性按模型判活 | 会话绑定的账号被 6004 模型级限额后，换模型请求自动解绑重分配（治"限额后换不动号"）；`/healthz` 探活计入模型豁免形态（治"全号被单模型限流探活误报 503"） |
 | report 增强 | `ReportChatActivity` 支持独立 `requestID`（同会话多轮上报各条可区分） |
 
-未吸收（明确不做）：脚本体系（task_runner/school 脚本—我们已有更完整的纯 API 实现）、governance/CI workflow、成本账本选号（依赖 usage.credit 观测，收益待验证）。
+**第三轮（`1e23c2b` → `30a3e5e`，2026-09-29，稳健性、并发修复与连接池自愈）**：
+
+| 领域 | 吸收与修复内容 |
+|---|---|
+| **网络层自愈** | 根治腾讯网关（APISIX / NGI）空闲 TCP 掐断引发的 `list tasks: EOF` 报错：实现 `retryTransportTransient` 有界重试与空闲池自动清理，专治长连接假死 |
+| **计费与签到重试** | 吸收 `dd4ea34` 的 `retryBillingTransient`，应对腾讯计费端点偶发的 5xx / code 10000 报错，并在重试前主动排空半死 socket |
+| **已签状态跟踪** | 账号池引入 `lastCheckinDay` / `CheckinDone` 状态跟踪与落盘持久化；面板签到按钮实时呈现「已签」视觉反馈，次日自动刷新 |
+| **任务中心修复** | 达标未领任务（`Target > 0 && Current >= Target`）自动判定为可领奖并推入队列；`startGrowthQueue` 补充 CAS 锁防止重复并发启动 |
+| **时钟校准** | 移植 `97335bd` 的 `waitSlot` 60s 步进分段睡眠，彻底修复 Windows 睡眠唤醒后单调时钟冻结导致定时调度器严重滞后的物理缺陷 |
+| **并发与精度修复** | `SanitizeFingerprints` 改为 `atomic.Bool`（消除热重载与聊天热路径数据竞争）；`parseRetryNumber` 乘法防溢出；`DesktopChatWithExpert` SSE requestId 提取添加游标递增防死读 1MB；`NoteModelCost` 多维积分独立扣减 |
+
+未吸收（明确不做）：上游将逻辑回塞至单体 `main.go` 的重构；上游重写 `r.Add` 导致无法兼容自研 DeepSeek 实际用量与前缀缓存的统计实现。
 
 ### 未做 / 待办
 
@@ -261,28 +278,38 @@ docker compose restart          # 重启
 docker compose down             # 停止并移除容器（数据在 ./auths 与 ./data，不受影响）
 ```
 
-### 方式二：Windows 单文件运行（无需 Docker）
+### 方式二：Windows 单文件运行（无需 Docker，推荐）
+
+本项目专为 Windows 环境提供了**一键启动脚本**与**静默系统托盘模式**：
+
+1. **一键后台静默运行（推荐）**：
+   - 双击 **`start.bat`** 即可在后台静默启动（带原生 Windows 系统托盘图标）；
+   - 自动在浏览器打开控制面板 **`http://127.0.0.1:9527/panel/`**；
+   - 首次启动若目录下无 `config.json`，会自动生成推荐配置（含高强随机生成的 `api_key`）。
+2. **控制台调试模式**：
+   - 双击 **`debug.bat`**，控制台窗口将实时滚屏输出请求明细与任务调度日志，便于排查；
+3. **一键安全停止**：
+   - 双击 **`stop.bat`** 即可安全优雅退出网关进程。
+
+如果需要自行从源码构建：
 
 ```powershell
-# 1) 下载 Release 中的 wb2api.exe，或从源码构建
-go build -trimpath -ldflags="-s -w" -o wb2api.exe ./cmd/server
+# 编译标准命令行版本
+go build -ldflags="-s -w" -o workbuddy-gateway.exe ./main.go
 
-# 2) 直接运行：首次启动自动生成 config.json（含随机 api_key，日志打印一次）
-.\wb2api.exe -config config.json
-
-# 3) 浏览器打开面板添加账号
-#    http://127.0.0.1:7863/panel/
+# 编译 Windows 静默无黑框托盘版本
+go build -ldflags="-s -w -H windowsgui" -o workbuddy-gateway-tray.exe ./main.go
 ```
 
-exe 为**单文件自包含**（前端资源已 embed 进二进制），拷到任意 Windows 机器即可运行，只需保证 `auths/`（凭证）与 `data/`（状态）目录可写。
+exe 为**单文件自包含**（前端资源与静态资产已 embed 进二进制），拷到任意机器即可运行，只需保证同目录下的 `auths/`（凭证）与 `data/`（状态）目录可写。
 
 ### 方式三：源码运行（开发调试）
 
 ```bash
 go build ./...
 go vet ./...
-go test ./...                      # 完整测试套件
-go run ./cmd/server -config config.json
+go test ./...                      # 完整测试套件（含单元测试与 JS 语法校验）
+go run ./main.go -config config.json
 ```
 
 构建全部二进制：
@@ -298,7 +325,7 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 
 **方式 A：Web 面板（推荐，各平台通用，免命令行）**
 
-打开 `http://127.0.0.1:7863/panel/`，点右上角「**添加账号**」：面板展示授权链接 → 浏览器完成登录 → 自动检测并落盘凭证 → **热加载进池（无需重启）**，顺带完成首次签到。
+打开 `http://127.0.0.1:9527/panel/`（Docker 部署默认为 `http://127.0.0.1:7863/panel/`），点右上角「**添加账号**」：面板展示授权链接 → 浏览器完成登录 → 自动检测并落盘凭证 → **热加载进池（无需重启）**，顺带完成首次签到。
 
 **方式 B：命令行脚本（仅 Linux / macOS，依赖 bash + python3）**
 
@@ -313,21 +340,23 @@ CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o credit ./cmd/credit
 
 ### 验证
 
+> 注：以下请求示例基于本机默认端口 `9527`（若使用 Docker 镜像请改为 `7863`）。
+
 ```bash
 # 模型列表
-curl -s http://localhost:7863/v1/models -H "Authorization: Bearer your-api-key"
+curl -s http://localhost:9527/v1/models -H "Authorization: Bearer your-api-key"
 
 # 账号状态（汇总 + 每账号详情，disabled 账号透出 disabled_reason）
-curl -s http://localhost:7863/status -H "Authorization: Bearer your-api-key"
+curl -s http://localhost:9527/status -H "Authorization: Bearer your-api-key"
 
 # 流式聊天
-curl -sN http://localhost:7863/v1/chat/completions \
+curl -sN http://localhost:9527/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":true}'
 
 # 非流式聊天（本地聚合）
-curl -s http://localhost:7863/v1/chat/completions \
+curl -s http://localhost:9527/v1/chat/completions \
   -H "Authorization: Bearer your-api-key" \
   -H "Content-Type: application/json" \
   -d '{"model":"deepseek-v4-flash","messages":[{"role":"user","content":"hi"}],"stream":false}'
@@ -532,20 +561,22 @@ curl -s http://localhost:7863/v1/chat/completions \
 内嵌式管理面板（`internal/panel`，前端 go:embed 单文件打进二进制，无外部构建依赖），服务启动后访问：
 
 ```
-http://127.0.0.1:7863/panel/
+http://127.0.0.1:9527/panel/
+# （若使用 Docker 镜像请访问 http://127.0.0.1:7863/panel/）
 ```
 
 鉴权与 API 同口径：`api_key` 非空时面板要求输入一次密钥（浏览器 localStorage 记住）；为空则直接可用。
-界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航分四个视图：
+界面支持**明暗主题切换**（首次跟随系统偏好，点击按钮两态翻转并记住选择），左侧导航分多个视图：
 
 | 视图 | 功能 |
 |---|---|
-| **账号池** | 统计条（总数/可用/冷却/禁用/可用积分合计/粘性会话）+ 账号表：状态标签（可用/限流冷却/积分冷却/熔断/已禁用）、积分量条、成功失败计数、在途、单号操作（签到/余额/任务/解冻/禁用/移除）；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」 |
+| **账号池** | 统计条（总数/可用/冷却/禁用/可用积分合计/粘性会话）+ 账号表：状态标签（可用/限流冷却/积分冷却/熔断/已禁用）、手机号脱敏与**自定义昵称备注**修改、积分量条与到期分布、成功失败计数、在途、单号操作（签到/**「已签」视觉反馈**/余额/任务/解冻/禁用/移除）；批量「全部签到」「旅行巡检」「活跃上报」「全部保活」 |
+| **用量分析** | 精致的 **DeepSeek 风格用量与缓存命中率图表**：逐请求与日历用量槽深度分析、各模型每千 token 实测单价（EMA 成本台账）及上下文缓存率统计 |
 | **添加账号**（顶部按钮） | 浏览器内完成 OAuth 设备授权（显示授权链接 + 自动轮询），登录后凭证落盘并**热加载进池，免重启** |
-| **积分任务**（账号行内「任务」按钮） | 展示全部任务（进度 / 奖励分数与能量 / 状态）；「全部接受」批量报名；「一键完成」覆盖 **17 个任务**（推进进度 + 异步计分等待 + **自动领奖**，幂等可重复点）；其余任务展示操作指引 |
+| **积分任务**（账号行内「任务」按钮） | 展示全部任务（进度 / 奖励分数与能量 / 状态）；「全部接受」批量报名；「一键完成」覆盖 **17 个任务**（推进进度 + 异步计分等待 + **自动领奖**，底层传输 EOF 自愈重试，幂等可重复点）；其余任务展示操作指引 |
 | **模型与档位** | 实时查询上游：每模型的积分倍率、默认思考档、支持的档位（含「off（可关）」）、上下文长度与最大输出；若存在探测数据，最大输出列显示**实测上限与钳制告警**（见「探测模型真实输出上限」） |
-| **配置** | 在线编辑 config.json：API 密钥、定时任务（四类任务时点与开关、余额刷新间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关 |
-| **运行日志** | 最近 500 行服务日志 + 请求表格日志（可开关自动滚动） |
+| **配置** | 在线编辑 config.json：API 密钥、定时任务（四类任务时点与开关、$\pi$ 抖动轮询间隔）、账号池与流量治理参数、上游超时与 UA、提示词模式、脱敏/粘性开关 |
+| **运行日志** | 最近 500 行服务日志 + 请求表格日志（可开关自动滚动，分系统/对话/任务频道） |
 
 **配置热生效**：保存配置后，`api_key`、`cooldown.soft_rate`、`features.sanitize_blacklist_fingerprints`、
 `pool.*`（熔断/在途/权重）、`schedule.*`（时点/开关/余额刷新间隔）**立即生效，无需重启**；

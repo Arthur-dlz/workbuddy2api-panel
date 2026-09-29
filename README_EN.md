@@ -41,7 +41,11 @@
 |---|---|
 | 🖥️ **Web Dashboard** | Built-in graphite dark/light theme dashboard for real-time traffic inspection, hot-reloading configurations, and visual account management. |
 | 🪟 **Native Windows Tray** | Run silently in the background with a system tray icon. Right-click to open panel, copy endpoints, or grab API keys. |
+| 🌊 **Transient EOF Self-Healing** | Built-in connection-level retry & idle pool cleanup preventing upstream APISIX socket drops (`list tasks: EOF`). |
+| 📋 **Check-in Done Tracking** | Visual "Done" feedback for today's check-in on the dashboard backed by persistent `lastCheckinDay` state. |
 | 🤖 **Automated Quest Manager** | Automatic pet expeditions (adopt, travel, claim loot), daily active streak checks, and background token keep-alives. |
+| 🥧 **$\pi$-Jittered Polling** | Mathematical $\pi$-sequence pseudo-random offset dispersion for staggered background balance polling. |
+| ⏱️ **Sleep Clock Calibration** | Segmented sleep loop with wallclock checks preventing monotonicity timer freezes when Windows sleeps. |
 | 📊 **Token & Cost Analytics** | Dual-dimension heatmap & calendar breakdown for token consumption, aligned with official credit calculations. |
 | 🛡️ **Fault Tolerance & Circuit Breaking** | Model-level 429 adaptive throttling, exponential backoff cooling, automatic retry on alternative accounts. |
 | 🧲 **Sticky Sessions** | Keeps the same conversation (`conversation_id`) bound to a single upstream account to prevent cross-account context corruption. |
