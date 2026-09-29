@@ -31,6 +31,14 @@ func normalizeUsageCacheAliases(usage map[string]any) map[string]any {
 	return out
 }
 
+// BestUsageCacheHitTokens 从 usage map 中提取最佳的 cache hit tokens（整型返回）。
+func BestUsageCacheHitTokens(usage map[string]any) (int64, bool) {
+	if f, ok := bestUsageCacheHitTokens(usage); ok && f > 0 {
+		return int64(f), true
+	}
+	return 0, false
+}
+
 func bestUsageCacheHitTokens(usage map[string]any) (float64, bool) {
 	paths := []struct {
 		section string

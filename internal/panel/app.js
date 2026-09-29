@@ -2094,6 +2094,9 @@ function fmtTok(n) {
   if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
   return String(Math.round(n));
 }
+function fmtInt(n) {
+  return Math.round(Number(n || 0)).toLocaleString('en-US');
+}
 function fmtMs(ms) {
   ms = Number(ms || 0);
   if (!ms) return '—';
@@ -2776,15 +2779,15 @@ function renderTokBarChart(series, hours) {
       out += `<g>${barSvg}</g>`;
     }
   } else {
-    // ── 按类型模式 ──
+    // ── 按类型模式（对齐 DeepSeek 蓝阶三段式：输出 -> 输入未命中 -> 输入命中） ──
     if ($('chartTokLegend')) {
       $('chartTokLegend').innerHTML =
-        '<span><i class="sw" style="background:#2563eb;"></i>Prompt</span>' +
-        '<span><i class="sw" style="background:#60a5fa;"></i>Cache命中</span>' +
-        '<span><i class="sw" style="background:#10b981;"></i>Completion</span>';
+        '<span><i class="sw" style="background:#86d3ff;"></i>输入（命中缓存）</span>' +
+        '<span><i class="sw" style="background:#38bdf8;"></i>输入（未命中缓存）</span>' +
+        '<span><i class="sw" style="background:#2563eb;"></i>输出</span>';
     }
 
-    // 渲染各槽类型堆叠柱：Prompt(#2563eb) -> Cache(#60a5fa) -> Completion(#10b981)
+    // 渲染各槽类型堆叠柱：输出(#2563eb) -> 未命中(#38bdf8) -> 命中(#86d3ff)
     for (let i = 0; i < slots.length; i++) {
       const s = slots[i];
       if (s.tt <= 0) continue;
@@ -2792,25 +2795,25 @@ function renderTokBarChart(series, hours) {
       const x = PL + (i + 0.5) * slotWidth - bw / 2;
       const hTot = ih * (s.tt / maxVal);
 
-      const realPrompt = Math.max(0, s.pt - s.cached);
-      const cached = Math.min(s.cached, s.pt);
-      const comp = s.ct;
-      const tokSum = realPrompt + cached + comp;
+      const cached = Math.min(Math.max(0, Number(s.cached || 0)), Math.max(0, Number(s.pt || 0)));
+      const unhit = Math.max(0, Number(s.pt || 0) - cached);
+      const comp = Math.max(0, Number(s.ct || 0));
+      const tokSum = cached + unhit + comp;
 
-      let hRealPrompt = 0, hCached = 0, hComp = 0;
-      if (tokSum > 0) {
-        hRealPrompt = hTot * (realPrompt / tokSum);
-        hCached = hTot * (cached / tokSum);
-        hComp = Math.max(0, hTot - hRealPrompt - hCached);
+      let hComp = 0, hUnhit = 0, hCached = 0;
+      if (tokSum > 0 && hTot > 0) {
+        hComp = hTot * (comp / tokSum);
+        hUnhit = hTot * (unhit / tokSum);
+        hCached = Math.max(0, hTot - hComp - hUnhit);
       } else {
-        hRealPrompt = hTot;
+        hUnhit = hTot;
       }
 
       const segments = [];
-      if (hRealPrompt > 0.05) segments.push({ h: hRealPrompt, fill: '#2563eb' });
-      if (hCached > 0.05) segments.push({ h: hCached, fill: '#60a5fa' });
-      if (hComp > 0.05) segments.push({ h: hComp, fill: '#10b981' });
-      if (segments.length === 0 && hTot > 0.05) segments.push({ h: hTot, fill: '#2563eb' });
+      if (hComp > 0.05) segments.push({ h: hComp, fill: '#2563eb' });
+      if (hUnhit > 0.05) segments.push({ h: hUnhit, fill: '#38bdf8' });
+      if (hCached > 0.05) segments.push({ h: hCached, fill: '#86d3ff' });
+      if (segments.length === 0 && hTot > 0.05) segments.push({ h: hTot, fill: '#38bdf8' });
 
       if (segments.length > 0) {
         let accH = 0;
@@ -2890,15 +2893,10 @@ function renderTokBarChart(series, hours) {
       const dateStr = isHourly
         ? s.raw.replace('T', ' ') + ':00'
         : s.raw.slice(0, 10);
-      let content = `<div class="tip-title">${esc(dateStr)}</div>`;
 
+      let content = '';
       if (currentTokChartMode === 'model') {
-        content += `
-          <div class="tip-row" style="margin-bottom:6px;">
-            <span class="tip-label">总消耗 Token</span>
-            <span class="tip-val" style="color:var(--ink);">${fmtTok(s.tt)}</span>
-          </div>
-        `;
+        content = `<div class="tip-title"><span>${esc(dateStr)}</span><span class="tot">${fmtInt(s.tt)}</span></div>`;
         const mEntries = Object.entries(s.models || {}).filter(([_, v]) => v > 0);
         mEntries.sort((a, b) => b[1] - a[1]);
         if (mEntries.length > 0) {
@@ -2909,7 +2907,7 @@ function renderTokBarChart(series, hours) {
             content += `
               <div class="tip-row">
                 <span class="tip-label" title="${esc(mName)}"><i class="sw" style="background:${color};"></i>${esc(shortName)}</span>
-                <span class="tip-val">${fmtTok(mTok)}</span>
+                <span class="tip-val">${fmtInt(mTok)}</span>
               </div>
             `;
           }
@@ -2918,7 +2916,7 @@ function renderTokBarChart(series, hours) {
             content += `
               <div class="tip-row">
                 <span class="tip-label"><i class="sw" style="background:${COLOR_OTHER};"></i>其他模型</span>
-                <span class="tip-val">${fmtTok(otherSum)}</span>
+                <span class="tip-val">${fmtInt(otherSum)}</span>
               </div>
             `;
           }
@@ -2926,23 +2924,24 @@ function renderTokBarChart(series, hours) {
           content += `<div class="tip-row"><span class="tip-label" style="color:var(--ink-3);">无模型消耗明细</span></div>`;
         }
       } else {
-        const hr = s.pt > 0 ? (s.cached / s.pt * 100) : 0;
+        const cached = Math.min(Math.max(0, Number(s.cached || 0)), Math.max(0, Number(s.pt || 0)));
+        const unhit = Math.max(0, Number(s.pt || 0) - cached);
+        const comp = Math.max(0, Number(s.ct || 0));
+        const total = cached + unhit + comp;
+
+        content = `<div class="tip-title"><span>${esc(dateStr)}</span><span class="tot">${fmtInt(total)}</span></div>`;
         content += `
-          <div class="tip-row" style="margin-bottom:6px;">
-            <span class="tip-label">总消耗 Token</span>
-            <span class="tip-val" style="color:var(--ink);">${fmtTok(s.tt)}</span>
+          <div class="tip-row">
+            <span class="tip-label"><i class="sw" style="background:#86d3ff;"></i>输入（命中缓存）</span>
+            <span class="tip-val">${fmtInt(cached)}</span>
           </div>
           <div class="tip-row">
-            <span class="tip-label"><i class="sw" style="background:#2563eb;"></i>Prompt</span>
-            <span class="tip-val">${fmtTok(s.pt)}</span>
+            <span class="tip-label"><i class="sw" style="background:#38bdf8;"></i>输入（未命中缓存）</span>
+            <span class="tip-val">${fmtInt(unhit)}</span>
           </div>
           <div class="tip-row">
-            <span class="tip-label"><i class="sw" style="background:#60a5fa;"></i>Cache 命中</span>
-            <span class="tip-val" style="color:#2563eb;">${fmtTok(s.cached)} <span style="font-size:10px;font-weight:normal;color:var(--ink-3)">(${hr.toFixed(0)}%)</span></span>
-          </div>
-          <div class="tip-row">
-            <span class="tip-label"><i class="sw" style="background:#10b981;"></i>Completion</span>
-            <span class="tip-val" style="color:#10b981;">${fmtTok(s.ct)}</span>
+            <span class="tip-label"><i class="sw" style="background:#2563eb;"></i>输出</span>
+            <span class="tip-val">${fmtInt(comp)}</span>
           </div>
         `;
       }
@@ -3180,22 +3179,43 @@ function summarizeCreditDays(list, now) {
 function renderExpiryDistribution(list, now) {
   const summary = summarizeCreditDays(list, now);
   const colors = pkAccountColorMap(list);
+  const maxCredits = summary.rows.length ? Math.max(...summary.rows.map(r => r.credits), 1) : 1;
+  const minCredits = summary.rows.length ? Math.min(...summary.rows.map(r => r.credits), 1) : 1;
+  const ratio = maxCredits / Math.max(1, minCredits);
+
   const rows = summary.rows.map(row => {
     const total = row.credits || 1;
+    let pct;
+    if (ratio > 4) {
+      pct = 18 + 82 * Math.pow(Math.max(0, row.credits) / maxCredits, 0.42);
+    } else {
+      pct = Math.max(12, (Math.max(0, row.credits) / maxCredits) * 100);
+    }
+    pct = Math.min(100, Math.max(1, pct));
+
     const nodes = row.segments.map(segment => {
       const color = colors.get(segment.uid) || 'var(--accent)';
-      const title = segment.source + '\n' + fmtTok(segment.amount) + ' 积分\n到期时间 ' +
-        pkExpiryDateTime(segment.expiresAt) + '（' + pkExpiryText(segment.expiresAt) + '）\n' +
-        segment.accountName;
+      const exp = pkExpiryDateTime(segment.expiresAt);
+      const expText = pkExpiryText(segment.expiresAt);
+      const flexVal = Math.max(0.008, segment.amount / total).toFixed(4);
+      const label = segment.accountName + ' · ' + segment.source + ' · ' + fmtInt(segment.amount) + ' 积分';
       return '<span class="pk-expiry-seg" style="--seg-color:' + color +
         ';opacity:' + pkCreditOpacity(segment.days).toFixed(5) +
-        ';flex:' + Math.max(0.008, segment.amount / total).toFixed(4) +
-        ' 1 0" title="' + esc(title) + '" aria-label="' + esc(title) + '"></span>';
+        ';flex:' + flexVal + ' 1 0"' +
+        ' data-acc="' + esc(segment.accountName) + '"' +
+        ' data-src="' + esc(segment.source) + '"' +
+        ' data-amt="' + esc(segment.amount) + '"' +
+        ' data-exp="' + esc(exp) + '"' +
+        ' data-exptext="' + esc(expText) + '"' +
+        ' data-color="' + esc(color) + '"' +
+        ' aria-label="' + esc(label) + '"></span>';
     }).join('');
+
     return '<div class="pk-expiry-row"><span>' + esc(row.days === 0 ? '已到期' : row.days + ' 天') +
-      '</span><div class="pk-expiry-track">' + nodes + '</div><b>' + esc(fmtTok(row.credits)) +
-      '</b></div>';
+      '</span><div class="pk-expiry-track-wrap"><div class="pk-expiry-track" style="width:' + pct.toFixed(2) + '%">' +
+      nodes + '</div></div><b>' + esc(fmtTok(row.credits)) + '</b></div>';
   }).join('');
+
   const foot = summary.accountCount + ' 个账号' +
     (summary.unavailable ? ' · ' + summary.unavailable + ' 个未获取余额' : '');
   const legend = (list || []).filter(a =>
@@ -3208,6 +3228,128 @@ function renderExpiryDistribution(list, now) {
     : '<div class="pk-expiry-empty">暂无可汇总积分</div>') +
     (legend ? '<div class="pk-expiry-legend">' + legend + '</div>' : '') +
     '<div class="pk-expiry-foot">' + esc(foot) + '</div>';
+
+  initExpiryTip();
+  const tip = $('pkInstantTip');
+  if (tip) tip.classList.remove('active');
+}
+
+function getOrCreateInstantTip() {
+  let tip = $('pkInstantTip');
+  if (!tip) {
+    tip = document.createElement('div');
+    tip.id = 'pkInstantTip';
+    tip.className = 'pk-instant-tip';
+    document.body.appendChild(tip);
+  }
+  return tip;
+}
+
+function initExpiryTip() {
+  const expiryBox = $('pkExpiry');
+  if (!expiryBox || expiryBox._tipBound) return;
+  expiryBox._tipBound = true;
+
+  const tip = getOrCreateInstantTip();
+  let activeSeg = null;
+
+  const hide = () => {
+    activeSeg = null;
+    tip.classList.remove('active');
+  };
+
+  const renderTip = (seg) => {
+    const acc = seg.dataset.acc || '';
+    const src = seg.dataset.src || '';
+    const amt = Number(seg.dataset.amt || 0);
+    const exp = seg.dataset.exp || '—';
+    const expText = seg.dataset.exptext || '';
+    const color = seg.dataset.color || 'var(--accent, #38bdf8)';
+    const isExpired = expText.includes('已到期');
+
+    tip.innerHTML =
+      '<div class="tip-head">' +
+        '<i class="tip-dot" style="background:' + esc(color) + ';--dot-color:' + esc(color) + ';"></i>' +
+        '<span class="tip-head-title">' + esc(acc) + '</span>' +
+      '</div>' +
+      '<div class="tip-row">' +
+        '<span class="tip-k">来源包</span>' +
+        '<span class="tip-v-text" title="' + esc(src) + '">' + esc(src) + '</span>' +
+      '</div>' +
+      '<div class="tip-row">' +
+        '<span class="tip-k">批次积分</span>' +
+        '<span class="tip-v" style="color:#38bdf8;">' + esc(fmtInt(amt)) + ' 积分' +
+          (amt >= 1000 ? ' <span style="font-size:10px;opacity:0.8;font-weight:normal;">(' + fmtTok(amt) + ')</span>' : '') +
+        '</span>' +
+      '</div>' +
+      '<div class="tip-row">' +
+        '<span class="tip-k">到期时间</span>' +
+        '<span class="tip-v">' + esc(exp) + '</span>' +
+      '</div>' +
+      '<div class="tip-row">' +
+        '<span class="tip-k">剩余状态</span>' +
+        '<span class="tip-v" style="color:' + (isExpired ? '#f87171' : '#34d399') + ';">' + esc(expText) + '</span>' +
+      '</div>';
+  };
+
+  const updatePos = (clientX, clientY) => {
+    const pad = 12;
+    const tipW = tip.offsetWidth || 210;
+    const tipH = tip.offsetHeight || 135;
+    const winW = window.innerWidth;
+    const winH = window.innerHeight;
+
+    let left = clientX + 14;
+    let top = clientY + 14;
+
+    if (left + tipW + pad > winW) {
+      left = clientX - tipW - 14;
+    }
+    if (left < pad) {
+      left = pad;
+    }
+
+    if (top + tipH + pad > winH) {
+      top = clientY - tipH - 14;
+    }
+    if (top < pad) {
+      top = pad;
+    }
+
+    tip.style.left = left + 'px';
+    tip.style.top = top + 'px';
+  };
+
+  expiryBox.addEventListener('mouseover', (e) => {
+    const seg = e.target.closest('.pk-expiry-seg');
+    if (!seg) {
+      if (activeSeg) hide();
+      return;
+    }
+    if (seg === activeSeg) return;
+    activeSeg = seg;
+    renderTip(seg);
+    tip.classList.add('active');
+    updatePos(e.clientX, e.clientY);
+  });
+
+  expiryBox.addEventListener('mousemove', (e) => {
+    const seg = e.target.closest('.pk-expiry-seg');
+    if (!seg) {
+      if (activeSeg) hide();
+      return;
+    }
+    if (seg !== activeSeg) {
+      activeSeg = seg;
+      renderTip(seg);
+      tip.classList.add('active');
+    }
+    updatePos(e.clientX, e.clientY);
+  });
+
+  expiryBox.addEventListener('mouseleave', hide);
+  expiryBox.addEventListener('scroll', hide, { passive: true, capture: true });
+  window.addEventListener('scroll', hide, { passive: true });
 }
 
 function renderPackages(d, detailLimit) {

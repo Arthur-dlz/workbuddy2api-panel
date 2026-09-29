@@ -82,6 +82,22 @@ func TestChatStatsReaderLastFrameUsageWins(t *testing.T) {
 	}
 }
 
+func TestChatStatsReaderCachedTokens(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n" +
+		"data: {\"usage\":{\"prompt_tokens\":1000,\"completion_tokens\":50,\"total_tokens\":1050,\"prompt_tokens_details\":{\"cached_tokens\":800}}}\n\n" +
+		"data: [DONE]\n\n"
+	r := newChatStatsReaderSince(strings.NewReader(sse), time.Now())
+	_, _ = io.Copy(io.Discard, r)
+	cached, ok := r.CachedTokens()
+	if !ok || cached != 800 {
+		t.Fatalf("cachedTokens=%d ok=%v, want 800/true", cached, ok)
+	}
+	u := r.Usage()
+	if !u.HasPromptTokens || u.PromptTokens != 1000 {
+		t.Fatalf("promptTokens=%d, want 1000", u.PromptTokens)
+	}
+}
+
 func TestChatStatsReaderTTFBOnlyOnDataFrame(t *testing.T) {
 	start := time.Now().Add(-2 * time.Second)
 	var s chatStatsReader

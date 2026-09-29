@@ -1344,7 +1344,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.status = http.StatusBadGateway
 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			}
-			recordAttempt(acct.UID, stats.Usage(), 0, attemptStarted)
+			cachedT, _ := stats.CachedTokens()
+			recordAttempt(acct.UID, stats.Usage(), cachedT, attemptStarted)
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -1373,11 +1374,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		var cachedT int64
 		if u, ok := resp["usage"].(map[string]any); ok {
-			if c, ok := u["prompt_cache_hit_tokens"].(float64); ok { cachedT = int64(c) }
-			if c, ok := u["cache_read_input_tokens"].(float64); ok && int64(c) > cachedT { cachedT = int64(c) }
-			if c, ok := u["cached_tokens"].(float64); ok && int64(c) > cachedT { cachedT = int64(c) }
-			if p, ok := u["prompt_tokens_details"].(map[string]any); ok {
-				if c, ok := p["cached_tokens"].(float64); ok && int64(c) > cachedT { cachedT = int64(c) }
+			if c, hit := upstream.BestUsageCacheHitTokens(u); hit {
+				cachedT = c
 			}
 		}
 		recordAttempt(acct.UID, usageDeltaFromResponse(resp), cachedT, attemptStarted)

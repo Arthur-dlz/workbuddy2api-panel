@@ -13,6 +13,7 @@ import (
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/pool"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
 )
 
 // chatSeq 进程级请求序号。
@@ -79,7 +80,10 @@ type chatStatsReader struct {
 	// credit 上游末帧 usage.credit（本次真实扣费积分），供成本台账（NoteModelCost）。
 	hasCredit bool
 	credit    float64
-	pend      []byte // 已读未返回的行缓存
+	// cachedTokens 上游末帧 usage 中提取的 prompt cache 命中 token 数量。
+	hasCachedTokens bool
+	cachedTokens    int64
+	pend            []byte // 已读未返回的行缓存
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
@@ -99,6 +103,9 @@ func (s *chatStatsReader) Credit() (float64, bool) { return s.credit, s.hasCredi
 // TotalTokens 返回末帧 usage.total_tokens 与是否缺失。
 func (s *chatStatsReader) TotalTokens() (int, bool) { return s.totalTokens, s.hasTotalTokens }
 
+// CachedTokens 返回末帧 usage 中提取的 prompt cache 命中 token 数量与是否命中。
+func (s *chatStatsReader) CachedTokens() (int64, bool) { return s.cachedTokens, s.hasCachedTokens }
+
 // Usage 返回流式响应中已收到的 token usage 字段。
 func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 	return pool.TokenUsageDelta{
@@ -111,7 +118,7 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 	}
 }
 
-// parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens。
+// parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens 与 prompt 缓存。
 func (s *chatStatsReader) parseSSELine(line string) {
 	line = strings.TrimRight(line, "\r\n")
 	if !strings.HasPrefix(line, "data: ") {
@@ -125,33 +132,63 @@ func (s *chatStatsReader) parseSSELine(line string) {
 		s.seen = true
 		s.ttfb = time.Since(s.start)
 	}
+
+	// 性能剪枝：首帧记录 TTFB 后，后续 99% 的纯文本正文帧均不含 "usage"，直接短路退出，消除大量 json 反序列化开销
+	if !strings.Contains(payload, `"usage"`) {
+		return
+	}
+
 	var chunk struct {
-		Usage *struct {
-			PromptTokens     *int     `json:"prompt_tokens"`
-			CompletionTokens *int     `json:"completion_tokens"`
-			TotalTokens      *int     `json:"total_tokens"`
-			Credit           *float64 `json:"credit"`
-		} `json:"usage"`
+		Usage map[string]any `json:"usage"`
 	}
 	if json.Unmarshal([]byte(payload), &chunk) != nil || chunk.Usage == nil {
 		return
 	}
-	if chunk.Usage.PromptTokens != nil {
+
+	if pt, ok := readIntMetric(chunk.Usage["prompt_tokens"]); ok {
 		s.hasPromptTokens = true
-		s.promptTokens = *chunk.Usage.PromptTokens
+		s.promptTokens = pt
 	}
-	if chunk.Usage.CompletionTokens != nil {
+	if ct, ok := readIntMetric(chunk.Usage["completion_tokens"]); ok {
 		s.hasCompletionTokens = true
-		s.completionTokens = *chunk.Usage.CompletionTokens
+		s.completionTokens = ct
 	}
-	if chunk.Usage.TotalTokens != nil {
+	if tt, ok := readIntMetric(chunk.Usage["total_tokens"]); ok {
 		s.hasTotalTokens = true
-		s.totalTokens = *chunk.Usage.TotalTokens
+		s.totalTokens = tt
 	}
-	if chunk.Usage.Credit != nil {
+	if cr, ok := readFloatMetric(chunk.Usage["credit"]); ok {
 		s.hasCredit = true
-		s.credit = *chunk.Usage.Credit
+		s.credit = cr
 	}
+	if ch, ok := upstream.BestUsageCacheHitTokens(chunk.Usage); ok && ch > 0 {
+		s.hasCachedTokens = true
+		s.cachedTokens = ch
+	}
+}
+
+func readIntMetric(v any) (int, bool) {
+	switch n := v.(type) {
+	case float64:
+		return int(n), n >= 0
+	case int:
+		return n, n >= 0
+	case int64:
+		return int(n), n >= 0
+	}
+	return 0, false
+}
+
+func readFloatMetric(v any) (float64, bool) {
+	switch n := v.(type) {
+	case float64:
+		return n, n >= 0
+	case int:
+		return float64(n), n >= 0
+	case int64:
+		return float64(n), n >= 0
+	}
+	return 0, false
 }
 
 // Read 返回原始数据，同时解析统计 TTFB/token。
