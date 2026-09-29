@@ -231,3 +231,61 @@ process.stdout.write(JSON.stringify({
 		t.Fatalf("expiry summary=%s want %s", out, want)
 	}
 }
+
+// TestAppJSMaskPhone 验证前端 maskPhone 对手机号脱敏与非手机号原样保留的准确性。
+func TestAppJSMaskPhone(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; maskPhone test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function maskPhone');
+const end = src.indexOf('function esc');
+if (start < 0 || end < 0) throw new Error('maskPhone function not found');
+const fnCode = src.slice(start, end);
+const ctx = {};
+vm.createContext(ctx);
+vm.runInContext(fnCode, ctx);
+
+const tests = [
+  { in: '19926424159', want: '199****4159' },
+  { in: '+8619926424159', want: '+86199****4159' },
+  { in: '+86 19926424159', want: '+86 199****4159' },
+  { in: '+86-19926424159', want: '+86-199****4159' },
+  { in: '86-19926424159', want: '86-199****4159' },
+  { in: '13800138000', want: '138****8000' },
+  { in: '张三', want: '张三' },
+  { in: 'admin-account', want: 'admin-account' },
+  { in: '12345', want: '12345' },
+  { in: 'uid_19926424159_test', want: 'uid_19926424159_test' },
+  { in: '', want: '' },
+  { in: null, want: '' }
+];
+
+for (const tc of tests) {
+  const got = ctx.maskPhone(tc.in);
+  if (got !== tc.want) {
+    throw new Error('maskPhone(' + JSON.stringify(tc.in) + ') = ' + JSON.stringify(got) + ', want ' + JSON.stringify(tc.want));
+  }
+}
+process.stdout.write('MASK_OK');
+`
+	f, err := os.CreateTemp(t.TempDir(), "mask-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("maskPhone test failed: %v\n%s", err, out)
+	}
+	if !bytes.Contains(out, []byte("MASK_OK")) {
+		t.Fatalf("maskPhone output want MASK_OK, got %s", out)
+	}
+}
+

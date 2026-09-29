@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/httpauth"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/livecfg"
@@ -163,6 +165,7 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/checkin", p.withAuth(p.accountCheckin))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/balance", p.withAuth(p.accountBalance))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/remove", p.withAuth(p.accountRemove))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/nickname", p.withAuth(p.accountNickname))
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/tasks", p.withAuth(p.accountTasks))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept", p.withAuth(p.accountTaskAccept))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/tasks/accept_all", p.withAuth(p.taskAcceptAll))
@@ -600,6 +603,61 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("panel: remove uid=%s（已出池并删除凭证文件）", uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// accountNickname 修改账号自定义昵称（备注）：校验长度与字符，SaveAtomic 两阶段持久化，失败回滚。
+func (p *Panel) accountNickname(w http.ResponseWriter, r *http.Request) {
+	uid := r.PathValue("uid")
+	a := p.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+
+	var req struct {
+		Nickname string `json:"nickname"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "invalid json body: "+err.Error())
+		return
+	}
+
+	// 过滤换行与控制字符，允许空字符串清除备注
+	var b strings.Builder
+	for _, ch := range req.Nickname {
+		if unicode.IsControl(ch) {
+			continue
+		}
+		b.WriteRune(ch)
+	}
+	cleanNick := strings.TrimSpace(b.String())
+
+	// 限制 0 <= utf8.RuneCountInString <= 32
+	if utf8.RuneCountInString(cleanNick) > 32 {
+		writeErr(w, http.StatusBadRequest, "昵称长度不能超过 32 个字符")
+		return
+	}
+
+	// 两阶段事务：修改内存 -> 保存文件 -> 失败回滚
+	oldNick := a.NicknameValue()
+	a.SetNickname(cleanNick)
+
+	if err := a.SaveAtomic(); err != nil {
+		a.SetNickname(oldNick) // 内存回滚
+		log.Printf("panel: account %s nickname save failed: %v", uid, err)
+		writeErr(w, http.StatusInternalServerError, "保存凭证文件失败: "+err.Error())
+		return
+	}
+
+	// 同步刷新池状态与快照
+	p.cfg.Pool.Flush()
+
+	log.Printf("panel: account %s nickname updated: %q -> %q", uid, oldNick, cleanNick)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":       true,
+		"uid":      uid,
+		"nickname": cleanNick,
+	})
 }
 
 // ---------------------------------------------------------------------------

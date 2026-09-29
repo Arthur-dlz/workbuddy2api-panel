@@ -91,6 +91,26 @@ func (a *Auth) RefreshTokenValue() string {
 	return a.RefreshToken
 }
 
+// NicknameValue 加锁读取 Nickname（加锁保护，防止数据竞争）。
+func (a *Auth) NicknameValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.Nickname
+}
+
+// SetNickname 加锁写入 Nickname（加锁保护，防止数据竞争）。
+func (a *Auth) SetNickname(nick string) {
+	if a == nil {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.Nickname = nick
+}
+
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
 // 默认开启（与 config global.enabled 缺省 true 一致）：Realm() 正常按显式 realm/
 // domain 判定 global/cn。显式 SetGlobalEnabled(false)（config "enabled": false）关闭

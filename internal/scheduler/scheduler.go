@@ -76,6 +76,13 @@ type Scheduler struct {
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
 	balanceInterval atomic.Int64
+
+	// balanceRefreshing 并发锁（CAS Lock）：防抖保护，同一时间仅允许一个全量手动刷新运行。
+	balanceRefreshing atomic.Bool
+
+	// balanceWorkers 保护与存储各账号轻量 Worker 独立循环的唤醒通道。
+	balanceWorkersMu sync.Mutex
+	balanceWorkers   map[string]chan struct{}
 }
 
 // New 构建。
@@ -99,10 +106,11 @@ func New(cfg Config) *Scheduler {
 		cfg.GrowthHours = []int{1}
 	}
 	return &Scheduler{
-		cfg:           cfg,
-		adoptTried:    make(map[string]string),
-		rearmSchedule: make(chan struct{}, 1),
-		rearmBalance:  make(chan struct{}, 1),
+		cfg:            cfg,
+		adoptTried:     make(map[string]string),
+		rearmSchedule:  make(chan struct{}, 1),
+		rearmBalance:   make(chan struct{}, 1),
+		balanceWorkers: make(map[string]chan struct{}),
 	}
 }
 
@@ -503,83 +511,4 @@ func (s *Scheduler) RunKeepaliveNow() {
 			log.Printf("keepalive %s save: %v", logfmt.Label(st.UID, st.Nickname), err)
 		}
 	}
-}
-
-// RunBalanceRefreshNow 并发对所有非禁用账号查询余额并更新池内 credits。
-// 解冻语义与签到一致（ReenableIfCredits：余额 > 0 的冷却账号自动解冻），
-// 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
-// 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
-func (s *Scheduler) RunBalanceRefreshNow() {
-	var wg sync.WaitGroup
-	expiringSoon := s.ExpiringSoonWindow()
-	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
-			continue
-		}
-		a := s.cfg.Pool.AuthByUID(st.UID)
-		if a == nil {
-			continue
-		}
-		wg.Add(1)
-		go func(a *auth.Auth, uid string) {
-			defer wg.Done()
-			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
-			if err != nil {
-				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
-				return
-			}
-			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
-		}(a, st.UID)
-	}
-	wg.Wait()
-}
-
-// StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。
-// interval<=0 不启动（schedule.balance_refresh_enabled=false 时 main 不调用即可）。
-// 独立于 Run 的小时制排程：余额是分钟级观测量，不值得为它扩展 nextFire 的粒度。
-// 运行期可用 SetBalanceInterval 热改间隔（下一轮生效）。
-func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Duration) {
-	if interval <= 0 {
-		return
-	}
-	s.balanceInterval.Store(int64(interval))
-	go func() {
-		var logged time.Duration
-		for {
-			cur := time.Duration(s.balanceInterval.Load())
-			if cur != logged {
-				log.Printf("scheduler: 余额后台刷新每 %s（暂停中显示 0s）", cur)
-				logged = cur
-			}
-			if cur <= 0 {
-				// 被热改暂停：等重排通知（重新启用时唤醒）或退出。
-				select {
-				case <-ctx.Done():
-					return
-				case <-s.rearmBalance:
-					continue
-				}
-			}
-			timer := time.NewTimer(cur)
-			select {
-			case <-ctx.Done():
-				timer.Stop()
-				return
-			case <-s.rearmBalance:
-				timer.Stop() // 间隔已变：立刻按新值重算
-			case <-timer.C:
-				s.RunBalanceRefreshNow()
-			}
-		}
-	}()
-}
-
-// SetBalanceInterval 热改余额刷新间隔；<=0 表示暂停循环（面板关闭该开关时）。
-func (s *Scheduler) SetBalanceInterval(d time.Duration) {
-	if d < 0 {
-		d = 0
-	}
-	s.balanceInterval.Store(int64(d))
-	poke(s.rearmBalance)
 }

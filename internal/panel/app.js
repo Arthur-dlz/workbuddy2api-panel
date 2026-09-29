@@ -49,6 +49,19 @@ function toast(msg, cls) {
   $('toasts').appendChild(el);
   setTimeout(() => el.remove(), 3600);
 }
+// maskPhone 手机号脱敏显示：将标准 11 位手机号（或带 +86 格式）中间 4 位替换为星号（199****4159）。
+// 非手机号格式（如纯英文、汉字、非11位UID）原样返回。严禁污染内存或后端原始数据。
+function maskPhone(str) {
+  if (!str || typeof str !== 'string') return str || '';
+  const s = str.trim();
+  const m = s.match(/^(\+?86[-\s]?)?(1[3-9]\d)(\d{4})(\d{4})$/);
+  if (m) {
+    const prefix = m[1] || '';
+    return prefix + m[2] + '****' + m[4];
+  }
+  return str;
+}
+
 // esc 文本/属性双安全转义。不能只用 div.innerHTML（它转义 <>& 但不转义引号），
 // 否则字符串拼进 HTML 属性（如 title="uid: ..."）时引号可闭合属性并注入事件处理器。
 // 显式替换 5 个字符：& < > " '（& 必须最先，避免二次转义）。
@@ -190,7 +203,7 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm"><span class="nm-text">' + (s.nickname ? esc(maskPhone(s.nickname)) : '<span style="color:var(--ink-3)">未命名</span>') + '</span>' + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '<button type="button" class="nick-edit-btn" data-a="edit-nick" data-u="' + esc(s.uid) + '" data-nick="' + esc(s.nickname || '') + '" title="修改名称/备注">✎</button></div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
@@ -263,6 +276,16 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'remove') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/remove', { method: 'POST' });
       toast(r.file_error ? '已移除（凭证文件删除失败：' + r.file_error + '）' : '已移除', 'ok');
+    } else if (a === 'edit-nick') {
+      const currentNick = b.dataset.nick || '';
+      const newNick = prompt('修改账号备注名称（留空可清除备注，上限 32 字符）：', currentNick);
+      if (newNick === null) return;
+      const trimmed = newNick.trim();
+      await api('accounts/' + encodeURIComponent(u) + '/nickname', {
+        method: 'POST',
+        body: JSON.stringify({ nickname: trimmed })
+      });
+      toast(trimmed ? '账号名称已更新为：' + trimmed : '账号备注已清除', 'ok');
     }
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; loadOverview(true); }
@@ -1456,7 +1479,7 @@ async function pollLogin() {
       stopPoll();
       $('addReady').hidden = true;
       $('addDone').hidden = false;
-      $('addDone').textContent = '已添加 ' + (r.nickname || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中';
+      $('addDone').textContent = '已添加 ' + (maskPhone(r.nickname) || r.uid) + (r.realm === 'global' ? '（国际版）' : '') + (r.credits >= 0 ? ' · 积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + '，账号已载入池中';
       setTimeout(() => { closeAdd(); loadOverview(true); }, 1600);
     }
   } catch (e) {
@@ -1925,7 +1948,7 @@ async function loadSchoolVouchers() {
     const ok = arr.filter(a => !a.error);
     const total = ok.reduce((n, a) => n + (a.vouchers || []).length, 0);
     body.innerHTML = ok.filter(a => (a.vouchers || []).length).map(a =>
-      '<div class="vc-acct"><span class="nm">' + esc(a.nickname || a.uid) + '</span>' +
+      '<div class="vc-acct"><span class="nm">' + esc(maskPhone(a.nickname) || a.uid) + '</span>' +
       '<span>' + a.vouchers.length + ' 张</span></div>' +
       a.vouchers.map(vcCard).join('')
     ).join('') || '<div class="empty"><div class="big">🎟️</div>还没有抽到券</div>';
@@ -1933,7 +1956,7 @@ async function loadSchoolVouchers() {
     const errs = arr.filter(a => a.error);
     if (errs.length) {
       body.insertAdjacentHTML('beforeend', '<div class="note" style="color:var(--warn);margin-top:8px">查询失败：' +
-        errs.map(a => esc(a.nickname || a.uid.slice(0, 8)) + '（' + esc(a.error) + '）').join('、') + '</div>');
+        errs.map(a => esc(maskPhone(a.nickname) || a.uid.slice(0, 8)) + '（' + esc(a.error) + '）').join('、') + '</div>');
     }
     body.querySelectorAll('button[data-copy]').forEach(b => b.onclick = async () => {
       try { await copyText(b.dataset.copy); toast('券码已复制', 'ok'); }
@@ -2031,7 +2054,7 @@ function renderQueue(groups, progress, emptyTitle, emptyDesc) {
   let total = 0;
   list.innerHTML = groups.map(g => {
     total += g.rows.length;
-    return '<div class="qgroup"><header><span class="nm">' + esc(g.nick || g.uid.slice(0, 12)) + '</span><span class="cnt">' + g.rows.length + ' 项待办</span></header>' +
+    return '<div class="qgroup"><header><span class="nm">' + esc(maskPhone(g.nick) || g.uid.slice(0, 12)) + '</span><span class="cnt">' + g.rows.length + ' 项待办</span></header>' +
       g.rows.map(qrowHTML).join('') + '</div>';
   }).join('');
   $('qcSummary').textContent = total + ' 项';
@@ -3176,7 +3199,7 @@ function pkAccountSegments(a, now) {
       days: expiresAt == null ? null : Math.max(0, Math.ceil((expiresAt - now) / PK_DAY_MS)),
       source: p.name || '积分',
       uid: String(a.uid || ''),
-      accountName: a.nickname || String(a.uid || '').slice(0, 8) || '未命名账号',
+      accountName: (a.nickname ? maskPhone(a.nickname) : String(a.uid || '').slice(0, 8)) || '未命名账号',
     });
     balance -= amount;
   }
@@ -3263,7 +3286,7 @@ function renderExpiryDistribution(list, now) {
   const legend = (list || []).filter(a =>
     a && !a.error && a.uid && pkAccountSegments(a, now).some(s => s.days != null)
   ).map(a => '<span><i style="background:' + (colors.get(String(a.uid)) || 'var(--accent)') +
-    '"></i>' + esc(a.nickname || String(a.uid).slice(0, 8)) + '</span>').join('');
+    '"></i>' + esc((a.nickname ? maskPhone(a.nickname) : String(a.uid).slice(0, 8))) + '</span>').join('');
   const hdr = '<div class="pk-expiry-hdr"><span>剩余天数</span><span style="text-align:center">各账号该批剩余</span><b>剩余积分</b></div>';
   $('pkExpiry').innerHTML = (rows
     ? hdr + '<div class="pk-expiry-chart">' + rows + '</div>'
@@ -3426,7 +3449,7 @@ function renderPackages(d, detailLimit) {
   $('pkSummary').innerHTML = list.map(a => {
     if (a.error) {
       return '<div class="pk-card"><div class="who"><span class="nm">' +
-        esc((a.nickname || a.uid.slice(0, 8))) + '</span>' +
+        esc((maskPhone(a.nickname) || a.uid.slice(0, 8))) + '</span>' +
         '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
         '<div class="err">查询失败：' + esc(a.error) + '</div></div>';
     }
@@ -3454,7 +3477,7 @@ function renderPackages(d, detailLimit) {
           ' 1 0" title="' + esc(title) + '"></i>';
       }).join('') + '</div>' : '';
     return '<div class="pk-card">' +
-      '<div class="who"><span class="nm">' + esc(a.nickname || a.uid.slice(0, 8)) + '</span>' +
+      '<div class="who"><span class="nm">' + esc(maskPhone(a.nickname) || a.uid.slice(0, 8)) + '</span>' +
       '<span class="realm">' + esc(a.realm || '') + '</span></div>' +
       '<div class="big">' + fmtTok(a.remain) + '</div>' +
       '<div class="sub">共 ' + fmtTok(a.size) + ' · ' + (a.packages || []).length +
@@ -3505,7 +3528,7 @@ function renderPackages(d, detailLimit) {
         groups.used.map(p => rowOf(p, 'used')).join('')
       : '';
     return '<div class="box"><header><h3>' +
-      esc(a.nickname || a.uid.slice(0, 8)) + ' · ' + esc(a.realm || '') +
+      esc(maskPhone(a.nickname) || a.uid.slice(0, 8)) + ' · ' + esc(a.realm || '') +
       '</h3><span class="grow"></span><span class="note">余额 ' + fmtTok(a.remain) +
       ' / 总额 ' + fmtTok(a.size) + ' · 可用 ' + (groups.visible.length + groups.rest.length) + ' 个包' +
       (groups.used.length ? ' / 已用完 ' + groups.used.length + ' 个' : '') +
