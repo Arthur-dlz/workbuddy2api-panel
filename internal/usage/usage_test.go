@@ -2,6 +2,7 @@ package usage
 
 import (
 	"encoding/json"
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -238,5 +239,100 @@ func TestSeriesModelsBreakdown(t *testing.T) {
 	}
 	if dayPoint.Models["claude-3.5"] != 700 {
 		t.Errorf("dayPoint.Models[claude-3.5] = %d, want 700", dayPoint.Models["claude-3.5"])
+	}
+}
+
+// TestCreditTrackingAndDefense 验证官方积分打通：真实扣费累加、NaN/Inf/负数防御、4位小数修约及落盘持久化。
+func TestCreditTrackingAndDefense(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "usage_credit.json")
+	r := New(path)
+	now := time.Now()
+
+	// 1. 合法扣费累加与 CreditRequests 计数
+	r.Add(now, "cn", "u1", "glm-5.2", "master", Delta{
+		PromptTokens:     100,
+		HasPromptTokens:  true,
+		CompletionTokens: 50,
+		HasCompletion:    true,
+		Credit:           0.0525,
+		HasCredit:        true,
+	}, true)
+
+	r.Add(now, "cn", "u1", "glm-5.2", "master", Delta{
+		PromptTokens:     200,
+		HasPromptTokens:  true,
+		CompletionTokens: 100,
+		HasCompletion:    true,
+		Credit:           0.1042,
+		HasCredit:        true,
+	}, true)
+
+	// 2. 只有 token 没有 credit 的请求：不增加 credit，不增加 CreditRequests
+	r.Add(now, "cn", "u1", "glm-5.2", "master", Delta{
+		PromptTokens:     50,
+		HasPromptTokens:  true,
+		CompletionTokens: 25,
+		HasCompletion:    true,
+		HasCredit:        false,
+	}, true)
+
+	// 3. 致命漏洞防御：NaN, +Inf, -Inf, 负数, 超大值（>1e9）必须被拦截
+	r.Add(now, "cn", "u1", "glm-5.2", "master", Delta{
+		Credit:    math.NaN(),
+		HasCredit: true,
+	}, true)
+	r.Add(now, "cn", "u1", "glm-5.2", "master", Delta{
+		Credit:    math.Inf(1),
+		HasCredit: true,
+	}, true)
+	r.Add(now, "cn", "u1", "glm-5.2", "master", Delta{
+		Credit:    math.Inf(-1),
+		HasCredit: true,
+	}, true)
+	r.Add(now, "cn", "u1", "glm-5.2", "master", Delta{
+		Credit:    -0.5,
+		HasCredit: true,
+	}, true)
+	r.Add(now, "cn", "u1", "glm-5.2", "master", Delta{
+		Credit:    1e11,
+		HasCredit: true,
+	}, true)
+
+	s := r.Snapshot(24, nil)
+	// 期望 0.0525 + 0.1042 = 0.1567
+	if s.Totals.Credits != 0.1567 {
+		t.Fatalf("Totals.Credits = %v, want 0.1567", s.Totals.Credits)
+	}
+	if s.Totals.CreditRequests != 2 {
+		t.Fatalf("Totals.CreditRequests = %d, want 2", s.Totals.CreditRequests)
+	}
+
+	// 4. 落盘并恢复，检验 JSON 序列化无 panic 且数据不丢
+	r.Save()
+
+	r2 := New(path)
+	s2 := r2.Snapshot(24, nil)
+	if s2.Totals.Credits != 0.1567 {
+		t.Fatalf("恢复后 Totals.Credits = %v, want 0.1567", s2.Totals.Credits)
+	}
+	if s2.Totals.CreditRequests != 2 {
+		t.Fatalf("恢复后 Totals.CreditRequests = %d, want 2", s2.Totals.CreditRequests)
+	}
+
+	// 5. 日桶折叠测试：超出 hourlyKeep 的小时桶折叠后 Credit 与 CreditReq 完整保留
+	old := now.AddDate(0, 0, -100)
+	r.Add(old, "cn", "u1", "glm-5.2", "master", Delta{
+		Credit:    0.2000,
+		HasCredit: true,
+	}, true)
+	r.Rollup(now)
+
+	all := r.Snapshot(0, nil)
+	// 0.1567 + 0.2000 = 0.3567
+	if all.Totals.Credits != 0.3567 {
+		t.Fatalf("全部历史 Totals.Credits = %v, want 0.3567", all.Totals.Credits)
+	}
+	if all.Totals.CreditRequests != 3 {
+		t.Fatalf("全部历史 Totals.CreditRequests = %d, want 3", all.Totals.CreditRequests)
 	}
 }

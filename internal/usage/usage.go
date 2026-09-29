@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -44,21 +45,23 @@ const (
 // bucket 一个 (时间片, realm, uid, model) 的累计量。
 // JSON 字段名刻意取短，因为桶数量会随时间增长。
 type bucket struct {
-	Scope    string  `json:"s"` // "h:2006-01-02T15" 或 "d:2006-01-02"
-	Realm    string  `json:"r"`
-	UID      string  `json:"u"`
-	Model    string  `json:"m"`
-	TokenKey string  `json:"k,omitempty"`
-	Req      int64   `json:"q"`  // 请求数（含失败）
-	Err      int64   `json:"e"`  // 失败数
-	PT       int64   `json:"p"`  // prompt tokens
-	CT       int64   `json:"c"`  // completion tokens
-	TT       int64   `json:"t"`  // total tokens（上游给什么用什么的合计）
-	CachedT  int64   `json:"ch,omitempty"`
-	LatMs    int64   `json:"l"`  // 延迟累计（ms）
-	LatN     int64   `json:"ln"` // 延迟样本数
-	TPS      float64 `json:"v"`  // 吐字速率累计
-	TPSN     int64   `json:"vn"` // 速率样本数
+	Scope     string  `json:"s"` // "h:2006-01-02T15" 或 "d:2006-01-02"
+	Realm     string  `json:"r"`
+	UID       string  `json:"u"`
+	Model     string  `json:"m"`
+	TokenKey  string  `json:"k,omitempty"`
+	Req       int64   `json:"q"`  // 请求数（含失败）
+	Err       int64   `json:"e"`  // 失败数
+	PT        int64   `json:"p"`  // prompt tokens
+	CT        int64   `json:"c"`  // completion tokens
+	TT        int64   `json:"t"`  // total tokens（上游给什么用什么的合计）
+	CachedT   int64   `json:"ch,omitempty"`
+	LatMs     int64   `json:"l"`  // 延迟累计（ms）
+	LatN      int64   `json:"ln"` // 延迟样本数
+	TPS       float64 `json:"v"`  // 吐字速率累计
+	TPSN      int64   `json:"vn"` // 速率样本数
+	Credit    float64 `json:"cr,omitempty"`
+	CreditReq int64   `json:"cq,omitempty"`
 }
 
 // file 落盘结构。
@@ -142,6 +145,18 @@ type Delta struct {
 	HasLatency       bool
 	TokensPerSecond  float64
 	HasTPS           bool
+	Credit           float64
+	HasCredit        bool
+}
+
+// isValidCredit 校验积分值，防御 NaN / Inf / 负数及异常畸形超大值。
+func isValidCredit(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 && v < 1e9
+}
+
+// IsValidCredit 导出版本供其它包防御性校验积分。
+func IsValidCredit(v float64) bool {
+	return isValidCredit(v)
 }
 
 // Add 记录一次请求尝试。
@@ -199,6 +214,10 @@ func (r *Recorder) Add(now time.Time, realm, uid, model, tokenKey string, d Delt
 		b.TPS += d.TokensPerSecond
 		b.TPSN++
 	}
+	if d.HasCredit && isValidCredit(d.Credit) {
+		b.Credit += d.Credit
+		b.CreditReq++
+	}
 	r.dirty = true
 }
 
@@ -248,6 +267,8 @@ func (r *Recorder) Rollup(now time.Time) {
 			dst.LatN += src.LatN
 			dst.TPS += src.TPS
 			dst.TPSN += src.TPSN
+			dst.Credit += src.Credit
+			dst.CreditReq += src.CreditReq
 		}
 		delete(r.buckets, m.from)
 	}
@@ -324,15 +345,17 @@ func (r *Recorder) Save() { r.flush(true) }
 
 // Agg 一组累计量。
 type Agg struct {
-	Requests      int64   `json:"requests"`
-	Errors        int64   `json:"errors"`
-	PromptTokens  int64   `json:"prompt_tokens"`
-	CompletionTok int64   `json:"completion_tokens"`
-	TotalTokens   int64   `json:"total_tokens"`
-	CachedTokens  int64   `json:"cached_tokens"`
-	CacheHitRate  float64 `json:"cache_hit_rate"`
-	AvgLatencyMs  float64 `json:"avg_latency_ms"`
-	AvgTPS        float64 `json:"avg_tokens_per_second"`
+	Requests       int64   `json:"requests"`
+	Errors         int64   `json:"errors"`
+	PromptTokens   int64   `json:"prompt_tokens"`
+	CompletionTok  int64   `json:"completion_tokens"`
+	TotalTokens    int64   `json:"total_tokens"`
+	CachedTokens   int64   `json:"cached_tokens"`
+	CacheHitRate   float64 `json:"cache_hit_rate"`
+	AvgLatencyMs   float64 `json:"avg_latency_ms"`
+	AvgTPS         float64 `json:"avg_tokens_per_second"`
+	Credits        float64 `json:"credits"`
+	CreditRequests int64   `json:"credit_requests"`
 }
 
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
@@ -357,6 +380,8 @@ func (g *aggAcc) add(b *bucket) {
 	g.latSamples += b.LatN
 	g.tpsSum += b.TPS
 	g.tpsSamples += b.TPSN
+	g.Credits += b.Credit
+	g.CreditRequests += b.CreditReq
 	if b.Model != "" {
 		tt := b.TT
 		if tt == 0 && (b.PT > 0 || b.CT > 0) {
@@ -382,6 +407,7 @@ func (g *aggAcc) finish() Agg {
 	if a.PromptTokens > 0 {
 		a.CacheHitRate = float64(a.CachedTokens) / float64(a.PromptTokens) * 100
 	}
+	a.Credits = math.Round(g.Credits*10000) / 10000
 	return a
 }
 

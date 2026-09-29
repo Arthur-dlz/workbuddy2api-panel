@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -167,26 +168,63 @@ func (s *chatStatsReader) parseSSELine(line string) {
 	}
 }
 
+// isValidCredit 校验积分值，防御 NaN / Inf / 负数及异常畸形超大值（>=1e9）。
+func isValidCredit(v float64) bool {
+	return !math.IsNaN(v) && !math.IsInf(v, 0) && v >= 0 && v < 1e9
+}
+
 func readIntMetric(v any) (int, bool) {
 	switch n := v.(type) {
 	case float64:
-		return int(n), n >= 0
+		if math.IsNaN(n) || math.IsInf(n, 0) || n < 0 || n > 1e12 {
+			return 0, false
+		}
+		return int(n), true
+	case float32:
+		f := float64(n)
+		if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > 1e12 {
+			return 0, false
+		}
+		return int(n), true
 	case int:
 		return n, n >= 0
 	case int64:
-		return int(n), n >= 0
+		if n < 0 || n > 1e12 {
+			return 0, false
+		}
+		return int(n), true
+	case json.Number:
+		i, err := n.Int64()
+		if err != nil || i < 0 || i > 1e12 {
+			return 0, false
+		}
+		return int(i), true
 	}
 	return 0, false
 }
 
 func readFloatMetric(v any) (float64, bool) {
+	var val float64
 	switch n := v.(type) {
 	case float64:
-		return n, n >= 0
+		val = n
+	case float32:
+		val = float64(n)
 	case int:
-		return float64(n), n >= 0
+		val = float64(n)
 	case int64:
-		return float64(n), n >= 0
+		val = float64(n)
+	case json.Number:
+		f, err := n.Float64()
+		if err != nil {
+			return 0, false
+		}
+		val = f
+	default:
+		return 0, false
+	}
+	if isValidCredit(val) {
+		return val, true
 	}
 	return 0, false
 }
@@ -245,26 +283,33 @@ func parseModelFromBody(body []byte) string {
 func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
 	delta := pool.TokenUsageDelta{}
 	u, ok := resp["usage"].(map[string]any)
-	if !ok {
+	if !ok || u == nil {
 		return delta
 	}
 	read := func(key string) (int64, bool) {
 		v, ok := u[key]
-		if !ok {
+		if !ok || v == nil {
 			return 0, false
 		}
 		switch n := v.(type) {
 		case float64:
+			if math.IsNaN(n) || math.IsInf(n, 0) || n < 0 || n > 1e12 {
+				return 0, false
+			}
 			return int64(n), true
 		case float32:
+			f := float64(n)
+			if math.IsNaN(f) || math.IsInf(f, 0) || f < 0 || f > 1e12 {
+				return 0, false
+			}
 			return int64(n), true
 		case int:
-			return int64(n), true
+			return int64(n), n >= 0
 		case int64:
-			return n, true
+			return n, n >= 0
 		case json.Number:
 			i, err := n.Int64()
-			return i, err == nil
+			return i, err == nil && i >= 0
 		default:
 			return 0, false
 		}
@@ -284,14 +329,13 @@ func usageDeltaFromResponse(resp map[string]any) pool.TokenUsageDelta {
 // completionTokens 从 Aggregate 返回的响应中提取 usage.completion_tokens；缺失返回 -1。
 func completionTokens(resp map[string]any) int {
 	u, ok := resp["usage"].(map[string]any)
-	if !ok {
+	if !ok || u == nil {
 		return -1
 	}
-	v, ok := u["completion_tokens"].(float64)
-	if !ok {
-		return -1
+	if v, ok := readIntMetric(u["completion_tokens"]); ok {
+		return v
 	}
-	return int(v)
+	return -1
 }
 
 // uidPrefix 只显示 uid 前 8 位；空 uid 显示 "-"。

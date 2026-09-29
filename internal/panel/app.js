@@ -126,6 +126,8 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
+let lastUsagePoll = 0;
+let lastRenderedUsageSig = '';
 const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型路由', tokens: 'API 令牌', config: '配置', logs: '运行日志' };
 function go(v) {
   view = v;
@@ -136,7 +138,7 @@ function go(v) {
   if (v === 'tokens') loadTokens();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
-  if (v === 'usage') loadUsage();
+  if (v === 'usage') { lastUsagePoll = Date.now(); loadUsage(false); }
   if (v === 'packages') loadPackages();
   if (v === 'taskscenter') reattachQueueView();
 }
@@ -1511,10 +1513,18 @@ $('btnRefresh').onclick = async () => {
 };
 
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
+function pollUsage() {
+  const now = Date.now();
+  if (now - lastUsagePoll >= 15000) {
+    lastUsagePoll = now;
+    loadUsage(true);
+  }
+}
 function refreshVisible() {
   if (view === 'accounts') loadOverview(true);
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') reattachQueueView();
+  else if (view === 'usage') pollUsage();
 }
 function start() {
   loadOverview(true);
@@ -2159,40 +2169,60 @@ function renderUsage(d) {
   if (kpiEl) {
     // 腾讯 WorkBuddy 官方价格基准：加量包 50 元 / 1000 积分 = 0.05 元 / 积分
     const OFFICIAL_CREDIT_PRICE = 0.05;
+    const realCredits = Number(t.credits || 0);
+
+    // 官方基准模型扣费率（积分 / 1k tokens，基于上游实测及元数据）
     const OFFICIAL_MODEL_RATES = {
-      'kimi-k3-1': 1.62,
-      'glm-5.3': 0.79,
-      'deepseek-v4-pro': 0.51,
-      'deepseek-v4-flash': 0.11,
-      'glm-5.3-flash': 0.06,
+      'deepseek-v4-flash': 0.05,
+      'glm-5.3-flash': 0.05,
+      'glm-5.2': 0.05,
+      'glm-5.1': 0.05,
+      'deepseek-v4': 0.20,
+      'deepseek-v4-pro': 0.29,
+      'glm-5.3': 0.20,
+      'kimi-k3-1': 0.25,
       'hy3': 0.0,
     };
+    const DEFAULT_RATE = 0.10; // 默认 0.1 积分 / 1k tokens 兜底基准，绝不虚高
 
     let estCredits = 0;
     let savedCredits = 0;
     if (Array.isArray(d.by_model) && d.by_model.length > 0) {
       for (const m of d.by_model) {
-        const rate = OFFICIAL_MODEL_RATES[m.key] !== undefined ? OFFICIAL_MODEL_RATES[m.key] : 1.0;
+        const rate = OFFICIAL_MODEL_RATES[m.key] !== undefined ? OFFICIAL_MODEL_RATES[m.key] : DEFAULT_RATE;
         const tt = Number(m.total_tokens || 0);
         const ct = Number(m.cached_tokens || 0);
         estCredits += (tt / 1000) * rate;
         savedCredits += (ct * 0.9 / 1000) * rate;
       }
     } else {
-      estCredits = (totalTokens / 1000) * 1.0;
-      savedCredits = (cachedTokens * 0.9 / 1000) * 1.0;
+      estCredits = (totalTokens / 1000) * DEFAULT_RATE;
+      savedCredits = (cachedTokens * 0.9 / 1000) * DEFAULT_RATE;
     }
 
-    const estCny = estCredits * OFFICIAL_CREDIT_PRICE;
-    const savedCny = savedCredits * OFFICIAL_CREDIT_PRICE;
-    const cnyStr = estCny >= 10 ? estCny.toFixed(2) : estCny.toFixed(3);
-    const savedCnyStr = savedCny >= 10 ? savedCny.toFixed(2) : savedCny.toFixed(3);
+    let cardTitle, cardTag, cnyVal, subHtml;
+    if (realCredits > 0) {
+      cardTitle = '官方实扣额度';
+      cardTag = '<span class="tag ok" style="font-size:10px;">官方实扣</span>';
+      cnyVal = (realCredits * OFFICIAL_CREDIT_PRICE).toFixed(2);
+      const crStr = realCredits >= 10 ? realCredits.toFixed(2) : realCredits.toFixed(3);
+      const savedStr = savedCredits > 0 ? ` · 节省 ~${savedCredits.toFixed(1)} 积分` : '';
+      subHtml = `官方实扣 ${crStr} 积分 · 官方 ¥0.05/积分${savedStr}`;
+    } else {
+      cardTitle = '预估消耗额度';
+      cardTag = '<span class="tag ok" style="font-size:10px;">官方 ¥0.05/积分</span>';
+      const estCny = estCredits * OFFICIAL_CREDIT_PRICE;
+      cnyVal = estCny >= 10 ? estCny.toFixed(2) : estCny.toFixed(3);
+      const savedCny = savedCredits * OFFICIAL_CREDIT_PRICE;
+      const savedCnyStr = savedCny >= 10 ? savedCny.toFixed(2) : savedCny.toFixed(3);
+      subHtml = `折合约 ${estCredits.toFixed(1)} 积分 · 节省 ~¥${savedCnyStr} (${savedCredits.toFixed(1)} 积分)`;
+    }
 
     kpiEl.innerHTML = `
       <div class="ds-kpi-card">
-        <div class="lbl"><span>预估消耗额度</span><span class="tag ok" style="font-size:10px;">官方 ¥0.05/积分</span></div>
-        <div class="val">¥ ${cnyStr}</div>
-        <div class="sub">折合约 ${estCredits.toFixed(1)} 积分 · 节省 ~¥${savedCnyStr} (${savedCredits.toFixed(1)} 积分)</div>
+        <div class="lbl"><span>${cardTitle}</span>${cardTag}</div>
+        <div class="val">¥ ${cnyVal}</div>
+        <div class="sub">${subHtml}</div>
       </div>
       <div class="ds-kpi-card">
         <div class="lbl"><span>API 请求次数</span><span style="font-size:11px;color:var(--ink-3);">含重试</span></div>
@@ -2221,8 +2251,12 @@ function renderUsage(d) {
   if (tokenSel) {
     const curVal = tokenSel.value;
     const tokens = d.by_token || [];
-    tokenSel.innerHTML = '<option value="">全部令牌</option>' +
+    const newOptionsHtml = '<option value="">全部令牌</option>' +
       tokens.map(tk => `<option value="${esc(tk.key)}"${tk.key === curVal ? ' selected' : ''}>${esc(tk.key)} (${fmtTok(tk.requests)}次)</option>`).join('');
+    if (tokenSel.innerHTML !== newOptionsHtml) {
+      tokenSel.innerHTML = newOptionsHtml;
+      tokenSel.value = curVal;
+    }
     tokenSel.onchange = () => filterAndRenderCharts();
   }
 
@@ -2963,19 +2997,27 @@ function renderTokBarChart(series, hours) {
   };
 }
 
-async function loadUsage() {
+async function loadUsage(silent = false) {
   const hours = getUsWindowHours();
   try {
     const d = await api('usage?hours=' + encodeURIComponent(hours));
+    // 脏检查：排除服务端生成的瞬态时间戳 generated
+    const sig = JSON.stringify({ ...d, generated: undefined });
+    if (silent && sig === lastRenderedUsageSig) {
+      return; // 脏检查：数据无变动，静默跳过渲染，防止 DOM 闪烁和下拉框收起
+    }
+    lastRenderedUsageSig = sig;
     renderUsage(d);
   } catch (e) {
-    if ($('chartTokBar')) $('chartTokBar').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
-    if ($('chartReqArea')) $('chartReqArea').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
+    if (!silent) {
+      if ($('chartTokBar')) $('chartTokBar').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
+      if ($('chartReqArea')) $('chartReqArea').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
+    }
   }
 }
 
-if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
-if ($('usWindow')) $('usWindow').onchange = loadUsage;
+if ($('btnUsage')) $('btnUsage').onclick = () => { lastUsagePoll = Date.now(); loadUsage(false); };
+if ($('usWindow')) $('usWindow').onchange = () => { lastUsagePoll = Date.now(); loadUsage(false); };
 if ($('tokModeType')) $('tokModeType').onclick = () => setTokChartMode('type');
 if ($('tokModeModel')) $('tokModeModel').onclick = () => setTokChartMode('model');
 

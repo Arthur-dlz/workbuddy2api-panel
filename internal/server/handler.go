@@ -1007,7 +1007,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			unbindSticky()
 		}
 	}
-	recordAttempt := func(uid string, delta pool.TokenUsageDelta, cachedTokens int64, started time.Time) {
+	recordAttempt := func(uid string, delta pool.TokenUsageDelta, cachedTokens int64, started time.Time, credit float64, hasCredit bool) {
 		delta.Model = peek.Model
 		latency := time.Since(started)
 		latencyMs := latency.Milliseconds()
@@ -1043,6 +1043,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasLatency:       delta.HasLatencyMs,
 				TokensPerSecond:  delta.TokensPerSecond,
 				HasTPS:           delta.HasTokensPerSecond,
+				Credit:           credit,
+				HasCredit:        hasCredit,
 			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
 		}
 	}
@@ -1215,7 +1217,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 连败兜底（issue #114）：喂连败计数——连不上上游是「不知道原因的失败」，
 			// 连败 N 次临时出池，单次/偶发不罚（NoteFailures 内部达阈才动作）。
 			// 上游 client 已打 transport error 日志。
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, attemptStarted, 0, false)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
 			h.cfg.Pool.NoteFailures(acct.UID)
@@ -1226,7 +1228,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		if status >= 400 {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, attemptStarted, 0, false)
 			st.status = status
 			var kind upstream.ErrKind
 			if uerr != nil {
@@ -1345,7 +1347,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
 			}
 			cachedT, _ := stats.CachedTokens()
-			recordAttempt(acct.UID, stats.Usage(), cachedT, attemptStarted)
+			credit, hasCredit := stats.Credit()
+			recordAttempt(acct.UID, stats.Usage(), cachedT, attemptStarted, credit, hasCredit)
 			st.ttfb = stats.TTFB()
 			// usage 缺失时保留 chatStat.toks 的 -1 哨兵（观测缺失 → 显示 "-"），
 			// 不写入零值——否则「没观测到 usage」被伪造成「测得 0 token」，
@@ -1355,7 +1358,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
-			if credit, ok := stats.Credit(); ok {
+			if hasCredit {
 				if total, tok := stats.TotalTokens(); tok && total > 0 {
 					h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
 				}
@@ -1366,7 +1369,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		resp, err := upstream.Aggregate(rc)
 		rc.Close()
 		if err != nil {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, attemptStarted)
+			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, attemptStarted, 0, false)
 			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
@@ -1378,7 +1381,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				cachedT = c
 			}
 		}
-		recordAttempt(acct.UID, usageDeltaFromResponse(resp), cachedT, attemptStarted)
+		credit, hasCredit := extractCreditFromResponse(resp)
+		recordAttempt(acct.UID, usageDeltaFromResponse(resp), cachedT, attemptStarted, credit, hasCredit)
 		writeJSON(w, http.StatusOK, resp)
 		st.status = http.StatusOK
 		st.toks = completionTokens(resp)
@@ -1435,19 +1439,46 @@ func promptTooLongMessage(body string) string {
 	return body
 }
 
+// extractCreditFromResponse 从非流式响应提取 usage.credit。
+// 必须显式判断 usage["credit"] 是否存在且不为 nil，不能把 key 缺失断言默认的 0.0 当成合法 0 积分。
+func extractCreditFromResponse(resp map[string]any) (float64, bool) {
+	if resp == nil {
+		return 0, false
+	}
+	usage, ok := resp["usage"].(map[string]any)
+	if !ok || usage == nil {
+		return 0, false
+	}
+	rawCredit, exists := usage["credit"]
+	if !exists || rawCredit == nil {
+		return 0, false
+	}
+	return readFloatMetric(rawCredit)
+}
+
 // usageCreditTotal 从聚合响应取 usage.credit 与 total_tokens（成本台账非流式入口）。
 // 任一字段缺失/非法 → ok=false（不记录）。
 func usageCreditTotal(resp map[string]any) (credit float64, total int, ok bool) {
+	if resp == nil {
+		return 0, 0, false
+	}
 	usage, _ := resp["usage"].(map[string]any)
 	if usage == nil {
 		return 0, 0, false
 	}
-	c, _ := usage["credit"].(float64)
-	t, _ := usage["total_tokens"].(float64)
-	if t <= 0 {
+	rawCredit, exists := usage["credit"]
+	if !exists || rawCredit == nil {
 		return 0, 0, false
 	}
-	return c, int(t), true
+	c, validCredit := readFloatMetric(rawCredit)
+	if !validCredit {
+		return 0, 0, false
+	}
+	t, okTotal := readIntMetric(usage["total_tokens"])
+	if !okTotal || t <= 0 {
+		return 0, 0, false
+	}
+	return c, t, true
 }
 
 // rotateBackoff 轮转间指数退避 + 抖动（WAF 403 修复 P0-2）：第 i 次轮转失败

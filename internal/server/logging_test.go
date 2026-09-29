@@ -2,6 +2,7 @@ package server
 
 import (
 	"io"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -306,5 +307,109 @@ func TestHealthzDoesNotLogTableRow(t *testing.T) {
 	})
 	if strings.Contains(out, "| #") {
 		t.Errorf("healthz/models/status must not emit table rows:\n%s", out)
+	}
+}
+
+func TestReadFloatMetric_NaNInfDefense(t *testing.T) {
+	cases := []struct {
+		input any
+		want  float64
+		ok    bool
+	}{
+		{0.05, 0.05, true},
+		{float64(0), 0.0, true},
+		{1, 1.0, true},
+		{int64(10), 10.0, true},
+		{-1.0, 0, false},
+		{math.NaN(), 0, false},
+		{math.Inf(1), 0, false},
+		{math.Inf(-1), 0, false},
+		{1e10, 0, false}, // 超过 1e9
+		{nil, 0, false},
+		{"0.05", 0, false},
+	}
+	for _, tc := range cases {
+		got, ok := readFloatMetric(tc.input)
+		if ok != tc.ok || (ok && got != tc.want) {
+			t.Errorf("readFloatMetric(%v) = (%v, %v), want (%v, %v)", tc.input, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+func TestExtractCreditFromResponse_Strictness(t *testing.T) {
+	// 1. 无 usage
+	if _, ok := extractCreditFromResponse(nil); ok {
+		t.Fatal("nil resp should return ok=false")
+	}
+	if _, ok := extractCreditFromResponse(map[string]any{}); ok {
+		t.Fatal("resp without usage should return ok=false")
+	}
+
+	// 2. usage 中无 credit 键，不能误当成 0.0
+	respNoCredit := map[string]any{
+		"usage": map[string]any{
+			"total_tokens": 100.0,
+		},
+	}
+	if _, ok := extractCreditFromResponse(respNoCredit); ok {
+		t.Fatal("usage without credit key must return ok=false, not 0.0!")
+	}
+
+	// 3. usage 中 credit 为 nil
+	respNilCredit := map[string]any{
+		"usage": map[string]any{
+			"credit":       nil,
+			"total_tokens": 100.0,
+		},
+	}
+	if _, ok := extractCreditFromResponse(respNilCredit); ok {
+		t.Fatal("usage with credit=nil must return ok=false!")
+	}
+
+	// 4. credit 为 NaN / Inf
+	respNaN := map[string]any{
+		"usage": map[string]any{
+			"credit":       math.NaN(),
+			"total_tokens": 100.0,
+		},
+	}
+	if _, ok := extractCreditFromResponse(respNaN); ok {
+		t.Fatal("usage with credit=NaN must be rejected!")
+	}
+
+	// 5. 正常合法 credit
+	respOK := map[string]any{
+		"usage": map[string]any{
+			"credit":       0.052,
+			"total_tokens": 100.0,
+		},
+	}
+	cr, ok := extractCreditFromResponse(respOK)
+	if !ok || cr != 0.052 {
+		t.Fatalf("extractCreditFromResponse = (%v, %v), want (0.052, true)", cr, ok)
+	}
+}
+
+func TestUsageCreditTotal_Strictness(t *testing.T) {
+	// usage 缺失 credit 键时，不能把默认 float64 零值当合法
+	respNoCredit := map[string]any{
+		"usage": map[string]any{
+			"total_tokens": 100.0,
+		},
+	}
+	if _, _, ok := usageCreditTotal(respNoCredit); ok {
+		t.Fatal("usageCreditTotal without credit key must return ok=false!")
+	}
+
+	// 正常提取
+	respOK := map[string]any{
+		"usage": map[string]any{
+			"credit":       0.12,
+			"total_tokens": 500.0,
+		},
+	}
+	cr, tt, ok := usageCreditTotal(respOK)
+	if !ok || cr != 0.12 || tt != 500 {
+		t.Fatalf("usageCreditTotal = (%v, %v, %v), want (0.12, 500, true)", cr, tt, ok)
 	}
 }
