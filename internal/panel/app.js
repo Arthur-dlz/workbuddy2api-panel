@@ -2190,8 +2190,13 @@ function renderUsage(d) {
   // 1. DeepSeek 风格 4 核心 KPI 卡片
   const kpiEl = $('dsKpiGrid');
   if (kpiEl) {
-    // 腾讯 WorkBuddy 官方价格基准：加量包 50 元 / 1000 积分 = 0.05 元 / 积分
-    const OFFICIAL_CREDIT_PRICE = 0.05;
+    // 腾讯 WorkBuddy 官方价格基准：
+    // - 旗舰版连续包月（默认基准）：700 元 / 50,000 积分 = 0.014 元 / 积分（折合 ¥14 / 千分）
+    // - 高级版连续包月：约 140 元 / 9,000 积分 ≈ 0.0156 元 / 积分
+    // - 零售加量包（原旧基准）：50 元 / 1,000 积分 = 0.05 元 / 积分
+    const savedPrice = parseFloat(localStorage.getItem('wb2api.credit_price'));
+    const OFFICIAL_CREDIT_PRICE = Number.isFinite(savedPrice) && savedPrice > 0 ? savedPrice : 0.014;
+    const priceLabel = `¥${OFFICIAL_CREDIT_PRICE}/积分`;
     const realCredits = Number(t.credits || 0);
 
     // 官方基准模型扣费率（积分 / 1k tokens，基于上游实测及元数据）
@@ -2226,14 +2231,15 @@ function renderUsage(d) {
     let cardTitle, cardTag, cnyVal, subHtml;
     if (realCredits > 0) {
       cardTitle = '官方实扣额度';
-      cardTag = '<span class="tag ok" style="font-size:10px;">官方实扣</span>';
-      cnyVal = (realCredits * OFFICIAL_CREDIT_PRICE).toFixed(2);
+      cardTag = `<span class="tag ok" style="font-size:10px;" title="连续包月基准：700元/50,000积分 = 0.014元/积分">官方实扣</span>`;
+      const realCny = realCredits * OFFICIAL_CREDIT_PRICE;
+      cnyVal = realCny >= 10 ? realCny.toFixed(2) : (realCny >= 1 ? realCny.toFixed(2) : realCny.toFixed(3));
       const crStr = realCredits >= 10 ? realCredits.toFixed(2) : realCredits.toFixed(3);
       const savedStr = savedCredits > 0 ? ` · 节省 ~${savedCredits.toFixed(1)} 积分` : '';
-      subHtml = `官方实扣 ${crStr} 积分 · 官方 ¥0.05/积分${savedStr}`;
+      subHtml = `官方实扣 ${crStr} 积分 · 官方 ${priceLabel}${savedStr}`;
     } else {
       cardTitle = '预估消耗额度';
-      cardTag = '<span class="tag ok" style="font-size:10px;">官方 ¥0.05/积分</span>';
+      cardTag = `<span class="tag ok" style="font-size:10px;">官方 ${priceLabel}</span>`;
       const estCny = estCredits * OFFICIAL_CREDIT_PRICE;
       cnyVal = estCny >= 10 ? estCny.toFixed(2) : estCny.toFixed(3);
       const savedCny = savedCredits * OFFICIAL_CREDIT_PRICE;
@@ -2242,7 +2248,7 @@ function renderUsage(d) {
     }
 
     kpiEl.innerHTML = `
-      <div class="ds-kpi-card">
+      <div class="ds-kpi-card" title="折算基准：官方连续包月 700元/50,000分 = ¥${OFFICIAL_CREDIT_PRICE}/积分">
         <div class="lbl"><span>${cardTitle}</span>${cardTag}</div>
         <div class="val">¥ ${cnyVal}</div>
         <div class="sub">${subHtml}</div>
