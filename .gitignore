@@ -18,6 +18,7 @@ config.json
 
 # Build artifacts
 *.tmp
+*.exe~
 __pycache__/
 
 # Backups (contains auth tokens)

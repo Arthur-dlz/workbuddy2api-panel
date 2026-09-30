@@ -2332,7 +2332,7 @@ function renderUsage(d) {
 
   if ($('usModelBody')) {
     $('usModelBody').innerHTML = (d.by_model || []).map(x =>
-      usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+      usRow(x.key, '', x, '', true)).join('') || '<tr><td colspan="9" class="empty">暂无数据</td></tr>';
   }
 
   if ($('usRealmBody')) {
