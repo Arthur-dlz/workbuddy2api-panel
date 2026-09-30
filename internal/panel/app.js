@@ -2202,6 +2202,7 @@ function renderUsage(d) {
     // 官方基准模型扣费率（积分 / 1k tokens，基于上游实测及元数据）
     const OFFICIAL_MODEL_RATES = {
       'deepseek-v4-flash': 0.05,
+      'deepseek-v4.1-flash': 0.05,
       'glm-5.3-flash': 0.05,
       'glm-5.2': 0.05,
       'glm-5.1': 0.05,

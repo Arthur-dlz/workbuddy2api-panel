@@ -358,6 +358,15 @@ type Agg struct {
 	CreditRequests int64   `json:"credit_requests"`
 }
 
+// normalizeModelForDisplay 归一化展示用模型名（仅用于用量快照分组与时序图表展示，不改写底层用量存储与上游交互）：
+// deepseek-v4-flash 与 deepseek-v4.1-flash 统一归类为 deepseek-v4.1-flash。
+func normalizeModelForDisplay(m string) string {
+	if m == "deepseek-v4-flash" {
+		return "deepseek-v4.1-flash"
+	}
+	return m
+}
+
 // aggAcc 是聚合过程中的累加器：Agg 只放已算好的结果，均值需要样本数才能
 // 正确加权（不能对每桶的均值再取平均），所以样本数留在这里。
 type aggAcc struct {
@@ -391,7 +400,7 @@ func (g *aggAcc) add(b *bucket) {
 			if g.models == nil {
 				g.models = make(map[string]int64)
 			}
-			g.models[b.Model] += tt
+			g.models[normalizeModelForDisplay(b.Model)] += tt
 		}
 	}
 }
@@ -522,10 +531,11 @@ func (r *Recorder) Snapshot(hours int, nicks map[string]string) Snapshot {
 			acctRealm[b.UID] = b.Realm
 		}
 
-		if modelAgg[b.Model] == nil {
-			modelAgg[b.Model] = &aggAcc{}
+		mKey := normalizeModelForDisplay(b.Model)
+		if modelAgg[mKey] == nil {
+			modelAgg[mKey] = &aggAcc{}
 		}
-		modelAgg[b.Model].add(b)
+		modelAgg[mKey].add(b)
 
 		tk := b.TokenKey
 		if tk == "" {

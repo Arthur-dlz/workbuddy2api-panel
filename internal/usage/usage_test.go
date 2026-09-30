@@ -336,3 +336,67 @@ func TestCreditTrackingAndDefense(t *testing.T) {
 		t.Fatalf("全部历史 Totals.CreditRequests = %d, want 3", all.Totals.CreditRequests)
 	}
 }
+
+// TestNormalizeDeepseekFlashModel 验证 deepseek-v4-flash 与 deepseek-v4.1-flash 在快照中自动归类合并为 deepseek-v4.1-flash。
+func TestNormalizeDeepseekFlashModel(t *testing.T) {
+	r := New("")
+	now := time.Now()
+
+	// 记录 2 次 deepseek-v4-flash
+	r.Add(now, "cn", "u1", "deepseek-v4-flash", "master", Delta{
+		PromptTokens:     100,
+		HasPromptTokens:  true,
+		CompletionTokens: 50,
+		HasCompletion:    true,
+		TotalTokens:      150,
+		HasTotal:         true,
+	}, true)
+	r.Add(now, "cn", "u2", "deepseek-v4-flash", "master", Delta{
+		PromptTokens:     200,
+		HasPromptTokens:  true,
+		CompletionTokens: 100,
+		HasCompletion:    true,
+		TotalTokens:      300,
+		HasTotal:         true,
+	}, true)
+
+	// 记录 1 次 deepseek-v4.1-flash
+	r.Add(now, "cn", "u1", "deepseek-v4.1-flash", "master", Delta{
+		PromptTokens:     50,
+		HasPromptTokens:  true,
+		CompletionTokens: 25,
+		HasCompletion:    true,
+		TotalTokens:      75,
+		HasTotal:         true,
+	}, true)
+
+	snap := r.Snapshot(24, nil)
+
+	// 1. ByModel 应该只有 1 个模型项，且名称为 deepseek-v4.1-flash
+	if len(snap.ByModel) != 1 {
+		t.Fatalf("expected 1 model entry, got %d: %+v", len(snap.ByModel), snap.ByModel)
+	}
+	m := snap.ByModel[0]
+	if m.Key != "deepseek-v4.1-flash" {
+		t.Errorf("expected model key 'deepseek-v4.1-flash', got '%s'", m.Key)
+	}
+	if m.Requests != 3 {
+		t.Errorf("expected 3 requests merged, got %d", m.Requests)
+	}
+	if m.TotalTokens != 525 {
+		t.Errorf("expected 525 total tokens, got %d", m.TotalTokens)
+	}
+
+	// 2. Series 时序分解中也应合并为 deepseek-v4.1-flash
+	if len(snap.Series) != 1 {
+		t.Fatalf("expected 1 series point, got %d", len(snap.Series))
+	}
+	p := snap.Series[0]
+	if _, hasOld := p.Models["deepseek-v4-flash"]; hasOld {
+		t.Errorf("series should not contain deepseek-v4-flash, found: %v", p.Models)
+	}
+	if p.Models["deepseek-v4.1-flash"] != 525 {
+		t.Errorf("series deepseek-v4.1-flash tokens want 525, got %d", p.Models["deepseek-v4.1-flash"])
+	}
+}
+
