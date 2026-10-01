@@ -2137,6 +2137,14 @@ function fmtMs(ms) {
   return Math.round(ms) + 'ms';
 }
 function fmtRate(r) { return r ? Number(r).toFixed(1) + ' tok/s' : '—'; }
+function fmtCredit(c) {
+  const n = Number(c || 0);
+  if (!n || n <= 0) return '—';
+  if (n >= 1000) {
+    return n.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  }
+  return n.toFixed(2);
+}
 
 function usStat(v, k, cls) {
   return '<div class="stat ' + (cls || '') + '"><div class="v">' + esc(v) +
@@ -2155,8 +2163,8 @@ function usBar(prompt, completion, total) {
 }
 
 /* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
-   withPerf 控制是否追加延迟/速率两列——只有「按账号」表的表头带这两列；
-   模型表与域表没有，多输出会造成列错位。早先靠「mid 是否为 undefined」隐式
+   withPerf 控制是否追加延迟/速率两列——只有「按账号」与「按模型」表的表头带这两列；
+   域表没有，多输出会造成列错位。早先靠「mid 是否为 undefined」隐式
    判断，调用方稍一改动就会错列，故改为显式参数。 */
 function usRow(name, sub, a, mid, withPerf) {
   return '<tr>' +
@@ -2168,6 +2176,7 @@ function usRow(name, sub, a, mid, withPerf) {
     '<td class="num">' + fmtTok(a.prompt_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.total_tokens) + '</td>' +
+    '<td class="num">' + fmtCredit(a.credits) + '</td>' +
     (withPerf
       ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
         '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
@@ -2319,26 +2328,27 @@ function renderUsage(d) {
         '<td>' + hrHtml + '</td>' +
         '<td class="num">' + fmtTok(x.completion_tokens) + '</td>' +
         '<td class="num"><b>' + fmtTok(x.total_tokens) + '</b></td>' +
+        '<td class="num">' + fmtCredit(x.credits) + '</td>' +
         '<td class="num" style="color:var(--ok)">~' + sc.toFixed(1) + '</td>' +
         '</tr>';
-    }).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+    }).join('') || '<tr><td colspan="11" class="empty">暂无数据</td></tr>';
   }
 
   if ($('usAccBody')) {
     $('usAccBody').innerHTML = (d.by_account || []).map(x =>
-      usRow(x.key.slice(0, 8), x.extra || '', x,
+      usRow(x.key.slice(0, 8), maskPhone(x.extra) || '', x,
         '<td class="num">' + esc(x.realm || '') + '</td>', true)
-    ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+    ).join('') || '<tr><td colspan="11" class="empty">暂无数据</td></tr>';
   }
 
   if ($('usModelBody')) {
     $('usModelBody').innerHTML = (d.by_model || []).map(x =>
-      usRow(x.key, '', x, '', true)).join('') || '<tr><td colspan="9" class="empty">暂无数据</td></tr>';
+      usRow(x.key, '', x, '', true)).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
   }
 
   if ($('usRealmBody')) {
     $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
-      usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+      usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
   }
 
   filterAndRenderCharts();
