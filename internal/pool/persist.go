@@ -234,6 +234,7 @@ func (p *Pool) saveLocked() {
 	sf := p.stateOverviewLocked()
 	raw, err := json.MarshalIndent(sf, "", "  ")
 	if err != nil {
+		p.dirty.Store(true)
 		p.notePersistFail(err)
 		return
 	}
@@ -242,10 +243,12 @@ func (p *Pool) saveLocked() {
 	}
 	tmp := p.stateFp + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+		p.dirty.Store(true)
 		p.notePersistFail(err)
 		return
 	}
 	if err := os.Rename(tmp, p.stateFp); err != nil {
+		p.dirty.Store(true)
 		p.notePersistFail(err)
 		return
 	}

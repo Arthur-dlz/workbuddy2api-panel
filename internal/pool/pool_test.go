@@ -1139,6 +1139,17 @@ func TestSaveFailureRecordedAndRecovers(t *testing.T) {
 		t.Fatal("persist failure should be recorded (visible), got 0")
 	}
 
+	// A failed Flush must keep the snapshot dirty so a later retry can persist it
+	// without requiring an unrelated state mutation.
+	p.stateFp = filepath.Join(t.TempDir(), "state.json")
+	p.Flush()
+	if _, err := os.Stat(p.stateFp); err != nil {
+		t.Fatalf("retry after persistence failure did not write state: %v", err)
+	}
+	if p.persistFails != 0 {
+		t.Fatalf("successful retry should clear failure count, got %d", p.persistFails)
+	}
+
 	// 换回可写目录 → 成功后 persistFails 归零（恢复日志由零值门槛触发）。
 	good := filepath.Join(t.TempDir(), "state.json")
 	p2 := New(good)

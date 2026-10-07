@@ -64,6 +64,45 @@ func TestSameKeySameAccount(t *testing.T) {
 	}
 }
 
+func TestTouchDoesNotOverwriteReboundUIDOrMoveTimeBackward(t *testing.T) {
+	st := newCountingStore()
+	r := routerWith(st, []string{"old", "new"}, time.Minute)
+	newer := time.Now()
+	r.mu.Lock()
+	r.entries["c1"] = entry{uid: "new", lastActive: newer}
+	r.mu.Unlock()
+
+	// A read that observed the old UID before a concurrent rebind may reach touch later.
+	r.touch("c1", "old", newer.Add(-time.Second))
+
+	r.mu.RLock()
+	e := r.entries["c1"]
+	r.mu.RUnlock()
+	if e.uid != "new" || !e.lastActive.Equal(newer) {
+		t.Fatalf("stale touch changed current binding: got %+v, want new UID and unchanged timestamp", e)
+	}
+	if got := st.LoadBinds()["c1"]; got == "old" {
+		t.Fatalf("stale touch mirrored old UID: %q", got)
+	}
+}
+
+func TestUnbindIfBoundOnlyRemovesExpectedUID(t *testing.T) {
+	r := routerWith(newCountingStore(), []string{"old", "new"}, time.Minute)
+	r.Bind("c1", "new")
+	if r.UnbindIfBound("c1", "old") {
+		t.Fatal("mismatched failed UID must not unbind current account")
+	}
+	if got, ok := r.GetBind("c1"); !ok || got != "new" {
+		t.Fatalf("current binding lost after mismatched unbind: got %q, ok=%v", got, ok)
+	}
+	if !r.UnbindIfBound("c1", "new") {
+		t.Fatal("matching UID should unbind")
+	}
+	if _, ok := r.GetBind("c1"); ok {
+		t.Fatal("matching unbind should remove binding")
+	}
+}
+
 func TestTTLExpiryReassigns(t *testing.T) {
 	st := newCountingStore()
 	r := routerWith(st, []string{"a1", "a2"}, 10*time.Millisecond)
@@ -376,4 +415,3 @@ func TestGetBind(t *testing.T) {
 		t.Fatalf("expired key should return false, got (%s, %v)", uid, ok)
 	}
 }
-

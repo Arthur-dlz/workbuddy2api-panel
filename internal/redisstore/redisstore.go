@@ -123,6 +123,12 @@ type Upstash struct {
 	submitMu sync.Mutex
 	// wg 已提交未完成的写（Close 排空用）。
 	wg sync.WaitGroup
+	// bindOrder serializes bind mutations per session key. Other Redis writes retain
+	// the shared bounded-concurrency path; only SetBind/DelBind require ordering.
+	bindOrderMu sync.Mutex
+	bindOrder   *sync.Cond
+	bindSubmit  map[string]uint64
+	bindDone    map[string]uint64
 }
 
 // goWrite 以 fire-and-forget 方式执行 fn：写槽（sem）有界并发，Close 前提交的写
@@ -147,6 +153,55 @@ func (u *Upstash) goWrite(fn func()) {
 		// 因此间歇失败（约 20%：取决于 write-1/write-2 谁先抢到唯一槽）。丢弃
 		// 语义已由提交点（submitMu 下的 done 检查）唯一承担；此处提交已冻结在
 		// wg 中，Close 的 wg.Wait 必然等到它执行完。
+		u.sem <- struct{}{}
+		defer func() { <-u.sem }()
+		fn()
+	}()
+}
+
+// goBindWrite preserves submission order for one binding key while retaining
+// fire-and-forget behavior and Close's drain guarantee.
+func (u *Upstash) goBindWrite(key string, fn func()) {
+	u.closeOnceGuard()
+	u.submitMu.Lock()
+	select {
+	case <-u.done:
+		u.submitMu.Unlock()
+		return
+	default:
+	}
+	u.wg.Add(1)
+	u.bindOrderMu.Lock()
+	if u.bindOrder == nil {
+		u.bindOrder = sync.NewCond(&u.bindOrderMu)
+		u.bindSubmit = make(map[string]uint64)
+		u.bindDone = make(map[string]uint64)
+	}
+	u.bindSubmit[key]++
+	seq := u.bindSubmit[key]
+	u.bindOrderMu.Unlock()
+	u.submitMu.Unlock()
+
+	go func() {
+		defer u.wg.Done()
+		u.bindOrderMu.Lock()
+		for u.bindDone[key]+1 != seq {
+			u.bindOrder.Wait()
+		}
+		u.bindOrderMu.Unlock()
+
+		// Advance even if an operation panics so later writes for this key and
+		// Close's drain cannot remain blocked forever.
+		defer func() {
+			u.bindOrderMu.Lock()
+			u.bindDone[key] = seq
+			if u.bindSubmit[key] == seq {
+				delete(u.bindSubmit, key)
+				delete(u.bindDone, key)
+			}
+			u.bindOrder.Broadcast()
+			u.bindOrderMu.Unlock()
+		}()
 		u.sem <- struct{}{}
 		defer func() { <-u.sem }()
 		fn()
@@ -199,7 +254,7 @@ func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
 	if ttl <= 0 {
 		ttl = keyTTL
 	}
-	u.goWrite(func() {
+	u.goBindWrite(key, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := u.client.Set(ctx, bindKey(key), uid, ttl).Err(); err != nil {
@@ -210,7 +265,7 @@ func (u *Upstash) SetBind(key, uid string, ttl time.Duration) {
 
 // DelBind 异步删除粘性会话绑定。
 func (u *Upstash) DelBind(key string) {
-	u.goWrite(func() {
+	u.goBindWrite(key, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := u.client.Del(ctx, bindKey(key)).Err(); err != nil {

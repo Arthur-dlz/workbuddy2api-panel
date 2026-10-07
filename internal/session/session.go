@@ -167,7 +167,10 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 	// re-check：并发同 key 可能已被其他 goroutine 分配好。
 	if e2, found2 := r.entries[key]; found2 && !expired(e2, now, r.cfg.TTL) {
 		if available[e2.uid] {
-			r.entries[key] = entry{uid: e2.uid, lastActive: now}
+			if now.After(e2.lastActive) {
+				e2.lastActive = now
+				r.entries[key] = e2
+			}
 			return e2.uid, true
 		}
 		delete(r.entries, key) // 失效：清掉再分配
@@ -207,9 +210,17 @@ func (r *Router) ResolveForModel(key, model string) (string, bool) {
 // touch 滚动 lastActive 并异步镜像（只在快路径命中时写最后一次）。
 func (r *Router) touch(key, uid string, now time.Time) {
 	r.mu.Lock()
-	r.entries[key] = entry{uid: uid, lastActive: now}
-	r.mu.Unlock()
+	e, ok := r.entries[key]
+	if !ok || e.uid != uid {
+		r.mu.Unlock()
+		return
+	}
+	if now.After(e.lastActive) {
+		e.lastActive = now
+		r.entries[key] = e
+	}
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	r.mu.Unlock()
 }
 
 // GetBind 检查会话是否已存在有效绑定（未过期）。存在返回 (uid, true)，不存在返回 ("", false)。
@@ -236,8 +247,8 @@ func (r *Router) Bind(key, uid string) {
 	now := time.Now()
 	r.mu.Lock()
 	r.entries[key] = entry{uid: uid, lastActive: now}
-	r.mu.Unlock()
 	r.cfg.Store.SetBind(key, uid, r.cfg.TTL)
+	r.mu.Unlock()
 }
 
 // Unbind 解除会话绑定（请求失败时调用，让该会话下次重新分配）。返回是否存在。
@@ -246,11 +257,28 @@ func (r *Router) Unbind(key string) bool {
 	_, found := r.entries[key]
 	if found {
 		delete(r.entries, key)
-	}
-	r.mu.Unlock()
-	if found {
 		r.cfg.Store.DelBind(key)
 	}
+	r.mu.Unlock()
+	return found
+}
+
+// UnbindIfBound removes a binding only when it still belongs to expectedUID.
+// This prevents a late failure from an older request from deleting a binding
+// established by a newer successful request.
+func (r *Router) UnbindIfBound(key, expectedUID string) bool {
+	if key == "" || expectedUID == "" {
+		return false
+	}
+	r.mu.Lock()
+	e, found := r.entries[key]
+	if found && e.uid == expectedUID {
+		delete(r.entries, key)
+		r.cfg.Store.DelBind(key)
+	} else {
+		found = false
+	}
+	r.mu.Unlock()
 	return found
 }
 
@@ -272,11 +300,9 @@ func (r *Router) gcOnce(now time.Time) int {
 	}
 	for _, key := range expiredKeys {
 		delete(r.entries, key)
-	}
-	r.mu.Unlock()
-	for _, key := range expiredKeys {
 		r.cfg.Store.DelBind(key)
 	}
+	r.mu.Unlock()
 	return len(expiredKeys)
 }
 
