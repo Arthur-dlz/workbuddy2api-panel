@@ -15,7 +15,9 @@ cd "$(dirname "$0")"
 AUTH_DIR="./auths"
 CONTAINER="workbuddy2api"
 
-mkdir -p "$AUTH_DIR"
+# Keep new and pre-existing credential directories owner-only.
+mkdir -m 700 -p "$AUTH_DIR"
+chmod 700 "$AUTH_DIR"
 
 # login 工具：不存在才编译（源码改动后手动 go build -o login ./cmd/login）
 LOGIN_BIN="./login"
@@ -135,28 +137,8 @@ WB2A_LOGIN_DOMAIN="$DOMAIN" \
 WB2A_LOGIN_USER_ID="$USER_ID" \
 WB2A_LOGIN_ENT_ID="$ENT_ID" \
 WB2A_LOGIN_NICKNAME="$NICKNAME" \
-WB2A_LOGIN_AUTH_FILE="$AUTH_FILE" \
 WB2A_LOGIN_ACTION="$ACTION" \
-python3 - <<'PYEOF'
-import json, os
-
-auth = {
-    "account": {
-        "uid": os.environ["WB2A_LOGIN_USER_ID"],
-        "enterpriseId": os.environ["WB2A_LOGIN_ENT_ID"],
-        "nickname": os.environ["WB2A_LOGIN_NICKNAME"],
-    },
-    "auth": {
-        "accessToken": os.environ["WB2A_LOGIN_TOKEN"],
-        "refreshToken": os.environ["WB2A_LOGIN_REFRESH"],
-        "expiresAt": int(os.environ["WB2A_LOGIN_EXPIRES_AT"]),
-        "domain": os.environ["WB2A_LOGIN_DOMAIN"],
-    },
-}
-with open(os.environ["WB2A_LOGIN_AUTH_FILE"], "w") as f:
-    json.dump(auth, f, indent=1)
-print(f"已保存（{os.environ['WB2A_LOGIN_ACTION']}）: {os.environ['WB2A_LOGIN_AUTH_FILE']}")
-PYEOF
+python3 scripts/write_auth.py "$AUTH_FILE"
 
 # ─── 重启服务 ────────────────────────────────────────────
 echo ""
@@ -177,6 +159,6 @@ echo "============================================================"
 echo "  登录完成！"
 echo "  UID: $USER_ID"
 echo "  Nickname: ${NICKNAME:-（未获取到）}"
-echo "  Token: ${TOKEN:0:30}..."
+echo "  Token: 已安全保存（不显示凭证内容）"
 echo "  有效期: $(date -d "@$EXPIRES_AT" '+%Y-%m-%d %H:%M' 2>/dev/null || echo "$EXPIRES_AT")"
 echo "============================================================"

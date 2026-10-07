@@ -42,26 +42,28 @@ var (
 	pGlobalAlloc       = kernel32.NewProc("GlobalAlloc")
 	pGlobalLock        = kernel32.NewProc("GlobalLock")
 	pGlobalUnlock      = kernel32.NewProc("GlobalUnlock")
+	pGlobalFree        = kernel32.NewProc("GlobalFree")
+	pRtlMoveMemory     = kernel32.NewProc("RtlMoveMemory")
 )
 
 const (
-	wmUser        = 0x0400
-	wmTrayIcon    = wmUser + 101
-	wmLButtonDbl  = 0x0203
-	wmRButtonUp   = 0x0205
-	wmCommand     = 0x0111
-	wmClose       = 0x0010
-	wmDestroy     = 0x0002
+	wmUser       = 0x0400
+	wmTrayIcon   = wmUser + 101
+	wmLButtonDbl = 0x0203
+	wmRButtonUp  = 0x0205
+	wmCommand    = 0x0111
+	wmClose      = 0x0010
+	wmDestroy    = 0x0002
 
 	nimAdd        = 0x00000000
 	nimModify     = 0x00000001
 	nimDelete     = 0x00000002
 	nimSetVersion = 0x00000004
 
-	nifMessage    = 0x00000001
-	nifIcon       = 0x00000002
-	nifTip        = 0x00000004
-	nifInfo       = 0x00000010
+	nifMessage = 0x00000001
+	nifIcon    = 0x00000002
+	nifTip     = 0x00000004
+	nifInfo    = 0x00000010
 
 	tpmRightButton = 0x0002
 	mfString       = 0x0000
@@ -121,10 +123,10 @@ type msg struct {
 
 // Config 托盘参数。
 type Config struct {
-	Title       string
-	Port        int
-	APIKey      string
-	OnExit      func()
+	Title  string
+	Port   int
+	APIKey string
+	OnExit func()
 }
 
 const (
@@ -161,10 +163,10 @@ func Run(cfg Config) error {
 	hIcon, _, _ := pLoadIconW.Call(0, uintptr(idiApplication))
 
 	wndClass := wndClassExW{
-		cbSize:      uint32(unsafe.Sizeof(wndClassExW{})),
-		lpfnWndProc: syscall.NewCallback(wndProc),
-		hInstance:   hInstance,
-		hIcon:       hIcon,
+		cbSize:        uint32(unsafe.Sizeof(wndClassExW{})),
+		lpfnWndProc:   syscall.NewCallback(wndProc),
+		hInstance:     hInstance,
+		hIcon:         hIcon,
 		lpszClassName: className,
 	}
 
@@ -247,9 +249,9 @@ func wndProc(hWnd, uMsg, wParam, lParam uintptr) uintptr {
 			openWebPanel()
 		case cmdCopyURL:
 			url := fmt.Sprintf("http://127.0.0.1:%d/v1", currentConfig.Port)
-			setClipboardText(url)
+			_ = setClipboardText(hWnd, url)
 		case cmdCopyKey:
-			setClipboardText(currentConfig.APIKey)
+			_ = setClipboardText(hWnd, currentConfig.APIKey)
 		case cmdOpenDir:
 			dir, _ := os.Getwd()
 			exec.Command("explorer.exe", dir).Start()
@@ -332,29 +334,43 @@ func utf16String(s string) []uint16 {
 	return res
 }
 
-func setClipboardText(text string) {
-	if text == "" {
-		return
-	}
-	utf16, err := syscall.UTF16FromString(text)
-	if err != nil {
-		return
-	}
-	bytes := len(utf16) * 2
+type windowsClipboardAPI struct{}
 
-	hMem, _, _ := pGlobalAlloc.Call(gmemMoveable, uintptr(bytes))
-	if hMem == 0 {
-		return
-	}
-	ptr, _, _ := pGlobalLock.Call(hMem)
+func (windowsClipboardAPI) alloc(size int) uintptr {
+	h, _, _ := pGlobalAlloc.Call(gmemMoveable, uintptr(size))
+	return h
+}
+
+func (windowsClipboardAPI) write(handle uintptr, data []byte) bool {
+	ptr, _, _ := pGlobalLock.Call(handle)
 	if ptr == 0 {
-		return
+		return false
 	}
-	copy((*[1 << 20]byte)(unsafe.Pointer(ptr))[:bytes], (*[1 << 20]byte)(unsafe.Pointer(&utf16[0]))[:bytes])
-	pGlobalUnlock.Call(hMem)
+	pRtlMoveMemory.Call(ptr, uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)))
+	runtime.KeepAlive(data)
+	pGlobalUnlock.Call(handle)
+	return true
+}
 
-	pOpenClipboard.Call(0)
-	pEmptyClipboard.Call()
-	pSetClipboardData.Call(cfUnicodetext, hMem)
-	pCloseClipboard.Call()
+func (windowsClipboardAPI) free(handle uintptr) { pGlobalFree.Call(handle) }
+
+func (windowsClipboardAPI) open(owner uintptr) bool {
+	ok, _, _ := pOpenClipboard.Call(owner)
+	return ok != 0
+}
+
+func (windowsClipboardAPI) empty() bool {
+	ok, _, _ := pEmptyClipboard.Call()
+	return ok != 0
+}
+
+func (windowsClipboardAPI) setUnicodeText(handle uintptr) bool {
+	data, _, _ := pSetClipboardData.Call(cfUnicodetext, handle)
+	return data != 0
+}
+
+func (windowsClipboardAPI) close() { pCloseClipboard.Call() }
+
+func setClipboardText(owner uintptr, text string) error {
+	return setClipboardTextWith(windowsClipboardAPI{}, owner, text)
 }
