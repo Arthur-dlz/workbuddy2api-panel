@@ -3,6 +3,7 @@
 package scheduler
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"time"
@@ -45,8 +46,16 @@ func travelDay(t time.Time) string {
 // 禁用账号跳过；401/查询失败只跳过该账号本轮（不强刷 token，交 22:00 keepalive）；
 // 账号间限速 travelAccountDelay。
 func (s *Scheduler) RunTravelNow() {
+	s.RunTravelContext(context.Background())
+}
+
+// RunTravelContext executes one travel pass bounded by ctx.
+func (s *Scheduler) RunTravelContext(ctx context.Context) {
 	first := true
 	for _, st := range s.cfg.Pool.List() {
+		if ctx.Err() != nil {
+			return
+		}
 		if st.Disabled {
 			continue
 		}
@@ -58,34 +67,46 @@ func (s *Scheduler) RunTravelNow() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
 		if !first {
-			time.Sleep(travelAccountDelay)
+			if !sleepCtx(ctx, travelAccountDelay) {
+				return
+			}
 		}
 		first = false
-		s.travelOne(a)
+		s.travelOneContext(ctx, a)
 	}
 }
 
 // travelOne 单账号单趟状态机：查有无猫 + 查状态 + 最多一个动作，不轮询不等待。
 func (s *Scheduler) travelOne(a *auth.Auth) {
-	buddy, err := s.cfg.Upstream.BuddyInfo(a)
+	s.travelOneContext(context.Background(), a)
+}
+
+func (s *Scheduler) travelOneContext(ctx context.Context, a *auth.Auth) {
+	if ctx.Err() != nil {
+		return
+	}
+	buddy, err := s.cfg.Upstream.BuddyInfoContext(ctx, a)
 	if err != nil {
 		log.Printf("travel %s: buddy-info: %v", logfmt.Label(a.UID, a.Nickname), err)
 		return
 	}
 	if buddy == nil {
-		s.travelAdopt(a)
+		s.travelAdoptContext(ctx, a)
 		return
 	}
-	ts, err := s.cfg.Upstream.TravelStatus(a)
+	if ctx.Err() != nil {
+		return
+	}
+	ts, err := s.cfg.Upstream.TravelStatusContext(ctx, a)
 	if err != nil {
 		log.Printf("travel %s: status: %v", logfmt.Label(a.UID, a.Nickname), err)
 		return
 	}
 	switch ts.State {
 	case travelStateArrived:
-		s.travelClaim(a, ts)
+		s.travelClaimContext(ctx, a, ts)
 	case travelStateIdle:
-		s.travelDepart(a, ts)
+		s.travelDepartContext(ctx, a, ts)
 	case travelStateTraveling:
 		log.Printf("travel %s: skip (traveling record=%d)", logfmt.Label(a.UID, a.Nickname), ts.RecordID)
 	default:
@@ -95,11 +116,18 @@ func (s *Scheduler) travelOne(a *auth.Auth) {
 
 // travelDepart 空闲且未达当日上限时派出（每日 1 次，自然日 00:00 CST 重置）。
 func (s *Scheduler) travelDepart(a *auth.Auth, ts *upstream.TravelState) {
+	s.travelDepartContext(context.Background(), a, ts)
+}
+
+func (s *Scheduler) travelDepartContext(ctx context.Context, a *auth.Auth, ts *upstream.TravelState) {
+	if ctx.Err() != nil {
+		return
+	}
 	if ts.DailyLimitReached {
 		log.Printf("travel %s: skip (daily limit reached)", logfmt.Label(a.UID, a.Nickname))
 		return
 	}
-	if err := s.cfg.Upstream.TravelDepart(a, travelLocationID); err != nil {
+	if err := s.cfg.Upstream.TravelDepartContext(ctx, a, travelLocationID); err != nil {
 		log.Printf("travel %s: depart: %v", logfmt.Label(a.UID, a.Nickname), err)
 		return
 	}
@@ -108,11 +136,18 @@ func (s *Scheduler) travelDepart(a *auth.Auth, ts *upstream.TravelState) {
 
 // travelClaim 到站领奖（必须带 record_id）。
 func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) {
+	s.travelClaimContext(context.Background(), a, ts)
+}
+
+func (s *Scheduler) travelClaimContext(ctx context.Context, a *auth.Auth, ts *upstream.TravelState) {
+	if ctx.Err() != nil {
+		return
+	}
 	if ts.RecordID == 0 {
 		log.Printf("travel %s: claim skipped (arrived but no record_id)", logfmt.Label(a.UID, a.Nickname))
 		return
 	}
-	reward, err := s.cfg.Upstream.TravelClaim(a, ts.RecordID)
+	reward, err := s.cfg.Upstream.TravelClaimContext(ctx, a, ts.RecordID)
 	if err != nil {
 		log.Printf("travel %s: claim record=%d: %v", logfmt.Label(a.UID, a.Nickname), ts.RecordID, err)
 		return
@@ -128,20 +163,35 @@ func (s *Scheduler) travelClaim(a *auth.Auth, ts *upstream.TravelState) {
 // 不是账号问题（report.go 注释亦明确「解锁 first_buddy 任务（领养前置）」）。
 // conversation 门槛未达标仍属预期行为，记一次当日已试后静默跳过，不再重试。
 func (s *Scheduler) travelAdopt(a *auth.Auth) {
+	s.travelAdoptContext(context.Background(), a)
+}
+
+func (s *Scheduler) travelAdoptContext(ctx context.Context, a *auth.Auth) {
+	if ctx.Err() != nil {
+		return
+	}
 	if s.adoptTriedToday(a.UID) {
 		return
 	}
 	// 前置：解锁 first_buddy 任务（幂等；失败不阻塞，让 buddy/first 按既有错误路径暴露）。
-	if err := s.cfg.Upstream.ReportChatActivity(a, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
+	if err := s.cfg.Upstream.ReportChatActivityContext(ctx, a, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
 		log.Printf("travel %s: adopt preflight report: %v", logfmt.Label(a.UID, a.Nickname), err)
 	} else {
-		time.Sleep(adoptReportGap) // 给上游事件处理留时间（对齐脚本实测的 1.05s 间隔口径）
+		if !sleepCtx(ctx, adoptReportGap) {
+			return
+		} // 给上游事件处理留时间
 	}
-	if err := s.cfg.Upstream.BuddyAgreement(a); err != nil {
+	if ctx.Err() != nil {
+		return
+	}
+	if err := s.cfg.Upstream.BuddyAgreementContext(ctx, a); err != nil {
 		log.Printf("travel %s: agreement: %v", logfmt.Label(a.UID, a.Nickname), err)
 		return
 	}
-	err := s.cfg.Upstream.BuddyFirst(a)
+	if ctx.Err() != nil {
+		return
+	}
+	err := s.cfg.Upstream.BuddyFirstContext(ctx, a)
 	switch {
 	case err == nil:
 		log.Printf("travel %s: adopt ok (+300 credits)", logfmt.Label(a.UID, a.Nickname))

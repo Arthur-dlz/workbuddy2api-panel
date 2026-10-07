@@ -42,7 +42,7 @@ type autoAction struct {
 	TaskCode string // 目标任务 code
 	Desc     string // 展示用说明
 	Attempt  bool   // true = 尝试型（上游未证实可脚本化，跑了可能不点亮）
-	run      func(p *Panel, a *auth.Auth) (string, error)
+	run      func(context.Context, *Panel, *auth.Auth) (string, error)
 }
 
 // autoActions 已实现的任务动作表（顺序即执行顺序：先解锁依赖项）。
@@ -219,7 +219,11 @@ func isMPTaskCode(code string) bool { return mpTaskCodes[code] }
 // 双口径：mp 专属任务在默认列表查不到，自动回落 mp 列表（仅对已登记的 mp 码，
 // 未知码不多打一次上游）。
 func (p *Panel) taskByCode(a *auth.Auth, code string) (*upstream.Task, error) {
-	tasks, err := p.cfg.Upstream.ListTasks(a)
+	return p.taskByCodeContext(context.Background(), a, code)
+}
+
+func (p *Panel) taskByCodeContext(ctx context.Context, a *auth.Auth, code string) (*upstream.Task, error) {
+	tasks, err := p.cfg.Upstream.ListTasksContext(ctx, a)
 	if err != nil {
 		return nil, err
 	}
@@ -229,7 +233,7 @@ func (p *Panel) taskByCode(a *auth.Auth, code string) (*upstream.Task, error) {
 		}
 	}
 	if isMPTaskCode(code) {
-		return p.taskByCodeMP(a, code)
+		return p.taskByCodeMPContext(ctx, a, code)
 	}
 	return nil, nil
 }
@@ -246,7 +250,11 @@ var (
 // taskByCodeWaiting 回读任务，若未达标则在有界预算内轮询等待（上游异步计分）。
 // 已达标（claimable）立即返回；预算耗尽返回最后一次结果（可能仍未达标）。
 func (p *Panel) taskByCodeWaiting(a *auth.Auth, code string) (*upstream.Task, error) {
-	t, err := p.taskByCode(a, code)
+	return p.taskByCodeWaitingContext(context.Background(), a, code)
+}
+
+func (p *Panel) taskByCodeWaitingContext(ctx context.Context, a *auth.Auth, code string) (*upstream.Task, error) {
+	t, err := p.taskByCodeContext(ctx, a, code)
 	if err != nil || t == nil {
 		return t, err
 	}
@@ -254,8 +262,14 @@ func (p *Panel) taskByCodeWaiting(a *auth.Auth, code string) (*upstream.Task, er
 		return t, nil
 	}
 	for i := 1; i < claimPollAttempts; i++ {
-		time.Sleep(claimPollGap)
-		t2, err2 := p.taskByCode(a, code)
+		timer := time.NewTimer(claimPollGap)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return t, ctx.Err()
+		case <-timer.C:
+		}
+		t2, err2 := p.taskByCodeContext(ctx, a, code)
 		if err2 != nil {
 			return t, nil // 轮询期间的查询失败不覆盖已拿到的结果
 		}
@@ -272,7 +286,11 @@ func (p *Panel) taskByCodeWaiting(a *auth.Auth, code string) (*upstream.Task, er
 // taskByCodeMP 以小程序口径拉取任务列表并定位单个任务；未找到返回 nil。
 // 小程序限定任务（school_season / Sequential_Tasks_1）在默认口径列表不出现。
 func (p *Panel) taskByCodeMP(a *auth.Auth, code string) (*upstream.Task, error) {
-	tasks, err := p.cfg.Upstream.ListTasksMP(a)
+	return p.taskByCodeMPContext(context.Background(), a, code)
+}
+
+func (p *Panel) taskByCodeMPContext(ctx context.Context, a *auth.Auth, code string) (*upstream.Task, error) {
+	tasks, err := p.cfg.Upstream.ListTasksMPContext(ctx, a)
 	if err != nil {
 		return nil, err
 	}
@@ -288,13 +306,26 @@ func (p *Panel) taskByCodeMP(a *auth.Auth, code string) (*upstream.Task, error) 
 // 登记的形态（此时上报事件全部不归账，任务永远点不亮，上游 task_runner c793ae3
 // 实测）——判定以回读 accept_status 为准，未生效重试一次。
 func (p *Panel) acceptWithVerifyMP(a *auth.Auth, code string) bool {
+	return p.acceptWithVerifyMPContext(context.Background(), a, code)
+}
+
+func (p *Panel) acceptWithVerifyMPContext(ctx context.Context, a *auth.Auth, code string) bool {
 	for attempt := 1; attempt <= 2; attempt++ {
-		if err := p.cfg.Upstream.AcceptTasksMP(a, []string{code}); err != nil {
+		if ctx.Err() != nil {
+			return false
+		}
+		if err := p.cfg.Upstream.AcceptTasksMPContext(ctx, a, []string{code}); err != nil {
 			log.Printf("autotask %s %s: accept 尝试%d: %v", logfmt.Label(a.UID, a.Nickname), code, attempt, err)
 			continue
 		}
-		time.Sleep(mpActionGap)
-		t, err := p.taskByCodeMP(a, code)
+		timer := time.NewTimer(mpActionGap)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
+		t, err := p.taskByCodeMPContext(ctx, a, code)
 		if err == nil && t != nil && t.AcceptStatus != "not_accepted" && t.AcceptStatus != "" {
 			return true
 		}
@@ -329,8 +360,8 @@ var mpChatEventGap = 45 * time.Second
 // mp 查询 → accept（带登记回读验证）→ mini chat 事件上报（withActivityId 决定
 // 是否带开学季 activityId：school_season 必带，Sequential_Tasks_1 不带——服务端按
 // source=mini_program 指纹关联）→ 回读 → 达标即领奖。
-func (p *Panel) runMPMiniChatTask(a *auth.Auth, code string, withActivityId bool) (string, error) {
-	t, err := p.taskByCodeMP(a, code)
+func (p *Panel) runMPMiniChatTask(ctx context.Context, a *auth.Auth, code string, withActivityId bool) (string, error) {
+	t, err := p.taskByCodeMPContext(ctx, a, code)
 	if err != nil {
 		return "", err
 	}
@@ -341,7 +372,7 @@ func (p *Panel) runMPMiniChatTask(a *auth.Auth, code string, withActivityId bool
 		return "已领取", nil
 	}
 	if t.AcceptStatus == "not_accepted" || t.AcceptStatus == "" {
-		if !p.acceptWithVerifyMP(a, code) {
+		if !p.acceptWithVerifyMPContext(ctx, a, code) {
 			return "accept 未登记生效（上游 200+OK 但未落账形态），待下次重试", nil
 		}
 	}
@@ -351,7 +382,7 @@ func (p *Panel) runMPMiniChatTask(a *auth.Auth, code string, withActivityId bool
 		target = 1
 	}
 	if t.Current >= target || t.AcceptStatus == "completed" {
-		credit, energy, err := p.cfg.Upstream.ClaimRewardMP(a, code)
+		credit, energy, err := p.cfg.Upstream.ClaimRewardMPContext(ctx, a, code)
 		if err != nil {
 			return "", err
 		}
@@ -361,7 +392,14 @@ func (p *Panel) runMPMiniChatTask(a *auth.Auth, code string, withActivityId bool
 	// 连发会被上游反作弊判无效（见 mpChatEventGap 注释），宁可慢不可白报。
 	need := target - t.Current
 	for i := int64(0); i < need; i++ {
-		time.Sleep(mpChatEventGap + time.Duration(rand.Int64N(int64(10*time.Second))))
+		delay := mpChatEventGap + time.Duration(rand.Int64N(int64(10*time.Second)))
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
 		conv := fmt.Sprintf("wb2api-mp-%d-%d", time.Now().UnixMilli(), i)
 		var ev map[string]any
 		if withActivityId {
@@ -369,14 +407,20 @@ func (p *Panel) runMPMiniChatTask(a *auth.Auth, code string, withActivityId bool
 		} else {
 			ev = upstream.SchoolChatTimesEvents(conv)
 		}
-		if err := p.cfg.Upstream.ReportMPEvent(a, ev); err != nil {
-			return fmt.Sprintf("完成 %d/%d 次上报后中断: %v", i, need, err), nil
+		if err := p.cfg.Upstream.ReportMPEventContext(ctx, a, ev); err != nil {
+			return fmt.Sprintf("完成 %d/%d 次上报后中断: %v", i, need, err), err
 		}
 	}
 	// 回读（异步计分，有界轮询复用 claimPoll 预算的紧凑版：两轮各隔 3s）。
 	for i := 0; i < 2; i++ {
-		time.Sleep(claimPollGap)
-		t2, err2 := p.taskByCodeMP(a, code)
+		timer := time.NewTimer(claimPollGap)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+		t2, err2 := p.taskByCodeMPContext(ctx, a, code)
 		if err2 != nil || t2 == nil {
 			continue
 		}
@@ -391,7 +435,7 @@ func (p *Panel) runMPMiniChatTask(a *auth.Auth, code string, withActivityId bool
 	if t.Current < target {
 		return fmt.Sprintf("已上报 %d 次但进度未达 %d/%d（异步计分未归账，下次重试）", need, t.Current, target), nil
 	}
-	credit, energy, err := p.cfg.Upstream.ClaimRewardMP(a, code)
+	credit, energy, err := p.cfg.Upstream.ClaimRewardMPContext(ctx, a, code)
 	if err != nil {
 		return "", err
 	}
@@ -401,15 +445,15 @@ func (p *Panel) runMPMiniChatTask(a *auth.Auth, code string, withActivityId bool
 // runSchoolSeason 完成 school_season「校园日」（growth 域小程序限定）。
 // 判据 = mini chat_request_send + activityId=school_open_day_2026（无 activityId
 // 不点亮，与 school 域开学季同活动关联；上游 task_runner e2e 实测 +100c+5e）。
-func runSchoolSeason(p *Panel, a *auth.Auth) (string, error) {
-	return p.runMPMiniChatTask(a, "school_season", true)
+func runSchoolSeason(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
+	return p.runMPMiniChatTask(ctx, a, "school_season", true)
 }
 
 // runSequentialChat 完成 Sequential_Tasks_1「小程序内完成 1 次有效对话」。
 // 判据 = mini chat_request_send（无 activityId，服务端按 source=mini_program
 // 指纹关联；上游 task_runner 实测 +100c+5e）。
-func runSequentialChat(p *Panel, a *auth.Auth) (string, error) {
-	return p.runMPMiniChatTask(a, "Sequential_Tasks_1", false)
+func runSequentialChat(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
+	return p.runMPMiniChatTask(ctx, a, "Sequential_Tasks_1", false)
 }
 
 // runSequentialChat5 完成 Sequential_Tasks_3「在小程序内完成 5 次有效对话」。
@@ -418,23 +462,23 @@ func runSequentialChat(p *Panel, a *auth.Auth) (string, error) {
 // 后被反作弊回滚（claim 400 "task not completed"），由 mpChatEventGap 间隔保证
 // （2026-09-26 实测：45s 间隔补满 5/5 → claim +300c+5e 成功，领后 accept_status
 // =claimed 稳定不回滚）。
-func runSequentialChat5(p *Panel, a *auth.Auth) (string, error) {
-	return p.runMPMiniChatTask(a, "Sequential_Tasks_3", false)
+func runSequentialChat5(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
+	return p.runMPMiniChatTask(ctx, a, "Sequential_Tasks_3", false)
 }
 
 // runSequentialChat10 完成 Sequential_Tasks_6「在小程序内完成 10 次有效对话」（预留）。
 // 判据假定与 Tasks_1/3 同形状（mini chat_request_send），target 由任务自带（回读），
 // runMPMiniChatTask 按差额补报——issue #42 称 target=10，以解锁后实际下发为准。
 // 真人节奏间隔同样适用（mpChatEventGap）：9 条 × ~50s ≈ 8 分钟/账号，夜间队列可接受。
-func runSequentialChat10(p *Panel, a *auth.Auth) (string, error) {
-	return p.runMPMiniChatTask(a, "Sequential_Tasks_6", false)
+func runSequentialChat10(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
+	return p.runMPMiniChatTask(ctx, a, "Sequential_Tasks_6", false)
 }
 
 // runSequentialEventTask Sequential 链预留任务通用骨架：mp 查询 → accept（带验证）
 // → 判据事件上报（primary；未点亮且 fallback 非空时补一轮）→ 回读 → 达标领奖。
 // 每日零点解锁一环：locked 期间 accept 不落账，返回等下次调度（无需人工干预）。
-func (p *Panel) runSequentialEventTask(a *auth.Auth, code string, primary, fallback func() error) (string, error) {
-	t, err := p.taskByCodeMP(a, code)
+func (p *Panel) runSequentialEventTask(ctx context.Context, a *auth.Auth, code string, primary, fallback func() error) (string, error) {
+	t, err := p.taskByCodeMPContext(ctx, a, code)
 	if err != nil {
 		return "", err
 	}
@@ -449,24 +493,30 @@ func (p *Panel) runSequentialEventTask(a *auth.Auth, code string, primary, fallb
 		target = 1
 	}
 	if t.Current >= target || t.AcceptStatus == "completed" {
-		credit, energy, err := p.cfg.Upstream.ClaimRewardMP(a, code)
+		credit, energy, err := p.cfg.Upstream.ClaimRewardMPContext(ctx, a, code)
 		if err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("已领取奖励（+%dc +%de）", credit, energy), nil
 	}
 	if t.AcceptStatus == "not_accepted" || t.AcceptStatus == "" {
-		if !p.acceptWithVerifyMP(a, code) {
+		if !p.acceptWithVerifyMPContext(ctx, a, code) {
 			return "accept 未登记生效（任务可能处于每日锁定窗口，等解锁后自动重试）", nil
 		}
 	}
 	if err := primary(); err != nil {
-		return fmt.Sprintf("判据上报失败: %v", err), nil
+		return fmt.Sprintf("判据上报失败: %v", err), err
 	}
 	// 回读（两轮各隔 3s）；未点亮且有 fallback 时补报一轮再读。
 	for round := 0; round < 2; round++ {
-		time.Sleep(claimPollGap)
-		t2, err2 := p.taskByCodeMP(a, code)
+		timer := time.NewTimer(claimPollGap)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return "", ctx.Err()
+		case <-timer.C:
+		}
+		t2, err2 := p.taskByCodeMPContext(ctx, a, code)
 		if err2 != nil || t2 == nil {
 			continue
 		}
@@ -476,7 +526,7 @@ func (p *Panel) runSequentialEventTask(a *auth.Auth, code string, primary, fallb
 		}
 		if round == 0 && fallback != nil {
 			if err := fallback(); err != nil {
-				return fmt.Sprintf("备选判据上报失败: %v", err), nil
+				return fmt.Sprintf("备选判据上报失败: %v", err), err
 			}
 		}
 	}
@@ -486,7 +536,7 @@ func (p *Panel) runSequentialEventTask(a *auth.Auth, code string, primary, fallb
 	if t.Current < target {
 		return "已上报但进度未点亮（判据形态待解锁后校正，下次重试）", nil
 	}
-	credit, energy, err := p.cfg.Upstream.ClaimRewardMP(a, code)
+	credit, energy, err := p.cfg.Upstream.ClaimRewardMPContext(ctx, a, code)
 	if err != nil {
 		return "", err
 	}
@@ -496,41 +546,41 @@ func (p *Panel) runSequentialEventTask(a *auth.Auth, code string, primary, fallb
 // runSequentialAutomation 完成 Sequential_Tasks_4「创建定时任务」（预留）。
 // mp 源码无 automation 事件发射点 → 判据疑为 PC 口径：复用 automation_1 同源
 // 事件（DesktopAutomationCreateEvent，PC 任务三账号实测点亮）。
-func runSequentialAutomation(p *Panel, a *auth.Auth) (string, error) {
-	return p.runSequentialEventTask(a, "Sequential_Tasks_4",
+func runSequentialAutomation(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
+	return p.runSequentialEventTask(ctx, a, "Sequential_Tasks_4",
 		func() error {
-			return p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopAutomationCreateEvent("wb2api 自动化"))
+			return p.cfg.Upstream.ReportDesktopEventContext(ctx, a, upstream.DesktopAutomationCreateEvent("wb2api 自动化"))
 		}, nil)
 }
 
 // runSequentialModelChat 完成 Sequential_Tasks_5「使用 GLM5.2」（预留）。
 // primary：mp 对话事件带 requestModelId/requestModelName=glm-5.2（mpsrc main 32904
 // 发射点实测形状）；fallback：PC 域模型活跃上报（Model_chat_GLM5.2 同源）。
-func runSequentialModelChat(p *Panel, a *auth.Auth) (string, error) {
-	return p.runSequentialEventTask(a, "Sequential_Tasks_5",
+func runSequentialModelChat(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
+	return p.runSequentialEventTask(ctx, a, "Sequential_Tasks_5",
 		func() error {
 			conv := fmt.Sprintf("wb2api-mp-glm-%d", time.Now().UnixMilli())
-			return p.cfg.Upstream.ReportMPEvent(a, upstream.MiniChatModelEvent(conv, "glm-5.2", "GLM-5.2"))
+			return p.cfg.Upstream.ReportMPEventContext(ctx, a, upstream.MiniChatModelEvent(conv, "glm-5.2", "GLM-5.2"))
 		},
 		func() error {
-			return p.cfg.Upstream.ReportChatActivityModel(a, fmt.Sprintf("wb2api-mp-glm-%d", time.Now().UnixMilli()), "", "glm-5.2", "GLM-5.2")
+			return p.cfg.Upstream.ReportChatActivityModelContext(ctx, a, fmt.Sprintf("wb2api-mp-glm-%d", time.Now().UnixMilli()), "", "glm-5.2", "GLM-5.2")
 		})
 }
 
 // runSequentialPlaybook 完成 Sequential_Tasks_7「体验灵感功能」（预留，疑 PC 口径）。
 // primary：PC 灵感事件组（DesktopPlaybookPromptSequence，playbook_prompt 三账号
 // 实测点亮）；fallback：mp 指纹灵感事件组（MiniPlaybookEvents，mpsrc 形状）。
-func runSequentialPlaybook(p *Panel, a *auth.Auth) (string, error) {
+func runSequentialPlaybook(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
 	ms := time.Now().UnixMilli()
-	return p.runSequentialEventTask(a, "Sequential_Tasks_7",
+	return p.runSequentialEventTask(ctx, a, "Sequential_Tasks_7",
 		func() error {
 			conv := fmt.Sprintf("wb2api-pb-%d", ms)
 			req := fmt.Sprintf("wb2api-pb-req-%d", ms)
-			return p.cfg.Upstream.ReportDesktopEvent(a,
+			return p.cfg.Upstream.ReportDesktopEventContext(ctx, a,
 				upstream.DesktopPlaybookPromptSequence(conv, req, "pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸")...)
 		},
 		func() error {
-			return p.cfg.Upstream.ReportMPEvent(a, upstream.MiniPlaybookEvents("pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸")...)
+			return p.cfg.Upstream.ReportMPEventContext(ctx, a, upstream.MiniPlaybookEvents("pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸")...)
 		})
 }
 
@@ -541,9 +591,9 @@ func runSequentialPlaybook(p *Panel, a *auth.Auth) (string, error) {
 // 专家 id 必须是市场真实 ex_ id（空 id 服务端不入账）→ **accept 之前**先解析市场
 // 列表：拉不到就整任务不动作，避免留下「已登记未上报」的半程态（上游 9a26ae7
 // 的 ids 前置判定同款）。复用既有 MarketExpertList（expert_5 任务同源，实测可用）。
-func runMiniExpert(p *Panel, a *auth.Auth) (string, error) {
+func runMiniExpert(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
 	const code = "Sequential_Tasks_2"
-	t, err := p.taskByCodeMP(a, code)
+	t, err := p.taskByCodeMPContext(ctx, a, code)
 	if err != nil {
 		return "", err
 	}
@@ -559,14 +609,14 @@ func runMiniExpert(p *Panel, a *auth.Auth) (string, error) {
 	}
 	// 已达标（含 completed 未领）：直接领奖。
 	if t.Current >= target || t.AcceptStatus == "completed" {
-		credit, energy, err := p.cfg.Upstream.ClaimRewardMP(a, code)
+		credit, energy, err := p.cfg.Upstream.ClaimRewardMPContext(ctx, a, code)
 		if err != nil {
 			return "", err
 		}
 		return fmt.Sprintf("已领取奖励（+%dc +%de）", credit, energy), nil
 	}
 	// 判据载体前置（accept 之前）：市场真实专家 id。
-	experts, merr := p.cfg.Upstream.MarketExpertList(a, "")
+	experts, merr := p.cfg.Upstream.MarketExpertListContext(ctx, a, "")
 	if merr != nil || len(experts) == 0 {
 		return fmt.Sprintf("专家市场不可用（%v），跳过以防半程态", merr), nil
 	}
@@ -576,18 +626,18 @@ func runMiniExpert(p *Panel, a *auth.Auth) (string, error) {
 		name = e.ProfessionZH
 	}
 	if t.AcceptStatus == "not_accepted" || t.AcceptStatus == "" {
-		if !p.acceptWithVerifyMP(a, code) {
+		if !p.acceptWithVerifyMPContext(ctx, a, code) {
 			return "accept 未登记生效（上游 200+OK 但未落账形态），待下次重试", nil
 		}
 	}
 	ev := upstream.MiniExpertUseEvent(e.ExpertID, name, e.ExpertType)
-	if err := p.cfg.Upstream.ReportMPEvent(a, ev); err != nil {
-		return fmt.Sprintf("上报 expert_actual_use 失败: %v", err), nil
+	if err := p.cfg.Upstream.ReportMPEventContext(ctx, a, ev); err != nil {
+		return fmt.Sprintf("上报 expert_actual_use 失败: %v", err), err
 	}
 	// 回读（异步计分，两轮各隔 3s——与 runMPMiniChatTask 同预算）。
 	for i := 0; i < 2; i++ {
 		time.Sleep(claimPollGap)
-		t2, err2 := p.taskByCodeMP(a, code)
+		t2, err2 := p.taskByCodeMPContext(ctx, a, code)
 		if err2 != nil || t2 == nil {
 			continue
 		}
@@ -602,7 +652,7 @@ func runMiniExpert(p *Panel, a *auth.Auth) (string, error) {
 	if t.Current < target {
 		return "已上报但进度未归账（异步计分，下次重试）", nil
 	}
-	credit, energy, err := p.cfg.Upstream.ClaimRewardMP(a, code)
+	credit, energy, err := p.cfg.Upstream.ClaimRewardMPContext(ctx, a, code)
 	if err != nil {
 		return "", err
 	}
@@ -611,6 +661,7 @@ func runMiniExpert(p *Panel, a *auth.Auth) (string, error) {
 
 // accountTaskAuto 一键完成单个任务：执行对应动作 → 回读进度 → 汇报结果。
 func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	uid := r.PathValue("uid")
 	a := p.accountByUID(w, uid)
 	if a == nil {
@@ -638,7 +689,7 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	defer p.unlockAccount(uid)
 	// 前置读取：已完成的任务直接跳过（幂等，不浪费上游调用）。
 	// taskByCode 已双口径（mp 专属码自动回落 mp 列表）。
-	before, err := p.taskByCode(a, act.TaskCode)
+	before, err := p.taskByCodeContext(ctx, a, act.TaskCode)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
 		return
@@ -652,7 +703,7 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "skipped": true, "message": "该任务已领取过奖励"})
 		return
 	}
-	msg, err := act.run(p, a)
+	msg, err := act.run(r.Context(), p, a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "执行失败: "+err.Error())
 		return
@@ -662,9 +713,9 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	var after *upstream.Task
 	var aerr error
 	if isMP {
-		after, aerr = p.taskByCodeMP(a, act.TaskCode)
+		after, aerr = p.taskByCodeMPContext(ctx, a, act.TaskCode)
 	} else {
-		after, aerr = p.taskByCodeWaiting(a, act.TaskCode)
+		after, aerr = p.taskByCodeWaitingContext(ctx, a, act.TaskCode)
 	}
 	progressBefore, progressAfter := taskProgressText(before), ""
 	claimable := false
@@ -686,9 +737,9 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		var credit, energy int64
 		var cerr error
 		if isMP {
-			credit, energy, cerr = p.cfg.Upstream.ClaimRewardMP(a, act.TaskCode)
+			credit, energy, cerr = p.cfg.Upstream.ClaimRewardMPContext(ctx, a, act.TaskCode)
 		} else {
-			credit, energy, cerr = p.cfg.Upstream.ClaimReward(a, act.TaskCode)
+			credit, energy, cerr = p.cfg.Upstream.ClaimRewardContext(ctx, a, act.TaskCode)
 		}
 		if cerr == nil {
 			resp["claimed"] = true
@@ -739,8 +790,8 @@ func truncateStr(s string, n int) string {
 var reportGap = 1050 * time.Millisecond
 
 // runChat5 补足 chat_5 的进度：按差额上报 chat_request_send。
-func runChat5(p *Panel, a *auth.Auth) (string, error) {
-	t, err := p.taskByCode(a, "chat_5")
+func runChat5(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
+	t, err := p.taskByCodeContext(ctx, a, "chat_5")
 	if err != nil {
 		return "", err
 	}
@@ -757,8 +808,8 @@ func runChat5(p *Panel, a *auth.Auth) (string, error) {
 	}
 	for i := int64(0); i < need; i++ {
 		cid := fmt.Sprintf("wb2api-chat5-%d-%d", time.Now().UnixMilli(), i)
-		if err := p.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
-			return fmt.Sprintf("上报第 %d/%d 条失败: %v", i+1, need, err), nil
+		if err := p.cfg.Upstream.ReportChatActivityContext(ctx, a, cid, ""); err != nil {
+			return fmt.Sprintf("上报第 %d/%d 条失败: %v", i+1, need, err), err
 		}
 		if i < need-1 {
 			time.Sleep(reportGap)
@@ -768,15 +819,15 @@ func runChat5(p *Panel, a *auth.Auth) (string, error) {
 }
 
 // runFirstBuddy 领养：report（解锁前置）→ agreement → first。
-func runFirstBuddy(p *Panel, a *auth.Auth) (string, error) {
-	if err := p.cfg.Upstream.ReportChatActivity(a, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
+func runFirstBuddy(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
+	if err := p.cfg.Upstream.ReportChatActivityContext(ctx, a, fmt.Sprintf("wb2api-adopt-%d", time.Now().UnixMilli()), ""); err != nil {
 		return "", fmt.Errorf("前置上报: %w", err)
 	}
 	time.Sleep(reportGap) // 给上游事件处理留时间（脚本实测口径）
-	if err := p.cfg.Upstream.BuddyAgreement(a); err != nil {
+	if err := p.cfg.Upstream.BuddyAgreementContext(ctx, a); err != nil {
 		return "", fmt.Errorf("同意协议: %w", err)
 	}
-	if err := p.cfg.Upstream.BuddyFirst(a); err != nil {
+	if err := p.cfg.Upstream.BuddyFirstContext(ctx, a); err != nil {
 		if upstream.IsBuddyTaskIncomplete(err) {
 			return "前置已上报，但领养门槛未过（上游要求当日活跃），请稍后重试", nil
 		}
@@ -786,10 +837,10 @@ func runFirstBuddy(p *Panel, a *auth.Auth) (string, error) {
 }
 
 // runModelChat 完成 Model_chat_GLM5.2：accept → 真实对话 → 对齐模型上报。
-func runModelChat(p *Panel, a *auth.Auth) (string, error) {
+func runModelChat(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
 	const code, modelID, modelName = "Model_chat_GLM5.2", "glm-5.2", "GLM-5.2"
 	// 1. accept（报名；失败不阻塞——行为事件才是判据）
-	if err := p.cfg.Upstream.AcceptTasks(a, []string{code}); err != nil {
+	if err := p.cfg.Upstream.AcceptTasksContext(ctx, a, []string{code}); err != nil {
 		log.Printf("panel: accept %s: %v（继续走行为链路）", code, err)
 	}
 	time.Sleep(reportGap)
@@ -801,7 +852,7 @@ func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 		},
 		"stream": true,
 	})
-	rc, status, respBody, err := p.cfg.Upstream.ChatStream(a, body, "", upstream.ChatMeta{})
+	rc, status, respBody, err := p.cfg.Upstream.ChatStreamContext(ctx, a, body, "", upstream.ChatMeta{})
 	if err != nil {
 		return "", fmt.Errorf("对话请求: %w", err)
 	}
@@ -814,7 +865,7 @@ func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 	rc.Close()
 	time.Sleep(reportGap)
 	// 3. 对齐模型的上报（触发进度）
-	if err := p.cfg.Upstream.ReportChatActivityModel(a, fmt.Sprintf("wb2api-glm52-%d", time.Now().UnixMilli()), "", modelID, modelName); err != nil {
+	if err := p.cfg.Upstream.ReportChatActivityModelContext(ctx, a, fmt.Sprintf("wb2api-glm52-%d", time.Now().UnixMilli()), "", modelID, modelName); err != nil {
 		return "对话已完成，但进度上报失败：" + err.Error(), nil
 	}
 	return "已完成 glm-5.2 对话并上报", nil
@@ -826,13 +877,13 @@ func runModelChat(p *Panel, a *auth.Auth) (string, error) {
 // chat_message_response isSuccessful=true 等 6 事件），纯 API 即可点亮并领奖
 // （紫川/人杰2 两账号无桌面客户端登录状态下 3 秒内 0/1 → 1/1）。
 // Hp_Appearance 的纯 API set 不计分（需客户端在主题下活跃），区别对待。
-func runRichMeow(p *Panel, a *auth.Auth) (string, error) {
+func runRichMeow(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
 	ms := time.Now().UnixMilli()
 	conv := fmt.Sprintf("wb2api-rm-%d", ms)
 	req := fmt.Sprintf("wb2api-rm-req-%d", ms)
 	msg := fmt.Sprintf("req-%d-user", ms)
 	events := upstream.DesktopChatSequence(conv, req, msg, "fast-model", "fast-model")
-	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+	if err := p.cfg.Upstream.ReportDesktopEventContext(ctx, a, events...); err != nil {
 		return "", err
 	}
 	return "已按桌面端指纹上报完整对话事件链（agent_task_created→chat_response）", nil
@@ -843,9 +894,9 @@ func runRichMeow(p *Panel, a *auth.Auth) (string, error) {
 // bind_skip）以 workbuddy-desktop 指纹上报即点亮，服务端不校验真实授权。
 // 用企鹅教师助手（Buddy_App_QQ 判据应用）作载体，同一组事件同时满足
 // Buddy_App「进入任一应用」——两个表项共用本 run，幂等由任务状态跳过兜底。
-func runBuddyApp(p *Panel, a *auth.Auth) (string, error) {
+func runBuddyApp(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
 	events := upstream.DesktopBuddyAppSequence("cb_y5Dy46tPQGGWtueMxXbe", "企鹅教师助手")
-	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+	if err := p.cfg.Upstream.ReportDesktopEventContext(ctx, a, events...); err != nil {
 		return "", err
 	}
 	return "已上报 buddyapp 进入五连事件（同时覆盖 Buddy_App 与 Buddy_App_QQ）", nil
@@ -854,8 +905,8 @@ func runBuddyApp(p *Panel, a *auth.Auth) (string, error) {
 // runAutomationCreate 完成 automation_1（设置自动化任务）。
 // 2026-09-12 两账号实测：automated_task_create_suc 事件纯 API 上报即点亮，
 // 无需真实创建定时任务。
-func runAutomationCreate(p *Panel, a *auth.Auth) (string, error) {
-	if err := p.cfg.Upstream.ReportDesktopEvent(a,
+func runAutomationCreate(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
+	if err := p.cfg.Upstream.ReportDesktopEventContext(ctx, a,
 		upstream.DesktopAutomationCreateEvent("wb2api 自动化")); err != nil {
 		return "", err
 	}
@@ -865,9 +916,9 @@ func runAutomationCreate(p *Panel, a *auth.Auth) (string, error) {
 // runLibraryRead 完成 Library_read（体验资料库）。
 // 2026-09-12 三账号实测：web 域 /v2/report 上报 web_element_click
 // (elementId=library_doc_intro_click) 即点亮（space 的 open/WS/inlong 都不是判据）。
-func runLibraryRead(p *Panel, a *auth.Auth) (string, error) {
+func runLibraryRead(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
 	const docURL = "https://www.workbuddy.cn/space/d/o0KWYeynteVv06UnAZqIFm"
-	if err := p.cfg.Upstream.ReportWebEvent(a, "web_element_click", docURL,
+	if err := p.cfg.Upstream.ReportWebEventContext(ctx, a, "web_element_click", docURL,
 		"library_doc_intro_click", "WorkBuddy资料库介绍"); err != nil {
 		return "", err
 	}
@@ -877,20 +928,20 @@ func runLibraryRead(p *Panel, a *auth.Auth) (string, error) {
 // runBlackCat 完成 black_cat（夜猫子，夜间 23:00–08:00 计数）。
 // 判据 = 夜间窗口内 glm-5.2 真实对话 + chat 事件上报（WorkBuddy-Daily 实测口径）。
 // 窗口外不做（提示等排程）；网关 blackcat_hours（默认 23 点）排程会自动补足。
-func runBlackCat(p *Panel, a *auth.Auth) (string, error) {
+func runBlackCat(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
 	if !upstream.InNightWindow(time.Now()) {
 		return "当前不在 23:00–08:00 计数窗口，行为不计分；网关会在每日 23 点自动补足", nil
 	}
-	need, err := p.cfg.Upstream.BlackcatNeed(a)
+	need, err := p.cfg.Upstream.BlackcatNeedContext(ctx, a)
 	if err != nil {
 		return "", err
 	}
 	if need <= 0 {
 		return "进度已达标，无需补足", nil
 	}
-	ok, err := p.cfg.Upstream.RunNightChats(a, int(need))
+	ok, err := p.cfg.Upstream.RunNightChatsContext(ctx, a, int(need))
 	if err != nil {
-		return fmt.Sprintf("完成 %d/%d 次后中断: %v", ok, need, err), nil
+		return fmt.Sprintf("完成 %d/%d 次后中断: %v", ok, need, err), err
 	}
 	return fmt.Sprintf("已完成 %d 次夜间对话并上报", ok), nil
 }
@@ -901,8 +952,8 @@ func runBlackCat(p *Panel, a *auth.Auth) (string, error) {
 // source:"workbuddy-desktop"} JOIN 真实会话（conversationId/requestId=服务端
 // id）。此前的 skill_request_send/skill_installed/skill_action 全是错误方向。
 // 人杰2 实测 0/1 → 1/1 点亮。
-func runSkillFresh(p *Panel, a *auth.Auth) (string, error) {
-	conv, req, err := p.cfg.Upstream.DesktopChatWithExpert(a, "")
+func runSkillFresh(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
+	conv, req, err := p.cfg.Upstream.DesktopChatWithExpertContext(ctx, a, "")
 	if err != nil {
 		return "", fmt.Errorf("真实对话: %w", err)
 	}
@@ -925,7 +976,7 @@ func runSkillFresh(p *Panel, a *auth.Auth) (string, error) {
 		"requestModelId": "fast-model", "requestModelName": "fast-model",
 		"traceId": req,
 	})
-	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+	if err := p.cfg.Upstream.ReportDesktopEventContext(ctx, a, events...); err != nil {
 		return "", fmt.Errorf("skill_info 事件: %w", err)
 	}
 	return "已上报真实对话 + skill_info 技能加载事件", nil
@@ -936,14 +987,14 @@ func runSkillFresh(p *Panel, a *auth.Auth) (string, error) {
 // chat 链的 agent_task_created 需带 has_expert:true + expert_id（我们默认 false），
 // expert_actual_use 的 mode 为 "LOCAL"（非 craft）。id 固定为轻量云专家
 // ex_2cvvUZQhDyeJ；requestId 必须是真实 chat 的服务端 id。紫川/人杰2 实测点亮。
-func runExpertLighthouse(p *Panel, a *auth.Auth) (string, error) {
+func runExpertLighthouse(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
 	const lhID = "ex_2cvvUZQhDyeJ"
 	lh := upstream.MarketExpert{
 		ExpertID: lhID, ExpertType: "agent",
 		DisplayNameZH: "腾讯轻量云专家", ProfessionZH: "腾讯轻量云专家", Version: "1.0.2",
 	}
 	// 市场列表若命中真实条目则用其信息（version 等以服务端为准）。
-	if experts, err := p.cfg.Upstream.MarketExpertList(a, "agent"); err == nil {
+	if experts, err := p.cfg.Upstream.MarketExpertListContext(ctx, a, "agent"); err == nil {
 		for _, e := range experts {
 			if e.ExpertID == lhID {
 				lh = e
@@ -951,10 +1002,10 @@ func runExpertLighthouse(p *Panel, a *auth.Auth) (string, error) {
 			}
 		}
 	}
-	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopExpertSummonSequence(lh)...); err != nil {
+	if err := p.cfg.Upstream.ReportDesktopEventContext(ctx, a, upstream.DesktopExpertSummonSequence(lh)...); err != nil {
 		return "", fmt.Errorf("召唤链: %w", err)
 	}
-	conv, req, err := p.cfg.Upstream.DesktopChatWithExpert(a, lhID)
+	conv, req, err := p.cfg.Upstream.DesktopChatWithExpertContext(ctx, a, lhID)
 	if err != nil {
 		return "", fmt.Errorf("真实对话: %w", err)
 	}
@@ -971,7 +1022,7 @@ func runExpertLighthouse(p *Panel, a *auth.Auth) (string, error) {
 	// 对齐真实样本细节：轻量云专家 actual_use 的 type 为空、cost=0。
 	events[len(events)-1]["type"] = ""
 	events[len(events)-1]["cost"] = 0
-	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+	if err := p.cfg.Upstream.ReportDesktopEventContext(ctx, a, events...); err != nil {
 		return "", fmt.Errorf("使用事件: %w", err)
 	}
 	return "已上报轻量云专家召唤+使用链（真实对话 requestId）", nil
@@ -982,13 +1033,13 @@ func runExpertLighthouse(p *Panel, a *auth.Auth) (string, error) {
 // 事件 {action:"apply",source:"settings_close",id:<resourceKey>,...}（客户端在
 // 主题生效状态下离开设置页时上报）——早期"纯 API set 不计分"的结论不准确，
 // 真相是当时只调了 appearance/set 没发事件。组合：set API 留痕 + 事件上报。
-func runAppearance(p *Panel, a *auth.Auth) (string, error) {
+func runAppearance(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
 	const themeKey = "theme-tkmw7j" // 和平精英激战金秋（Hp_Appearance 判据主题）
-	if err := p.cfg.Upstream.SetAppearanceTheme(a, themeKey); err != nil {
+	if err := p.cfg.Upstream.SetAppearanceThemeContext(ctx, a, themeKey); err != nil {
 		return "", fmt.Errorf("设置主题: %w", err)
 	}
 	time.Sleep(2 * time.Second)
-	if err := p.cfg.Upstream.ReportDesktopEvent(a, upstream.DesktopEvent{
+	if err := p.cfg.Upstream.ReportDesktopEventContext(ctx, a, upstream.DesktopEvent{
 		"eventCode": "appearance_skin_apply", "action": "apply", "source": "settings_close",
 		"id": themeKey, "vipLevel": 0, "series": "", "type": "unknown",
 	}); err != nil {
@@ -1000,15 +1051,15 @@ func runAppearance(p *Panel, a *auth.Auth) (string, error) {
 // runTemplateUse 完成 template_5（使用 5 个模板创建任务）。
 // 2026-09-12 三账号实测：agent_task_created_with_template + template_used 事件组
 // （JOIN chat 链）一次上报 5 组即 5/5 点亮。template_id 服务端不校验真实性。
-func runTemplateUse(p *Panel, a *auth.Auth) (string, error) {
+func runTemplateUse(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
 	templates := [][2]string{{"1", "深度研究"}, {"2", "周报生成"}, {"3", "竞品分析"}, {"4", "活动策划"}, {"5", "代码评审"}}
 	for i, tp := range templates {
 		ms := time.Now().UnixMilli()
 		conv := fmt.Sprintf("wb2api-tpl-%d-%d", ms, i)
 		req := fmt.Sprintf("wb2api-tpl-req-%d-%d", ms, i)
 		events := upstream.DesktopTemplateUseSequence(conv, req, tp[0], tp[1])
-		if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
-			return fmt.Sprintf("第 %d 组模板事件上报失败: %v", i+1, err), nil
+		if err := p.cfg.Upstream.ReportDesktopEventContext(ctx, a, events...); err != nil {
+			return fmt.Sprintf("第 %d 组模板事件上报失败: %v", i+1, err), err
 		}
 		time.Sleep(300 * time.Millisecond)
 	}
@@ -1017,12 +1068,12 @@ func runTemplateUse(p *Panel, a *auth.Auth) (string, error) {
 
 // runPlaybookPrompt 完成 playbook_prompt（灵感案例 Dialog 中发送 Prompt）。
 // 判据是 playbook_prompt_send（Dialog 发送）而非卡片曝光/点击——asar 逆向确认。
-func runPlaybookPrompt(p *Panel, a *auth.Auth) (string, error) {
+func runPlaybookPrompt(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
 	ms := time.Now().UnixMilli()
 	conv := fmt.Sprintf("wb2api-pb-%d", ms)
 	req := fmt.Sprintf("wb2api-pb-req-%d", ms)
 	events := upstream.DesktopPlaybookPromptSequence(conv, req, "pm-gtm-launch-plan", "新产品上市 GTM 发布计划一页纸")
-	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+	if err := p.cfg.Upstream.ReportDesktopEventContext(ctx, a, events...); err != nil {
 		return "", err
 	}
 	return "已上报 playbook_cta_click + playbook_prompt_send", nil
@@ -1030,12 +1081,12 @@ func runPlaybookPrompt(p *Panel, a *auth.Auth) (string, error) {
 
 // runCreateCanvas 完成 create_canvas（设计创意模式创建画布，+300 分）。
 // 判据是 wbx_design_canvas_task_create/open（Ardot create_design 工具完成遥测）。
-func runCreateCanvas(p *Panel, a *auth.Auth) (string, error) {
+func runCreateCanvas(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
 	ms := time.Now().UnixMilli()
 	conv := fmt.Sprintf("wb2api-canvas-%d", ms)
 	req := fmt.Sprintf("wb2api-canvas-req-%d", ms)
 	events := upstream.DesktopDesignCanvasSequence(conv, req)
-	if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+	if err := p.cfg.Upstream.ReportDesktopEventContext(ctx, a, events...); err != nil {
 		return "", err
 	}
 	return "已上报 wbx_design_canvas_task_create/open", nil
@@ -1048,18 +1099,18 @@ const expertSummonGap = 6 * time.Second
 // 2026-09-12 三账号实测公式：真实专家列表（id 必须真实存在）→ 召唤链
 // （summon_click/summoned）→ 真实 chat 拿服务端 requestId → expert_actual_use。
 // 自造专家 id 或自造 requestId 均不计数。
-func runExpertUse(p *Panel, a *auth.Auth) (string, error) {
-	return runExpertBatch(p, a, "agent", 5)
+func runExpertUse(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
+	return runExpertBatch(ctx, p, a, "agent", 5)
 }
 
 // runExpertTeamUse 完成 Expert_team_use_3（使用 3 个专家团，expertType=team）。
-func runExpertTeamUse(p *Panel, a *auth.Auth) (string, error) {
-	return runExpertBatch(p, a, "team", 3)
+func runExpertTeamUse(ctx context.Context, p *Panel, a *auth.Auth) (string, error) {
+	return runExpertBatch(ctx, p, a, "team", 3)
 }
 
 // runExpertBatch 专家召唤+使用的公共实现。失败逐个继续，返回汇总信息。
-func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (string, error) {
-	experts, err := p.cfg.Upstream.MarketExpertList(a, expertType)
+func runExpertBatch(ctx context.Context, p *Panel, a *auth.Auth, expertType string, count int) (string, error) {
+	experts, err := p.cfg.Upstream.MarketExpertListContext(ctx, a, expertType)
 	if err != nil {
 		return "", fmt.Errorf("拉取专家列表: %w", err)
 	}
@@ -1073,12 +1124,12 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 		}
 		// 召唤链（web_element_click + summon_click + summoned）。
 		summonEvents := upstream.DesktopExpertSummonSequence(e)
-		if err := p.cfg.Upstream.ReportDesktopEvent(a, summonEvents...); err != nil {
+		if err := p.cfg.Upstream.ReportDesktopEventContext(ctx, a, summonEvents...); err != nil {
 			fail++
 			continue
 		}
 		// 真实 chat（带 X-Expert-Id）→ 服务端 requestId。
-		conv, req, cerr := p.cfg.Upstream.DesktopChatWithExpert(a, e.ExpertID)
+		conv, req, cerr := p.cfg.Upstream.DesktopChatWithExpertContext(ctx, a, e.ExpertID)
 		if cerr != nil {
 			fail++
 			continue
@@ -1086,7 +1137,7 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 		// 使用事件（JOIN 服务端 requestId）+ chat 链。
 		events := append(upstream.DesktopChatSequence(conv, req, "msg-"+req[len(req)-8:], "fast-model", "fast-model"),
 			upstream.DesktopExpertActualUseEvent(e, conv, req))
-		if err := p.cfg.Upstream.ReportDesktopEvent(a, events...); err != nil {
+		if err := p.cfg.Upstream.ReportDesktopEventContext(ctx, a, events...); err != nil {
 			fail++
 			continue
 		}
@@ -1108,11 +1159,11 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 //
 // 流程：先把所有未接受的任务批量 accept（规范状态机；上游脚本建议"先 accept"），
 // 再逐项执行行为链路。accept 不是进度产生的必要条件，但让后续状态流转规范。
-func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
+func (p *Panel) runAutoAll(ctx context.Context, a *auth.Auth) []map[string]any {
 	var out []map[string]any
 
 	// 阶段 0：批量接受尚未接受的任务（失败不阻塞——行为事件才是进度唯一判据）。
-	if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {
+	if tasks, err := p.cfg.Upstream.ListTasksContext(ctx, a); err == nil {
 		var codes []string
 		for _, t := range tasks {
 			if !t.Claimed && !t.Locked && t.AcceptStatus != "accepted" && t.AcceptStatus != "completed" {
@@ -1120,7 +1171,7 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 			}
 		}
 		if len(codes) > 0 {
-			if err := p.cfg.Upstream.AcceptTasks(a, codes); err != nil {
+			if err := p.cfg.Upstream.AcceptTasksContext(ctx, a, codes); err != nil {
 				out = append(out, map[string]any{
 					"task_code": "(批量接受)", "status": "error",
 					"message": "接受任务失败（不阻塞后续）: " + err.Error(),
@@ -1136,7 +1187,7 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 	}
 
 	// 阶段 0b：小程序口径任务单独接受（默认列表不含 mp 码；失败不阻塞）。
-	if mpTasks, err := p.cfg.Upstream.ListTasksMP(a); err == nil {
+	if mpTasks, err := p.cfg.Upstream.ListTasksMPContext(ctx, a); err == nil {
 		var mpCodes []string
 		for _, t := range mpTasks {
 			if !t.Claimed && !t.Locked && t.AcceptStatus != "accepted" && t.AcceptStatus != "completed" {
@@ -1144,7 +1195,7 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 			}
 		}
 		if len(mpCodes) > 0 {
-			if err := p.cfg.Upstream.AcceptTasksMP(a, mpCodes); err != nil {
+			if err := p.cfg.Upstream.AcceptTasksMPContext(ctx, a, mpCodes); err != nil {
 				out = append(out, map[string]any{
 					"task_code": "(批量接受-mp)", "status": "error",
 					"message": "接受小程序任务失败（不阻塞后续）: " + err.Error(),
@@ -1161,7 +1212,7 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 
 	for _, act := range autoActions {
 		item := map[string]any{"task_code": act.TaskCode, "desc": act.Desc}
-		before, err := p.taskByCode(a, act.TaskCode)
+		before, err := p.taskByCodeContext(ctx, a, act.TaskCode)
 		if err != nil {
 			item["status"] = "error"
 			item["message"] = "查询失败: " + err.Error()
@@ -1180,18 +1231,21 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 			out = append(out, item)
 			continue
 		}
-		msg, err := act.run(p, a)
-		if err != nil {
-			item["status"] = "error"
-			item["message"] = err.Error()
-			out = append(out, item)
-			continue
-		}
+		msg, err := act.run(ctx, p, a)
 		var after *upstream.Task
 		if isMPTaskCode(act.TaskCode) {
-			after, _ = p.taskByCodeMP(a, act.TaskCode)
+			after, _ = p.taskByCodeMPContext(ctx, a, act.TaskCode)
 		} else {
-			after, _ = p.taskByCodeWaiting(a, act.TaskCode)
+			after, _ = p.taskByCodeWaitingContext(ctx, a, act.TaskCode)
+		}
+		if err != nil {
+			item["status"] = "error"
+			item["message"] = taskFailureMessage(msg, err)
+			if after != nil {
+				item["progress_after"] = taskProgressText(after)
+			}
+			out = append(out, item)
+			continue
 		}
 		item["status"] = "done"
 		item["message"] = msg
@@ -1203,9 +1257,9 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 			var credit, energy int64
 			var cerr error
 			if isMPTaskCode(act.TaskCode) {
-				credit, energy, cerr = p.cfg.Upstream.ClaimRewardMP(a, act.TaskCode)
+				credit, energy, cerr = p.cfg.Upstream.ClaimRewardMPContext(ctx, a, act.TaskCode)
 			} else {
-				credit, energy, cerr = p.cfg.Upstream.ClaimReward(a, act.TaskCode)
+				credit, energy, cerr = p.cfg.Upstream.ClaimRewardContext(ctx, a, act.TaskCode)
 			}
 			if cerr == nil {
 				item["claimed"] = true
@@ -1227,6 +1281,16 @@ func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 	return out
 }
 
+func taskFailureMessage(message string, err error) string {
+	if message != "" {
+		return message
+	}
+	if err == nil {
+		return "任务失败"
+	}
+	return err.Error()
+}
+
 // accountTaskAutoAll 一键完成该账号全部可自动任务。
 func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	uid := r.PathValue("uid")
@@ -1245,7 +1309,7 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	done := make(chan []map[string]any, 1)
 	go func() {
 		defer p.unlockAccount(uid) // 流水线真正结束（而非 HTTP 超时返回）才放锁
-		done <- p.runAutoAll(a)
+		done <- p.runAutoAll(ctx, a)
 	}()
 	select {
 	case results := <-done:

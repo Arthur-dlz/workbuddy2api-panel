@@ -7,6 +7,7 @@
 package upstream
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -62,7 +63,11 @@ type StreakFull struct {
 
 // GrowthStreakFull 拉取连登完整状态。
 func (c *Client) GrowthStreakFull(a *auth.Auth) (*StreakFull, error) {
-	data, err := c.growthJSON(a, http.MethodGet, streakPath, nil)
+	return c.GrowthStreakFullContext(context.Background(), a)
+}
+
+func (c *Client) GrowthStreakFullContext(ctx context.Context, a *auth.Auth) (*StreakFull, error) {
+	data, err := c.growthJSONContext(ctx, a, http.MethodGet, streakPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -76,14 +81,22 @@ func (c *Client) GrowthStreakFull(a *auth.Auth) (*StreakFull, error) {
 // GrowthRedeemTier 兑换连登档位（tier: "7d"|"14d"|"28d"）。
 // 未解锁返回 *Error（HTTP 403「连续登录天数不足」），调用方按 locked 状态跳过即可。
 func (c *Client) GrowthRedeemTier(a *auth.Auth, tier string) error {
-	_, err := c.growthJSON(a, http.MethodPost, streakRedeemPath,
+	return c.GrowthRedeemTierContext(context.Background(), a, tier)
+}
+
+func (c *Client) GrowthRedeemTierContext(ctx context.Context, a *auth.Auth, tier string) error {
+	_, err := c.growthJSONContext(ctx, a, http.MethodPost, streakRedeemPath,
 		map[string]any{"tier": tier, "client_token": clientToken()})
 	return err
 }
 
 // LotteryChances 当前抽奖次数（GET /activity/growth/lottery/summary）。
 func (c *Client) LotteryChances(a *auth.Auth) (int, error) {
-	data, err := c.growthJSON(a, http.MethodGet, lotterySummaryPath, nil)
+	return c.LotteryChancesContext(context.Background(), a)
+}
+
+func (c *Client) LotteryChancesContext(ctx context.Context, a *auth.Auth) (int, error) {
+	data, err := c.growthJSONContext(ctx, a, http.MethodGet, lotterySummaryPath, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -101,6 +114,10 @@ func (c *Client) LotteryChances(a *auth.Auth) (int, error) {
 
 // LotteryDraw 抽奖一次，返回原始奖品载荷（prize 字段形状由活动期决定，透传给调用方）。
 func (c *Client) LotteryDraw(a *auth.Auth) (json.RawMessage, error) {
-	return c.growthJSON(a, http.MethodPost, lotteryDrawPath,
+	return c.LotteryDrawContext(context.Background(), a)
+}
+
+func (c *Client) LotteryDrawContext(ctx context.Context, a *auth.Auth) (json.RawMessage, error) {
+	return c.growthJSONContext(ctx, a, http.MethodPost, lotteryDrawPath,
 		map[string]any{"client_token": clientToken()})
 }

@@ -31,6 +31,11 @@ func balanceHumanDelay() time.Duration {
 // RunBalanceRefreshNow 手动刷新全量账号余额（SingleFlight / CAS Lock 并发保护）。
 // 若正在执行则拒绝重复并发；账号间强制注入 800ms~1200ms 拟人间隔。
 func (s *Scheduler) RunBalanceRefreshNow() {
+	s.RunBalanceRefreshContext(context.Background())
+}
+
+// RunBalanceRefreshContext refreshes balances while honoring ctx cancellation.
+func (s *Scheduler) RunBalanceRefreshContext(ctx context.Context) {
 	if !s.balanceRefreshing.CompareAndSwap(false, true) {
 		log.Printf("[balance-pi] 手动刷新正在执行中，跳过重复并发")
 		return
@@ -40,6 +45,9 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 	expiringSoon := s.ExpiringSoonWindow()
 	first := true
 	for _, st := range s.cfg.Pool.List() {
+		if ctx.Err() != nil {
+			return
+		}
 		if st.Disabled {
 			continue
 		}
@@ -50,12 +58,14 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		if !first {
 			d := balanceHumanDelay()
 			if d > 0 {
-				time.Sleep(d)
+				if !sleepCtx(ctx, d) {
+					return
+				}
 			}
 		}
 		first = false
 
-		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
+		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiryContext(ctx, a, expiringSoon)
 		nick := a.NicknameValue()
 		if err != nil {
 			log.Printf("[balance-pi] %s: 手动刷新失败: %v", logfmt.Label(st.UID, nick), err)
@@ -77,7 +87,8 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 		s.balanceInterval.Store(int64(interval))
 	}
 
-	go s.runBalanceRefreshSupervisor(ctx)
+	s.workers.Add(1)
+	go func() { defer s.workers.Done(); s.runBalanceRefreshSupervisor(ctx) }()
 }
 
 // SetBalanceInterval 热改余额刷新间隔；<=0 表示暂停循环（面板关闭该开关时）。
@@ -139,7 +150,8 @@ func (s *Scheduler) ensureBalanceWorker(ctx context.Context, uid string) {
 	wakeCh := make(chan struct{}, 1)
 	s.balanceWorkers[uid] = wakeCh
 
-	go s.runSingleAccountBalanceWorker(ctx, uid, wakeCh)
+	s.workers.Add(1)
+	go func() { defer s.workers.Done(); s.runSingleAccountBalanceWorker(ctx, uid, wakeCh) }()
 }
 
 func (s *Scheduler) removeBalanceWorker(uid string) {
@@ -218,7 +230,10 @@ func (s *Scheduler) runSingleAccountBalanceWorker(ctx context.Context, uid strin
 
 		// 3. 执行查询与更新
 		expiringSoon := s.ExpiringSoonWindow()
-		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(acct, expiringSoon)
+		if ctx.Err() != nil {
+			return
+		}
+		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiryContext(ctx, acct, expiringSoon)
 
 		// 4. 计算下一次执行间隔
 		nextDelay := pi.NextDelay()

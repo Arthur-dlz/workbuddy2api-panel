@@ -5,6 +5,7 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -28,19 +29,23 @@ func (p *Panel) accountByUID(w http.ResponseWriter, uid string) *auth.Auth {
 
 // accountTasks 查询单账号全量任务（进度/状态/可领取）。
 func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	uid := r.PathValue("uid")
 	a := p.accountByUID(w, uid)
 	if a == nil {
 		return
 	}
-	tasks, err := p.cfg.Upstream.ListTasks(a)
+	tasks, err := p.cfg.Upstream.ListTasksContext(ctx, a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
 		return
 	}
 	// 合并小程序口径任务（school_season / Sequential_Tasks_1 等仅在 mp 头列表下发）。
 	// mp 列表是默认口径的超集（实测含常规任务），按 task_code 去重；失败静默。
-	if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
+	if ctx.Err() != nil {
+		return
+	}
+	if mpTasks, mpErr := p.cfg.Upstream.ListTasksMPContext(ctx, a); mpErr == nil {
 		seen := map[string]bool{}
 		for _, t := range tasks {
 			seen[t.TaskCode] = true
@@ -57,6 +62,7 @@ func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 
 // accountTaskAccept 接受任务（报名；幂等）。
 func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	uid := r.PathValue("uid")
 	a := p.accountByUID(w, uid)
 	if a == nil {
@@ -69,7 +75,7 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "task_codes required")
 		return
 	}
-	if err := p.cfg.Upstream.AcceptTasks(a, body.TaskCodes); err != nil {
+	if err := p.cfg.Upstream.AcceptTasksContext(ctx, a, body.TaskCodes); err != nil {
 		writeErr(w, http.StatusBadGateway, "accept: "+err.Error())
 		return
 	}
@@ -84,12 +90,13 @@ func (p *Panel) accountTaskAccept(w http.ResponseWriter, r *http.Request) {
 // 上游 scripts 的注释同样建议"先 accept"。
 // 批量提交会分片（上游对 task_codes 数组长度无公开上限，保守每批 20 个）。
 func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	uid := r.PathValue("uid")
 	a := p.accountByUID(w, uid)
 	if a == nil {
 		return
 	}
-	tasks, err := p.cfg.Upstream.ListTasks(a)
+	tasks, err := p.cfg.Upstream.ListTasksContext(ctx, a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())
 		return
@@ -110,20 +117,31 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 	accepted := 0
 	var failed []string
 	for i := 0; i < len(codes); i += batch {
+		if ctx.Err() != nil {
+			return
+		}
 		end := i + batch
 		if end > len(codes) {
 			end = len(codes)
 		}
-		if err := p.cfg.Upstream.AcceptTasks(a, codes[i:end]); err != nil {
+		if err := p.cfg.Upstream.AcceptTasksContext(ctx, a, codes[i:end]); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
 			log.Printf("panel: 批量接受失败 uid=%s codes=%v err=%v", uid, codes[i:end], err)
 			failed = append(failed, codes[i:end]...)
 			continue
 		}
 		accepted += end - i
-		time.Sleep(acceptBatchGap) // 批间节流（对齐脚本 1.05s 口径）
+		if !requestSleep(ctx, acceptBatchGap) {
+			return
+		}
 	}
 	// 小程序口径任务单独批量接受（默认列表不含 mp 码，accept 也要求 mp 头）。
-	if mpTasks, mpErr := p.cfg.Upstream.ListTasksMP(a); mpErr == nil {
+	if ctx.Err() != nil {
+		return
+	}
+	if mpTasks, mpErr := p.cfg.Upstream.ListTasksMPContext(ctx, a); mpErr == nil {
 		var mpCodes []string
 		for _, t := range mpTasks {
 			if t.Claimed || t.Locked || t.AcceptStatus == "accepted" || t.AcceptStatus == "completed" {
@@ -132,12 +150,17 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 			mpCodes = append(mpCodes, t.TaskCode)
 		}
 		if len(mpCodes) > 0 {
-			if err := p.cfg.Upstream.AcceptTasksMP(a, mpCodes); err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			if err := p.cfg.Upstream.AcceptTasksMPContext(ctx, a, mpCodes); err != nil {
 				log.Printf("panel: mp 批量接受失败 uid=%s err=%v", uid, err)
 				failed = append(failed, mpCodes...)
 			} else {
 				accepted += len(mpCodes)
-				time.Sleep(acceptBatchGap)
+				if !requestSleep(ctx, acceptBatchGap) {
+					return
+				}
 			}
 		}
 	}
@@ -151,6 +174,7 @@ func (p *Panel) taskAcceptAll(w http.ResponseWriter, r *http.Request) {
 
 // accountTaskClaim 领取任务奖励（未达标时上游返回业务错误，原样透出给前端提示）。
 func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
 	uid := r.PathValue("uid")
 	a := p.accountByUID(w, uid)
 	if a == nil {
@@ -166,10 +190,13 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 	// 小程序口径任务走 chat 域 mp 头领奖（缺头实测不可领）；其余 Web 端接口。
 	var credit, energy int64
 	var err error
+	if ctx.Err() != nil {
+		return
+	}
 	if isMPTaskCode(body.TaskCode) {
-		credit, energy, err = p.cfg.Upstream.ClaimRewardMP(a, body.TaskCode)
+		credit, energy, err = p.cfg.Upstream.ClaimRewardMPContext(ctx, a, body.TaskCode)
 	} else {
-		credit, energy, err = p.cfg.Upstream.ClaimReward(a, body.TaskCode)
+		credit, energy, err = p.cfg.Upstream.ClaimRewardContext(ctx, a, body.TaskCode)
 	}
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "claim: "+err.Error())
@@ -182,4 +209,18 @@ func (p *Panel) accountTaskClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	log.Printf("panel: 领取任务奖励 uid=%s code=%s +%d分 +%d能", uid, body.TaskCode, credit, energy)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "credit": credit, "energy": energy})
+}
+
+func requestSleep(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }

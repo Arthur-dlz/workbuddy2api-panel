@@ -55,11 +55,15 @@ type Config struct {
 	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
 	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
 	GrowthHook func()
+	// GrowthContextHook receives the scheduler lifetime context so queue startup
+	// and outbound task requests stop with the scheduler.
+	GrowthContextHook func(context.Context)
 }
 
 // Scheduler 调度器。
 type Scheduler struct {
-	cfg Config
+	cfg     Config
+	workers sync.WaitGroup // scheduler and balance workers; waited before pool/store shutdown
 
 	// mu/adoptTried 领养当日失败记录：uid → 自然日（CST）。门槛未达的账号当日不再重试，
 	// 避免同日多趟对上游重试轰炸；进程重启即清零（无需持久化）。
@@ -143,6 +147,13 @@ func (s *Scheduler) SetExpiringSoonWindow(d time.Duration) {
 func (s *Scheduler) SetGrowthHook(fn func()) {
 	s.schedMu.Lock()
 	s.cfg.GrowthHook = fn
+	s.schedMu.Unlock()
+}
+
+// SetGrowthContextHook installs a context-aware growth queue hook.
+func (s *Scheduler) SetGrowthContextHook(fn func(context.Context)) {
+	s.schedMu.Lock()
+	s.cfg.GrowthContextHook = fn
 	s.schedMu.Unlock()
 }
 
@@ -302,9 +313,9 @@ const wallclockCheckStep = time.Minute
 type slotWake int
 
 const (
-	slotFired slotWake = iota // 墙钟已到达计划时点：补跑本批
-	slotRearm                 // 排程已变（Reconfigure）：上层重算下一次唤醒
-	slotCancel                // ctx 取消：上层优雅退出
+	slotFired  slotWake = iota // 墙钟已到达计划时点：补跑本批
+	slotRearm                  // 排程已变（Reconfigure）：上层重算下一次唤醒
+	slotCancel                 // ctx 取消：上层优雅退出
 )
 
 // waitSlot 分段等待到 next 的**墙钟**时刻（next 由 nextFire 用 time.Date 构造、
@@ -347,6 +358,8 @@ func (s *Scheduler) waitSlot(ctx context.Context, next time.Time, step time.Dura
 // Run 主循环，阻塞直到 ctx 取消。
 // Reconfigure 触发 rearmSchedule 时提前唤醒重算（新时点/开关立即生效）。
 func (s *Scheduler) Run(ctx context.Context) {
+	s.workers.Add(1)
+	defer s.workers.Done()
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
@@ -390,21 +403,24 @@ func (s *Scheduler) runBatch(ctx context.Context, kinds []taskKind) {
 			defer wg.Done()
 			switch k {
 			case taskCheckin:
-				s.RunCheckinNow()
+				s.RunCheckinContext(ctx)
 			case taskTravel:
-				s.RunTravelNow()
+				s.RunTravelContext(ctx)
 			case taskActivity:
 				s.runActivity(ctx)
 			case taskKeepalive:
-				s.RunKeepaliveNow()
+				s.RunKeepaliveContext(ctx)
 			case taskBlackcat:
-				s.RunBlackcatNow()
+				s.RunBlackcatContext(ctx)
 			case taskGrowth:
 				// 成长任务队列：回调在 panel 侧异步启动（返回不等执行完），nil 未挂载则跳过。
 				s.schedMu.Lock()
 				hook := s.cfg.GrowthHook
+				ctxHook := s.cfg.GrowthContextHook
 				s.schedMu.Unlock()
-				if hook != nil {
+				if ctxHook != nil {
+					ctxHook(ctx)
+				} else if hook != nil {
 					hook()
 				}
 			}
@@ -435,8 +451,31 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
+	s.RunCheckinContext(context.Background())
+}
+
+// Wait joins the scheduler and all balance workers after their lifetime context is canceled.
+func (s *Scheduler) Wait() { s.workers.Wait() }
+
+// WaitContext joins scheduled workers until ctx expires.
+func (s *Scheduler) WaitContext(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() { s.workers.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// RunCheckinContext performs check-in work bounded by ctx.
+func (s *Scheduler) RunCheckinContext(ctx context.Context) {
 	expiringSoon := s.ExpiringSoonWindow()
 	for _, st := range s.cfg.Pool.List() {
+		if ctx.Err() != nil {
+			return
+		}
 		if st.Disabled {
 			continue
 		}
@@ -450,7 +489,7 @@ func (s *Scheduler) RunCheckinNow() {
 		if a.IsGlobal() {
 			continue
 		}
-		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+		if err := s.cfg.Upstream.DailyCheckinContext(ctx, a); err != nil {
 			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 			if upstream.IsAlreadyCheckin(err) {
 				log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(st.UID, st.Nickname))
@@ -463,7 +502,7 @@ func (s *Scheduler) RunCheckinNow() {
 			s.cfg.Pool.NoteCheckinDone(st.UID)
 		}
 		// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
-		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
+		remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiryContext(ctx, a, expiringSoon)
 		if err != nil {
 			log.Printf("user-resource %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			continue
@@ -471,7 +510,7 @@ func (s *Scheduler) RunCheckinNow() {
 		s.cfg.Pool.ReenableIfCredits(st.UID, remain, total)
 		s.cfg.Pool.SetCreditsDetailed(st.UID, remain, total, expiring, earliestAt, earliestRemaining)
 	}
-	s.RunStreakBonusNow()
+	s.RunStreakBonusContext(ctx)
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
@@ -484,6 +523,9 @@ func (s *Scheduler) RunCheckinNow() {
 func (s *Scheduler) RunActivityNow() {
 	s.runActivity(context.Background())
 }
+
+// RunActivityContext exposes the cancellation-aware activity pass to panel callers.
+func (s *Scheduler) RunActivityContext(ctx context.Context) { s.runActivity(ctx) }
 
 // runActivity 活跃上报遍历，随 ctx 取消立即退出。
 func (s *Scheduler) runActivity(ctx context.Context) {
@@ -506,11 +548,14 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		}
 		first = false
 		cid := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
-		if err := s.cfg.Upstream.ReportChatActivity(a, cid, ""); err != nil {
+		if ctx.Err() != nil {
+			return
+		}
+		if err := s.cfg.Upstream.ReportChatActivityContext(ctx, a, cid, ""); err != nil {
 			log.Printf("activity %s: %v", logfmt.Label(a.UID, a.Nickname), err)
 			continue
 		}
-		s.checkActivityStreak(a) // 上报成功 → 回读 streak 自检
+		s.checkActivityStreakContext(ctx, a) // 上报成功 → 回读 streak 自检
 	}
 }
 
@@ -522,7 +567,14 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 // 日志每号一行、一眼可 grep：`activity %s: streak days=%d`（成功也打，方便对账）。
 // 返回 true 表示「上报 OK 但 streak 可疑」（days==0 或回读失败），供测试断言。
 func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
-	days, err := s.cfg.Upstream.GrowthStreak(a)
+	return s.checkActivityStreakContext(context.Background(), a)
+}
+
+func (s *Scheduler) checkActivityStreakContext(ctx context.Context, a *auth.Auth) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+	days, err := s.cfg.Upstream.GrowthStreakContext(ctx, a)
 	if err != nil {
 		log.Printf("activity %s: streak check failed (report OK): %v", logfmt.Label(a.UID, a.Nickname), err)
 		return true
@@ -540,7 +592,15 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	s.RunKeepaliveContext(context.Background())
+}
+
+// RunKeepaliveContext refreshes tokens without outliving the caller.
+func (s *Scheduler) RunKeepaliveContext(ctx context.Context) {
 	for _, st := range s.cfg.Pool.List() {
+		if ctx.Err() != nil {
+			return
+		}
 		if st.Disabled {
 			continue
 		}
@@ -548,7 +608,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 		if a == nil || a.RefreshTokenValue() == "" {
 			continue
 		}
-		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+		if err := s.cfg.Upstream.RefreshTokenContext(ctx, a); err != nil {
 			log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 			var ue *upstream.Error
 			if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {

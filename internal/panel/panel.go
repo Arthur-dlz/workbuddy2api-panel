@@ -11,6 +11,7 @@
 package panel
 
 import (
+	"context"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -93,6 +94,11 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	lifecycleMu     sync.Mutex
+	lifecycleCtx    context.Context
+	lifecycleCancel context.CancelFunc
+	workers         sync.WaitGroup
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -144,6 +150,67 @@ func New(cfg Config) *Panel {
 	}
 	p.routes()
 	return p
+}
+
+// SetLifecycleContext binds asynchronous panel task work to the process lifetime.
+func (p *Panel) SetLifecycleContext(parent context.Context) {
+	if parent == nil {
+		parent = context.Background()
+	}
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.lifecycleCtx != nil {
+		return
+	}
+	p.lifecycleCtx, p.lifecycleCancel = context.WithCancel(parent)
+}
+
+func (p *Panel) lifecycle() context.Context {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.lifecycleCtx == nil {
+		p.lifecycleCtx = context.Background()
+	}
+	return p.lifecycleCtx
+}
+
+func (p *Panel) startWorker() (context.Context, bool) {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	if p.lifecycleCtx == nil {
+		p.lifecycleCtx = context.Background()
+	}
+	if p.lifecycleCtx.Err() != nil {
+		return p.lifecycleCtx, false
+	}
+	p.workers.Add(1)
+	return p.lifecycleCtx, true
+}
+
+// Stop cancels asynchronous panel jobs and joins them before shared stores close.
+func (p *Panel) Stop(ctx context.Context) error {
+	p.lifecycleMu.Lock()
+	if p.lifecycleCancel != nil {
+		p.lifecycleCancel()
+	}
+	p.lifecycleMu.Unlock()
+	done := make(chan struct{})
+	go func() { p.workers.Wait(); close(done) }()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *Panel) startTrackedJob(fn func(context.Context)) bool {
+	ctx, ok := p.startWorker()
+	if !ok {
+		return false
+	}
+	go func() { defer p.workers.Done(); fn(ctx) }()
+	return true
 }
 
 // Logs 返回日志环形缓冲（main 经 MultiWriter 镜像 log 与 chat 表格日志进来）。
@@ -545,7 +612,8 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]any{"ok": true}
 	checkinMsg := ""
-	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+	ctx := r.Context()
+	if err := p.cfg.Upstream.DailyCheckinContext(ctx, a); err != nil {
 		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
 		if upstream.IsAlreadyCheckin(err) {
 			p.cfg.Pool.NoteCheckinDone(uid)
@@ -558,7 +626,10 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}
-	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
+	if ctx.Err() != nil {
+		return
+	}
+	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiryContext(ctx, a, p.expiringSoonWindow())
 	if err != nil {
 		resp["balance_error"] = err.Error()
 		writeJSON(w, http.StatusOK, resp)
@@ -580,7 +651,7 @@ func (p *Panel) accountBalance(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
-	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiry(a, p.expiringSoonWindow())
+	remain, total, expiring, earliestAt, earliestRemaining, err := p.cfg.Upstream.UserResourceDetailedWithExpiryContext(r.Context(), a, p.expiringSoonWindow())
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "user resource: "+err.Error())
 		return
@@ -677,7 +748,10 @@ func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunCheckinNow()
+	if !p.startTrackedJob(p.cfg.Scheduler.RunCheckinContext) {
+		writeErr(w, http.StatusServiceUnavailable, "panel is stopping")
+		return
+	}
 	log.Printf("panel: 手动全量签到已触发（含猫猫旅行）")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
@@ -688,7 +762,10 @@ func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunTravelNow()
+	if !p.startTrackedJob(p.cfg.Scheduler.RunTravelContext) {
+		writeErr(w, http.StatusServiceUnavailable, "panel is stopping")
+		return
+	}
 	log.Printf("panel: 手动全量旅行巡检已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
@@ -699,7 +776,10 @@ func (p *Panel) activityAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunActivityNow()
+	if !p.startTrackedJob(p.cfg.Scheduler.RunActivityContext) {
+		writeErr(w, http.StatusServiceUnavailable, "panel is stopping")
+		return
+	}
 	log.Printf("panel: 手动全量活跃上报已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
@@ -710,7 +790,10 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunKeepaliveNow()
+	if !p.startTrackedJob(p.cfg.Scheduler.RunKeepaliveContext) {
+		writeErr(w, http.StatusServiceUnavailable, "panel is stopping")
+		return
+	}
 	log.Printf("panel: 手动全量保活已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
@@ -723,7 +806,7 @@ func (p *Panel) balanceAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	p.cfg.Scheduler.RunBalanceRefreshNow()
+	p.cfg.Scheduler.RunBalanceRefreshContext(r.Context())
 	log.Printf("panel: 手动全量余额刷新完成")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": p.cfg.Pool.List()})
 }

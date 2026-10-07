@@ -685,11 +685,11 @@ type Client struct {
 func New() *Client {
 	tr := newTransport()
 	c := &Client{
-		HTTP:                 &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:             &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		ChatBaseCN:           "https://copilot.tencent.com",
-		BillingBaseCN:        "https://www.codebuddy.cn",
-		WebBaseCN:            "https://www.workbuddy.cn",
+		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		ChatBaseCN:    "https://copilot.tencent.com",
+		BillingBaseCN: "https://www.codebuddy.cn",
+		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
 		GlobalEnabled: true,
@@ -704,6 +704,19 @@ func (c *Client) chatHTTP() *http.Client {
 		return c.ChatHTTP
 	}
 	return c.HTTP
+}
+
+// CloseIdleConnections 关闭底层的空闲连接，避免半死连接在传输异常后残留于连接池中。
+func (c *Client) CloseIdleConnections() {
+	if c == nil {
+		return
+	}
+	if c.ChatHTTP != nil {
+		roundTripCloseIdle(c.ChatHTTP.Transport)
+	}
+	if c.HTTP != nil {
+		roundTripCloseIdle(c.HTTP.Transport)
+	}
 }
 
 // defaultGlobalBase 缺省 global base（D5：config 未覆盖时默认 workbuddy.ai）。
@@ -858,6 +871,16 @@ func (c *Client) webBase(a *auth.Auth) string {
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
+	return c.doJSONContext(req.Context(), req)
+}
+
+// doJSONContext performs the same JSON request with a caller-owned cancellation
+// context. The context remains attached through RoundTrip and body reads.
+func (c *Client) doJSONContext(ctx context.Context, req *http.Request) (json.RawMessage, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	req = req.WithContext(ctx)
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
@@ -905,6 +928,13 @@ const refreshTokenExpiresInMax = 10 * 365 * 24 * time.Hour
 //   - 写回前重新校验快照一致性：若锁外期间另一 goroutine 已完成刷新（refreshToken
 //     已变），本次结果直接采用（新 token 已生效），不再重复写回。
 func (c *Client) RefreshToken(a *auth.Auth) error {
+	return c.RefreshTokenContext(context.Background(), a)
+}
+
+func (c *Client) RefreshTokenContext(parent context.Context, a *auth.Auth) error {
+	if err := parent.Err(); err != nil {
+		return err
+	}
 	// 第 1 段（锁内）：读快照。
 	a.Lock()
 	rtSnapshot := a.RefreshToken
@@ -915,7 +945,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	}
 
 	endpoint := c.chatBase(a) + "/v2/plugin/auth/token/refresh"
-	ctx, cancel := context.WithTimeout(context.Background(), refreshIOTimeout)
+	ctx, cancel := context.WithTimeout(parent, refreshIOTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, nil)
 	if err != nil {
@@ -938,7 +968,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	c.RefreshHeaders(req, &hdrSnapshot)
 
 	// 网络 I/O（锁外，30s 上限）。
-	data, err := c.doJSON(req)
+	data, err := c.doJSONContext(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -1856,7 +1886,11 @@ func parsePackageEndTime(raw string) (time.Time, bool) {
 // 钳 [0,size] 与 used 修正；消除双份逻辑漂移——旧中间 switch 只钳负值，上游脏数据
 // CycleRemain>Size 时会高估）。
 func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
-	remain, total, expiring, _, _, err = c.UserResourceDetailedWithExpiry(a, soon)
+	return c.UserResourceDetailedContext(context.Background(), a, soon)
+}
+
+func (c *Client) UserResourceDetailedContext(ctx context.Context, a *auth.Auth, soon time.Duration) (remain, total, expiring int64, err error) {
+	remain, total, expiring, _, _, err = c.UserResourceDetailedWithExpiryContext(ctx, a, soon)
 	return remain, total, expiring, err
 }
 
@@ -1864,6 +1898,10 @@ func (c *Client) UserResourceDetailed(a *auth.Auth, soon time.Duration) (remain,
 // earliestAt 是最早的可用到期时刻，earliestRemaining 是同一时刻所有正余额包的剩余量之和。
 // 已过期、剩余为 0、缺少或无法解析到期时间的包都不会成为最早批次；无有效批次时返回零值。
 func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
+	return c.UserResourceDetailedWithExpiryContext(context.Background(), a, soon)
+}
+
+func (c *Client) UserResourceDetailedWithExpiryContext(ctx context.Context, a *auth.Auth, soon time.Duration) (remain, total, expiring int64, earliestAt time.Time, earliestRemaining int64, err error) {
 	now := time.Now()
 	body := map[string]any{
 		"PageNumber":               1,
@@ -1876,9 +1914,9 @@ func (c *Client) UserResourceDetailedWithExpiry(a *auth.Auth, soon time.Duration
 	// 余额查询同样做瞬时错误有界重试（签到后紧接着的 user-resource 偶发 500/EOF 会让
 	// 该账号错过本次解冻/到期快照更新，只能等下一个刷新周期）。
 	var data json.RawMessage
-	err = c.retryBillingTransient(func() error {
+	err = c.retryBillingTransientContext(ctx, func() error {
 		var e error
-		data, e = c.billingMeterJSON(a, c.billingMeterPaths(a), http.MethodPost, body)
+		data, e = c.billingMeterJSONContext(ctx, a, c.billingMeterPaths(a), http.MethodPost, body)
 		return e
 	})
 	if err != nil {
@@ -1986,8 +2024,12 @@ func packageRemainUsed(a respAccount) (remain, used, size int64) {
 // 偶发上游 5xx（code 10000）或 EOF 瞬时断网做有界重试（见 retryBillingTransient）——
 // 单次抖动不再让该账号整天漏签；「已签到」等业务错误不重试。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
-	return c.retryBillingTransient(func() error {
-		_, err := c.billingMeterJSON(a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
+	return c.DailyCheckinContext(context.Background(), a)
+}
+
+func (c *Client) DailyCheckinContext(ctx context.Context, a *auth.Auth) error {
+	return c.retryBillingTransientContext(ctx, func() error {
+		_, err := c.billingMeterJSONContext(ctx, a, c.checkinMeterPaths(a), http.MethodPost, map[string]any{})
 		return err
 	})
 }

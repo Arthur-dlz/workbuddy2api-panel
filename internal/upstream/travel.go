@@ -4,6 +4,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -45,6 +46,10 @@ type TravelState struct {
 // 错误语义与 doJSON 一致：HTTP 非 2xx / 业务 code != 0 → *Error。
 // 接入瞬时错误有界重试（防上游网关空闲连接掐断报 EOF）。
 func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	return c.growthJSONContext(context.Background(), a, method, path, body)
+}
+
+func (c *Client) growthJSONContext(ctx context.Context, a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
 	var raw []byte
 	if body != nil {
 		var err error
@@ -54,18 +59,21 @@ func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.R
 		}
 	}
 	var data json.RawMessage
-	err := c.retryTransportTransient(func() error {
+	err := c.retryTransportTransientContext(ctx, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		var rdr io.Reader
 		if raw != nil {
 			rdr = bytes.NewReader(raw)
 		}
-		req, err := http.NewRequest(method, c.chatBase(a)+path, rdr)
+		req, err := http.NewRequestWithContext(ctx, method, c.chatBase(a)+path, rdr)
 		if err != nil {
 			return err
 		}
 		c.BillingHeaders(req, a)
 		var e error
-		data, e = c.doJSON(req)
+		data, e = c.doJSONContext(ctx, req)
 		return e
 	})
 	return data, err
@@ -73,7 +81,11 @@ func (c *Client) growthJSON(a *auth.Auth, method, path string, body any) (json.R
 
 // TravelStatus 查询猫猫旅行状态。
 func (c *Client) TravelStatus(a *auth.Auth) (*TravelState, error) {
-	data, err := c.growthJSON(a, http.MethodGet, travelStatusPath, nil)
+	return c.TravelStatusContext(context.Background(), a)
+}
+
+func (c *Client) TravelStatusContext(ctx context.Context, a *auth.Auth) (*TravelState, error) {
+	data, err := c.growthJSONContext(ctx, a, http.MethodGet, travelStatusPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -86,13 +98,21 @@ func (c *Client) TravelStatus(a *auth.Auth) (*TravelState, error) {
 
 // TravelDepart 派出猫旅行；locationID 实测 1~4（收益/时长区间相同）。
 func (c *Client) TravelDepart(a *auth.Auth, locationID int) error {
-	_, err := c.growthJSON(a, http.MethodPost, travelDepartPath, map[string]any{"location_id": locationID})
+	return c.TravelDepartContext(context.Background(), a, locationID)
+}
+
+func (c *Client) TravelDepartContext(ctx context.Context, a *auth.Auth, locationID int) error {
+	_, err := c.growthJSONContext(ctx, a, http.MethodPost, travelDepartPath, map[string]any{"location_id": locationID})
 	return err
 }
 
 // TravelClaim 领取到站奖励，返回 reward_credit。
 func (c *Client) TravelClaim(a *auth.Auth, recordID int64) (int64, error) {
-	data, err := c.growthJSON(a, http.MethodPost, travelClaimPath, map[string]any{"record_id": recordID})
+	return c.TravelClaimContext(context.Background(), a, recordID)
+}
+
+func (c *Client) TravelClaimContext(ctx context.Context, a *auth.Auth, recordID int64) (int64, error) {
+	data, err := c.growthJSONContext(ctx, a, http.MethodPost, travelClaimPath, map[string]any{"record_id": recordID})
 	if err != nil {
 		return 0, err
 	}
@@ -108,7 +128,11 @@ func (c *Client) TravelClaim(a *auth.Auth, recordID int64) (int64, error) {
 
 // BuddyInfo 查询当前猫档案；返回 (nil, nil) 表示无猫（data.buddy 为 null）。
 func (c *Client) BuddyInfo(a *auth.Auth) (*Buddy, error) {
-	data, err := c.growthJSON(a, http.MethodGet, buddyInfoPath, nil)
+	return c.BuddyInfoContext(context.Background(), a)
+}
+
+func (c *Client) BuddyInfoContext(ctx context.Context, a *auth.Auth) (*Buddy, error) {
+	data, err := c.growthJSONContext(ctx, a, http.MethodGet, buddyInfoPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -133,13 +157,21 @@ func (c *Client) BuddyInfo(a *auth.Auth) (*Buddy, error) {
 // BuddyFirst 领养第一只猫。无猫且已过 conversation 门槛时送 300 分。
 // 门槛未达标返回 HTTP 400（见 IsBuddyTaskIncomplete），属预期行为，调用方静默跳过。
 func (c *Client) BuddyFirst(a *auth.Auth) error {
-	_, err := c.growthJSON(a, http.MethodPost, buddyFirstPath, map[string]any{})
+	return c.BuddyFirstContext(context.Background(), a)
+}
+
+func (c *Client) BuddyFirstContext(ctx context.Context, a *auth.Auth) error {
+	_, err := c.growthJSONContext(ctx, a, http.MethodPost, buddyFirstPath, map[string]any{})
 	return err
 }
 
 // BuddyAgreement 同意协议（幂等，重复调用无副作用）。
 func (c *Client) BuddyAgreement(a *auth.Auth) error {
-	_, err := c.growthJSON(a, http.MethodPost, buddyAgreementPath, map[string]any{"agree": true})
+	return c.BuddyAgreementContext(context.Background(), a)
+}
+
+func (c *Client) BuddyAgreementContext(ctx context.Context, a *auth.Auth) error {
+	_, err := c.growthJSONContext(ctx, a, http.MethodPost, buddyAgreementPath, map[string]any{"agree": true})
 	return err
 }
 
@@ -148,7 +180,11 @@ func (c *Client) BuddyAgreement(a *auth.Auth) error {
 // GET 失败（HTTP 非 2xx / 业务 code != 0）返回 *Error；缺 streak/days 字段返回 0
 // （days==0 即活跃自检的「上报 200 但静默丢弃」告警信号）。
 func (c *Client) GrowthStreak(a *auth.Auth) (int, error) {
-	data, err := c.growthJSON(a, http.MethodGet, streakPath, nil)
+	return c.GrowthStreakContext(context.Background(), a)
+}
+
+func (c *Client) GrowthStreakContext(ctx context.Context, a *auth.Auth) (int, error) {
+	data, err := c.growthJSONContext(ctx, a, http.MethodGet, streakPath, nil)
 	if err != nil {
 		return 0, err
 	}

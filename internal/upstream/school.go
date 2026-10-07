@@ -12,6 +12,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -24,11 +25,15 @@ const schoolBase = "/portal/activity/school"
 
 // schoolJSON 学院活动 API 请求（剥信封，业务 code≠0 返回带 msg 的 error）。
 func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]any, out any) error {
+	return c.schoolJSONContext(context.Background(), a, method, path, body, out)
+}
+
+func (c *Client) schoolJSONContext(ctx context.Context, a *auth.Auth, method, path string, body map[string]any, out any) error {
 	var raw []byte
 	if body != nil {
 		raw, _ = json.Marshal(body)
 	}
-	req, err := http.NewRequest(method, c.billingBase(a)+schoolBase+path, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, method, c.billingBase(a)+schoolBase+path, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
@@ -38,7 +43,7 @@ func (c *Client) schoolJSON(a *auth.Auth, method, path string, body map[string]a
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	data, err := c.doJSON(req)
+	data, err := c.doJSONContext(ctx, req)
 	if err != nil {
 		return err
 	}
@@ -81,6 +86,10 @@ func mpEventBase(a *auth.Auth) map[string]any {
 
 // ReportMPEvent 以小程序指纹向 www.codebuddy.cn/v2/report 批量上报事件。
 func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
+	return c.ReportMPEventContext(context.Background(), a, events...)
+}
+
+func (c *Client) ReportMPEventContext(ctx context.Context, a *auth.Auth, events ...map[string]any) error {
 	if len(events) == 0 {
 		return fmt.Errorf("mp report: no events")
 	}
@@ -100,7 +109,7 @@ func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.BillingBaseCN+mpReportPath, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BillingBaseCN+mpReportPath, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
@@ -114,7 +123,7 @@ func (c *Client) ReportMPEvent(a *auth.Auth, events ...map[string]any) error {
 	req.Header.Set("X-Client-Version", "2.4.0")
 	req.Header.Set("X-Client-Platform", "mp-weixin")
 	req.Header.Set("X-Platform", "wechatmp")
-	_, err = c.doJSON(req)
+	_, err = c.doJSONContext(ctx, req)
 	return err
 }
 
@@ -232,10 +241,14 @@ type SchoolVoucher struct {
 // SchoolVouchers 查询账号的开学季券码列表（只读）。
 // 抽到积分的记录不在此端点（那是 /rewards 的 type=credit 条目）。
 func (c *Client) SchoolVouchers(a *auth.Auth) ([]SchoolVoucher, error) {
+	return c.SchoolVouchersContext(context.Background(), a)
+}
+
+func (c *Client) SchoolVouchersContext(ctx context.Context, a *auth.Auth) ([]SchoolVoucher, error) {
 	var out struct {
 		Items []SchoolVoucher `json:"items"`
 	}
-	if err := c.schoolJSON(a, http.MethodGet, "/vouchers", nil, &out); err != nil {
+	if err := c.schoolJSONContext(ctx, a, http.MethodGet, "/vouchers", nil, &out); err != nil {
 		return nil, err
 	}
 	return out.Items, nil

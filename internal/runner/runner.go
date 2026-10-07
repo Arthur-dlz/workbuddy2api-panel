@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 
@@ -271,7 +272,7 @@ func Run() {
 	})
 	// 成长任务队列每日自动执行（与「执行全部待办」同管线）：Sequential 族零点解锁后
 	// 无需手动扫描；hook 返回即启动（异步执行），已在跑时内部跳过。
-	sch.SetGrowthHook(pn.RunGrowthQueueOnce)
+	sch.SetGrowthContextHook(pn.RunGrowthQueueContext)
 	log.SetOutput(io.MultiWriter(pn.Logs(), safeConsoleWriter{os.Stderr}))
 	server.SetChatLogOutput(io.MultiWriter(pn.Logs(), safeConsoleWriter{os.Stdout}))
 
@@ -296,12 +297,19 @@ func Run() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	pn.SetLifecycleContext(ctx)
 	go sch.Run(ctx)
 	sch.StartBalanceRefresh(ctx, cfg.BalanceRefreshInterval)
 
+	var handlers sync.WaitGroup
+	trackedHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlers.Add(1)
+		defer handlers.Done()
+		h.ServeHTTP(w, r)
+	})
 	srv := &http.Server{
 		Addr:              cfg.Listen,
-		Handler:           h,
+		Handler:           trackedHandler,
 		ReadHeaderTimeout: 30 * time.Second,
 		// ReadTimeout 覆盖整个请求读取（含 body）：防慢速 body 拖死连接。
 		// 请求体已无网关侧上限（max_body_mb 移除），60s 按常规带宽的数十 MB
@@ -312,12 +320,37 @@ func Run() {
 		// （长流式生成合法时长可达数分钟，全局 WriteTimeout 会误杀在途 SSE）。
 		IdleTimeout: 120 * time.Second,
 	}
+	shutdownDone := make(chan error, 1)
 	go func() {
 		<-ctx.Done()
-		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		_ = srv.Shutdown(shutdownCtx)
+		shutdownDone <- srv.Shutdown(shutdownCtx)
+	}()
+	defer func() {
+		stop()
+		select {
+		case err := <-shutdownDone:
+			if err != nil {
+				log.Printf("HTTP shutdown exceeded deadline (%v); closing connections before shared-state shutdown", err)
+				_ = srv.Close()
+			}
+		case <-time.After(11 * time.Second):
+			log.Printf("HTTP shutdown did not complete; closing connections before shared-state shutdown")
+			_ = srv.Close()
+		}
+		handlers.Wait()
+		joinCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if err := sch.WaitContext(joinCtx); err != nil {
+			log.Printf("scheduler shutdown exceeded deadline (%v); waiting before pool/store close", err)
+			sch.Wait()
+		}
+		if err := pn.Stop(joinCtx); err != nil {
+			log.Printf("panel task shutdown exceeded deadline (%v); waiting before pool/store close", err)
+			_ = pn.Stop(context.Background())
+		}
+		p.Flush()
 	}()
 
 	log.Printf("WorkBuddy Gateway listening on %s (api_key=%v)，管理面板 http://127.0.0.1%s/panel/", cfg.Listen, cfg.APIKey != "", panelListenPath(cfg.Listen))
@@ -336,7 +369,7 @@ func Run() {
 	}
 
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("http: %v", err)
+		log.Printf("http: %v", err)
 	}
 	log.Printf("bye")
 }
@@ -542,4 +575,3 @@ func (s safeConsoleWriter) Write(p []byte) (int, error) {
 	}
 	return n, nil
 }
-

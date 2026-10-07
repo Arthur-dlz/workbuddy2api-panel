@@ -16,6 +16,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -60,7 +61,11 @@ type Task struct {
 // 响应形如 data.tasks[]，元素字段随任务类型变化（progress 可能是 {current,target} 或平铺），
 // 这里做宽松解析：两种形状都尝试。
 func (c *Client) ListTasks(a *auth.Auth) ([]Task, error) {
-	data, err := c.growthJSON(a, http.MethodGet, tasksListPath, nil)
+	return c.ListTasksContext(context.Background(), a)
+}
+
+func (c *Client) ListTasksContext(ctx context.Context, a *auth.Auth) ([]Task, error) {
+	data, err := c.growthJSONContext(ctx, a, http.MethodGet, tasksListPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +79,11 @@ func (c *Client) ListTasks(a *auth.Auth) ([]Task, error) {
 // （含 RichMeow/Model_chat 等常规任务 + wb_wechat_oa_subscribe_task 等 mp 专属），
 // 合并时调用方须按 task_code 去重。
 func (c *Client) ListTasksMP(a *auth.Auth) ([]Task, error) {
-	data, err := c.growthJSONMP(a, http.MethodGet, tasksListPath, nil)
+	return c.ListTasksMPContext(context.Background(), a)
+}
+
+func (c *Client) ListTasksMPContext(ctx context.Context, a *auth.Auth) ([]Task, error) {
+	data, err := c.growthJSONMPContext(ctx, a, http.MethodGet, tasksListPath, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -84,6 +93,10 @@ func (c *Client) ListTasksMP(a *auth.Auth) ([]Task, error) {
 // growthJSONMP 发 growth 域请求（小程序口径：叠加 X-Client-Platform: miniprogram）
 // 并解信封。语义同 growthJSON。
 func (c *Client) growthJSONMP(a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
+	return c.growthJSONMPContext(context.Background(), a, method, path, body)
+}
+
+func (c *Client) growthJSONMPContext(ctx context.Context, a *auth.Auth, method, path string, body any) (json.RawMessage, error) {
 	var raw []byte
 	if body != nil {
 		var err error
@@ -93,19 +106,22 @@ func (c *Client) growthJSONMP(a *auth.Auth, method, path string, body any) (json
 		}
 	}
 	var data json.RawMessage
-	err := c.retryTransportTransient(func() error {
+	err := c.retryTransportTransientContext(ctx, func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		var rdr io.Reader
 		if raw != nil {
 			rdr = bytes.NewReader(raw)
 		}
-		req, err := http.NewRequest(method, c.chatBase(a)+path, rdr)
+		req, err := http.NewRequestWithContext(ctx, method, c.chatBase(a)+path, rdr)
 		if err != nil {
 			return err
 		}
 		c.BillingHeaders(req, a)
 		req.Header.Set("X-Client-Platform", mpPlatform)
 		var e error
-		data, e = c.doJSON(req)
+		data, e = c.doJSONContext(ctx, req)
 		return e
 	})
 	return data, err
@@ -114,7 +130,11 @@ func (c *Client) growthJSONMP(a *auth.Auth, method, path string, body any) (json
 // AcceptTasksMP 接受小程序限定任务（mp 头；缺头实测 task not found）。
 // 幂等语义同 AcceptTasks。
 func (c *Client) AcceptTasksMP(a *auth.Auth, taskCodes []string) error {
-	_, err := c.growthJSONMP(a, http.MethodPost, tasksAcceptPath, map[string]any{"task_codes": taskCodes})
+	return c.AcceptTasksMPContext(context.Background(), a, taskCodes)
+}
+
+func (c *Client) AcceptTasksMPContext(ctx context.Context, a *auth.Auth, taskCodes []string) error {
+	_, err := c.growthJSONMPContext(ctx, a, http.MethodPost, tasksAcceptPath, map[string]any{"task_codes": taskCodes})
 	return err
 }
 
@@ -122,18 +142,22 @@ func (c *Client) AcceptTasksMP(a *auth.Auth, taskCodes []string) error {
 // + mp 头（上游 task_runner claim_one(mp=True) 同款）；chat 域 400 时降级 Web 域
 // 领奖端点（ClaimReward，x-client-platform: web 形态）。返回 (credit, energy, err)。
 func (c *Client) ClaimRewardMP(a *auth.Auth, taskCode string) (credit, energy int64, err error) {
-	req, err := http.NewRequest(http.MethodPost,
+	return c.ClaimRewardMPContext(context.Background(), a, taskCode)
+}
+
+func (c *Client) ClaimRewardMPContext(ctx context.Context, a *auth.Auth, taskCode string) (credit, energy int64, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.chatBase(a)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", nil)
 	if err != nil {
 		return 0, 0, err
 	}
 	c.BillingHeaders(req, a)
 	req.Header.Set("X-Client-Platform", mpPlatform)
-	data, err := c.doJSON(req)
+	data, err := c.doJSONContext(ctx, req)
 	if err != nil {
 		// chat 域对该路径 400（部分任务/租户形态）→ Web 域降级（已实测可领）。
 		if ue, ok := err.(*Error); ok && ue.Status == http.StatusBadRequest {
-			return c.ClaimReward(a, taskCode)
+			return c.ClaimRewardContext(ctx, a, taskCode)
 		}
 		return 0, 0, err
 	}
@@ -219,7 +243,11 @@ func parseGrowthTasks(data json.RawMessage) ([]Task, error) {
 
 // AcceptTasks 接受任务（幂等：已 accepted 时上游返回成功或业务提示，均不视为致命错误）。
 func (c *Client) AcceptTasks(a *auth.Auth, taskCodes []string) error {
-	_, err := c.growthJSON(a, http.MethodPost, tasksAcceptPath, map[string]any{"task_codes": taskCodes})
+	return c.AcceptTasksContext(context.Background(), a, taskCodes)
+}
+
+func (c *Client) AcceptTasksContext(ctx context.Context, a *auth.Auth, taskCodes []string) error {
+	_, err := c.growthJSONContext(ctx, a, http.MethodPost, tasksAcceptPath, map[string]any{"task_codes": taskCodes})
 	return err
 }
 
@@ -235,7 +263,11 @@ func (c *Client) AcceptTasks(a *auth.Auth, taskCodes []string) error {
 // 一直返回 400 "task not completed"，是此前领奖失败的真实原因。
 // 本实现返回 (credit, energy, err)：credit/energy 为本次到账奖励（已领取过时为 0）。
 func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int64, err error) {
-	req, err := http.NewRequest(http.MethodPost,
+	return c.ClaimRewardContext(context.Background(), a, taskCode)
+}
+
+func (c *Client) ClaimRewardContext(ctx context.Context, a *auth.Auth, taskCode string) (credit, energy int64, err error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
 		c.webBase(a)+"/activity/growth/tasks/"+url.PathEscape(taskCode)+"/claim", nil)
 	if err != nil {
 		return 0, 0, err
@@ -262,7 +294,7 @@ func (c *Client) ClaimReward(a *auth.Auth, taskCode string) (credit, energy int6
 		req.Header.Set("X-Domain", d)
 	}
 
-	data, err := c.doJSON(req)
+	data, err := c.doJSONContext(ctx, req)
 	if err != nil {
 		return 0, 0, err
 	}

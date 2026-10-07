@@ -23,6 +23,7 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -89,6 +90,10 @@ func desktopFingerprint(a *auth.Auth) map[string]any {
 // events 为业务载荷（eventCode 等字段由调用方给出）；公共指纹自动注入，
 // 业务字段优先（可用于覆盖 qimei36/machineId 等设备标识做真实设备对齐）。
 func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error {
+	return c.ReportDesktopEventContext(context.Background(), a, events...)
+}
+
+func (c *Client) ReportDesktopEventContext(ctx context.Context, a *auth.Auth, events ...DesktopEvent) error {
 	if len(events) == 0 {
 		return fmt.Errorf("desktop report: no events")
 	}
@@ -108,7 +113,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.desktopBase(a)+desktopReportPath, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.desktopBase(a)+desktopReportPath, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
@@ -122,7 +127,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSONContext(ctx, req)
 	return err
 }
 
@@ -204,12 +209,16 @@ func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelNam
 // 和品主题 resource_key 为 "theme-tkmw7j"，浅色 "light"、深色 "dark"）。纯 API set 不计
 // Hp_Appearance 分（需客户端切主题后真实活跃），保留供调色/还原与后续验证用。
 func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
+	return c.SetAppearanceThemeContext(context.Background(), a, resourceKey)
+}
+
+func (c *Client) SetAppearanceThemeContext(ctx context.Context, a *auth.Auth, resourceKey string) error {
 	body := map[string]string{"kind": "theme", "resource_key": resourceKey}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.desktopBase(a)+desktopAppearanceSet, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.desktopBase(a)+desktopAppearanceSet, bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
@@ -221,7 +230,7 @@ func (c *Client) SetAppearanceTheme(a *auth.Auth, resourceKey string) error {
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSONContext(ctx, req)
 	return err
 }
 
@@ -264,6 +273,10 @@ func DesktopAutomationCreateEvent(name string) DesktopEvent {
 // 与桌面指纹（copilot 域）不同：web 域事件是浏览器形状（os/machineId/userAgent），
 // 用于 Library_read 等页面行为类任务（实测 library_doc_intro_click 4 秒点亮）。
 func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, elementName string) error {
+	return c.ReportWebEventContext(context.Background(), a, eventCode, pageURL, elementID, elementName)
+}
+
+func (c *Client) ReportWebEventContext(ctx context.Context, a *auth.Auth, eventCode, pageURL, elementID, elementName string) error {
 	ua := "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 	ev := map[string]any{
 		"eventCode": eventCode, "timestamp": time.Now().UnixMilli(), "reportDelay": 0,
@@ -276,7 +289,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.webBase(a)+"/v2/report", bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.webBase(a)+"/v2/report", bytes.NewReader(raw))
 	if err != nil {
 		return err
 	}
@@ -290,7 +303,7 @@ func (c *Client) ReportWebEvent(a *auth.Auth, eventCode, pageURL, elementID, ele
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
-	_, err = c.doJSON(req)
+	_, err = c.doJSONContext(ctx, req)
 	return err
 }
 
@@ -379,6 +392,10 @@ type MarketExpert struct {
 // MarketExpertList 拉取专家市场真实专家列表（expertType: "agent" 单专家 / "team" 专家团）。
 // expert_actual_use 的判据校验要求 id 是平台上真实存在的专家（编造 id 不计数）。
 func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpert, error) {
+	return c.MarketExpertListContext(context.Background(), a, expertType)
+}
+
+func (c *Client) MarketExpertListContext(ctx context.Context, a *auth.Auth, expertType string) ([]MarketExpert, error) {
 	body := map[string]any{"page": 1, "page_size": 20, "sort_by": "reco_rank", "sort_order": "desc"}
 	if expertType != "" {
 		body["expert_type"] = expertType
@@ -387,7 +404,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.chatBase(a)+"/portal/operation-platform/market/expert/list", bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatBase(a)+"/portal/operation-platform/market/expert/list", bytes.NewReader(raw))
 	if err != nil {
 		return nil, err
 	}
@@ -402,7 +419,7 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 	var out struct {
 		Experts []MarketExpert `json:"experts"`
 	}
-	data, err := c.doJSON(req)
+	data, err := c.doJSONContext(ctx, req)
 	if err != nil {
 		return nil, err
 	}
@@ -417,6 +434,10 @@ func (c *Client) MarketExpertList(a *auth.Auth, expertType string) ([]MarketExpe
 // expert_actual_use 等 JOIN 事件的 requestId 必须是该服务端 id——自造 UUID 不计数
 // （客户端 resolveRealRequestId 同款语义，Sunny row 2113 实证）。
 func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversationID, requestID string, err error) {
+	return c.DesktopChatWithExpertContext(context.Background(), a, expertID)
+}
+
+func (c *Client) DesktopChatWithExpertContext(ctx context.Context, a *auth.Auth, expertID string) (conversationID, requestID string, err error) {
 	conversationID = fmt.Sprintf("wb2api-conv-%d", time.Now().UnixNano())
 	body := map[string]any{
 		"model": "fast-model",
@@ -433,7 +454,7 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	if err != nil {
 		return "", "", err
 	}
-	req, err := http.NewRequest(http.MethodPost, c.chatBase(a)+"/v2/chat/completions", bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.chatBase(a)+"/v2/chat/completions", bytes.NewReader(raw))
 	if err != nil {
 		return "", "", err
 	}
