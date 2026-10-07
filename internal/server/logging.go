@@ -2,11 +2,11 @@
 package server
 
 import (
-	"bufio"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"os"
 	"strings"
 	"sync/atomic"
@@ -34,14 +34,17 @@ func SetChatLogOutput(w io.Writer) { chatLogOut = w }
 
 // chatStat 单个 chat 请求的日志统计；handler 挂 defer，请求出口后落一行。
 type chatStat struct {
-	start  time.Time
-	model  string
-	mode   string // "stream" | "sync"
-	uid    string // 完整 uid，展示时只取前 8 位
-	nick   string // 账号昵称（随选号同步），流水行经 logfmt.Label 拼成 "昵称(uid8)"
-	ttfb   time.Duration
-	toks   int // <0 表示 usage 缺失 → 显示 "-"
-	status int
+	start               time.Time
+	model               string
+	mode                string // "stream" | "sync"
+	uid                 string // 完整 uid，展示时只取前 8 位
+	nick                string // 账号昵称（随选号同步），流水行经 logfmt.Label 拼成 "昵称(uid8)"
+	ttfb                time.Duration
+	toks                int // <0 表示 usage 缺失 → 显示 "-"
+	status              int
+	clientCancelled     bool
+	responseCommitted   bool
+	responseWriteFailed bool
 
 	logged bool
 }
@@ -62,13 +65,54 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.nick, s.status, s.toks)
+	if s.clientCancelled || !s.responseCommitted || s.responseWriteFailed {
+		fmt.Fprintf(chatLogOut, "[server] client_cancelled=%t response_committed=%t response_write_failed=%t\n", s.clientCancelled, s.responseCommitted, s.responseWriteFailed)
+	}
 }
+
+type trackedResponseWriter struct {
+	http.ResponseWriter
+	status      int
+	committed   bool
+	writeFailed bool
+}
+
+func (w *trackedResponseWriter) WriteHeader(status int) {
+	if w.committed {
+		return
+	}
+	w.status = status
+	w.committed = true
+	w.ResponseWriter.WriteHeader(status)
+}
+
+func (w *trackedResponseWriter) Write(p []byte) (int, error) {
+	if !w.committed {
+		w.WriteHeader(http.StatusOK)
+	}
+	n, err := w.ResponseWriter.Write(p)
+	if err != nil || n != len(p) {
+		w.writeFailed = true
+	}
+	return n, err
+}
+
+func (w *trackedResponseWriter) Flush() {
+	if !w.committed {
+		w.WriteHeader(http.StatusOK)
+	}
+	if flusher, ok := w.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
+func (w *trackedResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，
 // 并记录首个 data 帧的 TTFB；原始字节原样返回给下游透传。
 // 注意：不做 rune 估算，token 数一律采信上游 usage。
 type chatStatsReader struct {
-	br                  *bufio.Reader
+	src                 io.Reader
 	start               time.Time
 	ttfb                time.Duration
 	seen                bool // 已见过首个 data 帧（TTFB 只记一次）
@@ -85,11 +129,14 @@ type chatStatsReader struct {
 	hasCachedTokens bool
 	cachedTokens    int64
 	pend            []byte // 已读未返回的行缓存
+	line            strings.Builder
+	data            []string
+	skipLF          bool
 }
 
 // newChatStatsReaderSince 以 since 为 TTFB 计时起点（通常是请求进入 handler 的时刻）。
 func newChatStatsReaderSince(r io.Reader, since time.Time) *chatStatsReader {
-	return &chatStatsReader{br: bufio.NewReaderSize(r, 64*1024), start: since}
+	return &chatStatsReader{src: r, start: since}
 }
 
 // TTFB 返回首个 data 帧到达耗时；无帧时为 0。
@@ -122,10 +169,20 @@ func (s *chatStatsReader) Usage() pool.TokenUsageDelta {
 // parseSSELine 解析一行 "data: {...}"：首帧记 TTFB，含 usage 时采信精确 completion_tokens 与 prompt 缓存。
 func (s *chatStatsReader) parseSSELine(line string) {
 	line = strings.TrimRight(line, "\r\n")
-	if !strings.HasPrefix(line, "data: ") {
+	if strings.HasPrefix(line, ":") {
 		return
 	}
-	payload := strings.TrimPrefix(line, "data: ")
+	field, value, hasValue := strings.Cut(line, ":")
+	if field != "data" {
+		return
+	}
+	if hasValue {
+		value = strings.TrimPrefix(value, " ")
+	}
+	s.parseSSEPayload(value)
+}
+
+func (s *chatStatsReader) parseSSEPayload(payload string) {
 	if payload == "[DONE]" {
 		return
 	}
@@ -231,20 +288,57 @@ func readFloatMetric(v any) (float64, bool) {
 
 // Read 返回原始数据，同时解析统计 TTFB/token。
 func (s *chatStatsReader) Read(p []byte) (int, error) {
-	if len(s.pend) > 0 {
-		n := copy(p, s.pend)
-		s.pend = s.pend[n:]
-		return n, nil
+	n, err := s.src.Read(p)
+	if n > 0 {
+		s.observeSSE(p[:n])
 	}
-	line, err := s.br.ReadString('\n')
-	if line != "" {
-		s.parseSSELine(line)
-		s.pend = []byte(line)
-		n := copy(p, s.pend)
-		s.pend = s.pend[n:]
-		return n, nil
+	return n, err
+}
+
+// observeSSE observes event boundaries incrementally while Read returns every
+// byte from the source immediately. CR, LF, CRLF, comments, and multiline data
+// fields follow the same event framing used by the upstream SSE reader.
+func (s *chatStatsReader) observeSSE(raw []byte) {
+	for _, b := range raw {
+		if s.skipLF {
+			s.skipLF = false
+			if b == '\n' {
+				continue
+			}
+		}
+		switch b {
+		case '\r':
+			s.finishObservedLine()
+			s.skipLF = true
+		case '\n':
+			s.finishObservedLine()
+		default:
+			s.line.WriteByte(b)
+		}
 	}
-	return 0, err
+}
+
+func (s *chatStatsReader) finishObservedLine() {
+	line := s.line.String()
+	s.line.Reset()
+	if line == "" {
+		if len(s.data) != 0 {
+			s.parseSSEPayload(strings.Join(s.data, "\n"))
+			s.data = s.data[:0]
+		}
+		return
+	}
+	if strings.HasPrefix(line, ":") {
+		return
+	}
+	field, value, hasValue := strings.Cut(line, ":")
+	if field != "data" {
+		return
+	}
+	if hasValue {
+		value = strings.TrimPrefix(value, " ")
+	}
+	s.data = append(s.data, value)
 }
 
 // rewriteModel 把 outbound chat body 的 model 字段替换为 bare（保留其余字段原样）。

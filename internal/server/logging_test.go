@@ -1,6 +1,7 @@
 package server
 
 import (
+	"bytes"
 	"io"
 	"math"
 	"net/http"
@@ -124,6 +125,110 @@ func TestChatStatsReaderBytesPassthrough(t *testing.T) {
 	out, _ := io.ReadAll(r)
 	if string(out) != sse {
 		t.Errorf("passthrough mismatch:\n got %q\nwant %q", out, sse)
+	}
+}
+
+type blockingEventReader struct {
+	data    []byte
+	blocked chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingEventReader) Read(p []byte) (int, error) {
+	if len(r.data) != 0 {
+		n := copy(p, r.data)
+		r.data = r.data[n:]
+		return n, nil
+	}
+	close(r.blocked)
+	<-r.release
+	return 0, io.EOF
+}
+
+func TestChatStatsReaderReturnsCRHeartbeatBytesBeforeNextRead(t *testing.T) {
+	reader := &blockingEventReader{
+		data:    []byte(": ping\r\rdata:{\"choices\":[{\"delta\":{\"content\":\"x\"}}]}\r\r"),
+		blocked: make(chan struct{}), release: make(chan struct{}),
+	}
+	r := newChatStatsReaderSince(reader, time.Now())
+	got := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 256)
+		n, _ := r.Read(buf)
+		got <- append([]byte(nil), buf[:n]...)
+	}()
+	select {
+	case raw := <-got:
+		if len(raw) == 0 {
+			t.Fatal("first read returned no event bytes")
+		}
+		if !strings.Contains(string(raw), "data:{") {
+			t.Fatalf("passthrough bytes=%q lack no-space data field", raw)
+		}
+	case <-time.After(2 * time.Second):
+		close(reader.release)
+		t.Fatal("stats wrapper buffered until a later LF/read")
+	}
+	close(reader.release)
+}
+
+func TestChatStatsReaderMultilineNoSpaceUsage(t *testing.T) {
+	raw := ": keepalive\r\r" +
+		"data:{\"usage\":{\r\n" +
+		"data:\"prompt_tokens\":4,\r\n" +
+		"data:\"completion_tokens\":7,\r\n" +
+		"data:\"total_tokens\":11,\"credit\":0.5}}\r\r"
+	r := newChatStatsReaderSince(strings.NewReader(raw), time.Now())
+	if _, err := io.Copy(io.Discard, r); err != nil {
+		t.Fatal(err)
+	}
+	u := r.Usage()
+	if !u.HasPromptTokens || u.PromptTokens != 4 || !u.HasCompletionTokens || u.CompletionTokens != 7 || !u.HasTotalTokens || u.TotalTokens != 11 {
+		t.Fatalf("usage=%+v, want 4/7/11", u)
+	}
+	if got, ok := r.Credit(); !ok || got != 0.5 {
+		t.Fatalf("credit=%v ok=%v, want 0.5/true", got, ok)
+	}
+}
+
+func TestTrackedResponseWriterRecordsActualCommit(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := &trackedResponseWriter{ResponseWriter: rec}
+	w.WriteHeader(http.StatusCreated)
+	_, _ = w.Write([]byte("body"))
+	if !w.committed || w.status != http.StatusCreated || rec.Code != http.StatusCreated {
+		t.Fatalf("tracked=%+v recorder status=%d", w, rec.Code)
+	}
+}
+
+type writeFailResponseWriter struct{ header http.Header }
+
+func (w *writeFailResponseWriter) Header() http.Header { return w.header }
+func (*writeFailResponseWriter) WriteHeader(int)       {}
+func (*writeFailResponseWriter) Write([]byte) (int, error) {
+	return 0, io.ErrClosedPipe
+}
+
+func TestTrackedResponseWriterRecordsWriteFailure(t *testing.T) {
+	w := &trackedResponseWriter{ResponseWriter: &writeFailResponseWriter{header: make(http.Header)}}
+	if _, err := w.Write([]byte("response")); err == nil {
+		t.Fatal("expected downstream write failure")
+	}
+	if !w.committed || !w.writeFailed || w.status != http.StatusOK {
+		t.Fatalf("tracked writer failed-write state=%+v", w)
+	}
+}
+
+func TestChatStatLogsCancellationAndCommitState(t *testing.T) {
+	withChatLog(t)
+	old := chatLogOut
+	var out bytes.Buffer
+	chatLogOut = &out
+	t.Cleanup(func() { chatLogOut = old })
+	s := &chatStat{start: time.Now(), model: "m", mode: "sync", status: 499, toks: -1, clientCancelled: true, responseCommitted: false}
+	s.done()
+	if !strings.Contains(out.String(), "client_cancelled=true response_committed=false response_write_failed=false") {
+		t.Fatalf("cancellation state missing from log: %q", out.String())
 	}
 }
 

@@ -141,8 +141,8 @@ type Handler struct {
 	degrade degradeGate
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
-	wafIP   wafIPGate
-	limiter *ModelLimiter
+	wafIP        wafIPGate
+	limiter      *ModelLimiter
 	modelBreaker *ModelCircuitBreaker
 }
 
@@ -929,8 +929,25 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
+	trackedWriter := &trackedResponseWriter{ResponseWriter: w}
+	w = trackedWriter
 	st := newChatStat(time.Now(), body, peek.Stream)
-	defer st.done()
+	defer func() {
+		st.responseCommitted = trackedWriter.committed
+		st.responseWriteFailed = trackedWriter.writeFailed
+		st.clientCancelled = r.Context().Err() != nil
+		if st.status == 0 {
+			switch {
+			case st.clientCancelled:
+				st.status = 499
+			case trackedWriter.status != 0:
+				st.status = trackedWriter.status
+			default:
+				st.status = http.StatusInternalServerError
+			}
+		}
+		st.done()
+	}()
 
 	tried := map[string]bool{}
 	var lastErr error
@@ -949,7 +966,6 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				acct = h.cfg.Pool.PickForModel(bareModel)
 			}
 			if acct != nil {
-				h.cfg.Session.Bind(sessKey, acct.UID)
 				stickyUID = acct.UID
 			}
 		} else {
@@ -996,7 +1012,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 幂等：stickyUID 已空则空操作；不会误解绑其他轮的绑定。仅当 Session != nil 时 stickyUID 才会非空。
 	unbindSticky := func() {
 		if stickyUID != "" {
-			h.cfg.Session.Unbind(sessKey)
+			h.cfg.Session.UnbindIfBound(sessKey, stickyUID)
 			stickyUID = ""
 		}
 	}
@@ -1313,22 +1329,36 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			}
 			continue
 		}
-		h.cfg.Pool.NoteSuccess(acct.UID)
-		// 模型级熔断恢复探测成功：主模型返回 200，若此前处于降级期则自动升级恢复。
-		if h.modelBreaker != nil {
-			h.modelBreaker.RecordSuccess(targetModel)
+		noteSuccess := func() {
+			h.cfg.Pool.NoteSuccess(acct.UID)
+			// 模型级熔断恢复探测成功：主模型返回 200，若此前处于降级期则自动升级恢复。
+			if h.modelBreaker != nil {
+				h.modelBreaker.RecordSuccess(targetModel)
+			}
+			// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
+			// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
+			h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
+			// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
+			// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
+			if sessKey != "" && h.cfg.Session != nil {
+				h.cfg.Session.Bind(sessKey, acct.UID)
+			}
 		}
-		// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
-		// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
-		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
-		// 粘性跟随最终成功号：本轮成功的账号成为该会话的粘性绑定（覆盖旧绑定）。
-		// 若 sticky 号失败、轮换到别的号成功，这里把会话重绑到新号，多轮对话下一跳不再随机抽。
-		if sessKey != "" && h.cfg.Session != nil {
-			h.cfg.Session.Bind(sessKey, acct.UID)
+
+		handleStreamFailure := func(reason string, err error) {
+			st.status = http.StatusBadGateway
+			log.Printf("WARN: [server] stream acct=%s model=%s: %s: %v", logfmt.Label(acct.UID, acct.Nickname), bareModel, reason, err)
+			h.cfg.Pool.NoteFailures(acct.UID)
+			if sessKey != "" && h.cfg.Session != nil {
+				h.cfg.Session.UnbindIfBound(sessKey, acct.UID)
+			}
+			if h.cfg.Upstream != nil {
+				h.cfg.Upstream.CloseIdleConnections()
+			}
 		}
+
 		if peek.Stream {
 			// 流式：透传结束后立即关闭上游 body，避免 defer 在轮转场景下堆积 fd。
-			st.status = http.StatusOK
 			stats := newChatStatsReaderSince(rc, st.start)
 			// gateway_hint（SSE）：成功状态 200 已开流，中途 error 帧透传时附加
 			// hint 字段（hintFn 惰性求值——正常流零开销，只有真撞到 error 帧才
@@ -1336,15 +1366,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			sErr := upstream.StreamHint(w, stats, upstream.FrameHintFunc(func() upstream.HintContext {
 				return h.hintContext(bareModel, reqHasImage)
 			}))
-			if upstream.IsEmptyStreamError(sErr) {
-				// 上游 200 但空流（0 有效帧）：StreamHint 已写 error 帧 + [DONE]
-				// 兜底（HTTP 头已发出只能 200），但这是上游缺陷不是成功——日志/
-				// 状态收敛到 502 观测，与非流式 Aggregate 空流→502 upstream_parse
-				// 同语义（此前 `_ =` 吞错把失败流记成 200，运维看到假成功）。
-				// 只认 IsEmptyStreamError：客户端断连的写失败不误标（人已走，
-				// 502 观测没有意义）。
-				st.status = http.StatusBadGateway
-				log.Printf("WARN: [server] stream acct=%s model=%s: empty upstream stream (200+0 frames)", logfmt.Label(acct.UID, acct.Nickname), bareModel)
+			if r.Context().Err() != nil || errors.Is(sErr, context.Canceled) {
+				// 客户端主动取消（如停止生成或断开连接）：记录 INFO，不惩罚账号，不清除会话绑定，不报警
+				log.Printf("INFO: [server] stream acct=%s model=%s: client canceled context: %v", logfmt.Label(acct.UID, acct.Nickname), bareModel, r.Context().Err())
+			} else if upstream.IsEmptyStreamError(sErr) {
+				handleStreamFailure("empty upstream stream (200+0 frames)", sErr)
+			} else if upstream.IsStreamTruncatedError(sErr) {
+				handleStreamFailure("stream truncated prematurely", sErr)
+			} else if upstream.IsUpstreamInStreamError(sErr) {
+				handleStreamFailure("upstream emitted in-stream error", sErr)
+			} else if sErr != nil {
+				log.Printf("INFO: [server] stream acct=%s model=%s: client stream ended: %v", logfmt.Label(acct.UID, acct.Nickname), bareModel, sErr)
+			} else {
+				st.status = http.StatusOK
+				noteSuccess()
 			}
 			cachedT, _ := stats.CachedTokens()
 			credit, hasCredit := stats.Credit()
@@ -1366,15 +1401,54 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			rc.Close()
 			return
 		}
-		resp, err := upstream.Aggregate(rc)
+		stats := newChatStatsReaderSince(rc, st.start)
+		resp, err := upstream.Aggregate(stats)
 		rc.Close()
 		if err != nil {
-			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, attemptStarted, 0, false)
-			// 上游流解析失败：客户端还没看到任何输出，回 502 并告知原因。
+			cachedT, _ := stats.CachedTokens()
+			credit, hasCredit := stats.Credit()
+			recordAttempt(acct.UID, stats.Usage(), cachedT, attemptStarted, credit, hasCredit)
+			if hasCredit {
+				if total, ok := stats.TotalTokens(); ok && total > 0 {
+					h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+				}
+			}
+			if toks, ok := stats.Tokens(); ok {
+				st.toks = toks
+			}
+			st.ttfb = stats.TTFB()
+			if r.Context().Err() != nil || errors.Is(err, context.Canceled) {
+				log.Printf("INFO: [server] aggregate acct=%s model=%s: client canceled context: %v", logfmt.Label(acct.UID, acct.Nickname), bareModel, r.Context().Err())
+				return
+			}
+			// 上游流解析失败或截断：客户端还没看到任何输出，回 502 并告知原因。
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_parse", err.Error())
 			st.status = http.StatusBadGateway
+			h.cfg.Pool.NoteFailures(acct.UID)
+			if sessKey != "" && h.cfg.Session != nil {
+				h.cfg.Session.UnbindIfBound(sessKey, acct.UID)
+			}
+			if h.cfg.Upstream != nil {
+				h.cfg.Upstream.CloseIdleConnections()
+			}
 			return
 		}
+		if r.Context().Err() != nil {
+			var cachedT int64
+			if u, ok := resp["usage"].(map[string]any); ok {
+				if c, hit := upstream.BestUsageCacheHitTokens(u); hit {
+					cachedT = c
+				}
+			}
+			credit, hasCredit := extractCreditFromResponse(resp)
+			recordAttempt(acct.UID, usageDeltaFromResponse(resp), cachedT, attemptStarted, credit, hasCredit)
+			if credit, total, ok := usageCreditTotal(resp); ok {
+				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+			}
+			log.Printf("INFO: [server] aggregate acct=%s model=%s: client canceled context after upstream completion: %v", logfmt.Label(acct.UID, acct.Nickname), bareModel, r.Context().Err())
+			return
+		}
+		noteSuccess()
 		var cachedT int64
 		if u, ok := resp["usage"].(map[string]any); ok {
 			if c, hit := upstream.BestUsageCacheHitTokens(u); hit {

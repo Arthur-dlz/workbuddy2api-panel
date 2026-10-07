@@ -1,8 +1,10 @@
 package upstream
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -173,12 +175,12 @@ func TestStripToolCallNames(t *testing.T) {
 	getFn := func(f map[string]any) map[string]any {
 		return f["choices"].([]any)[0].(map[string]any)["delta"].(map[string]any)["tool_calls"].([]any)[0].(map[string]any)["function"].(map[string]any)
 	}
-	seen := map[int]bool{}
+	seen := map[toolCallIdentity]bool{}
 
 	// 首片带 name：保留，seen 建立
 	f0 := mkFrame(0, "lookup", "")
 	stripToolCallNames(f0, seen)
-	if !seen[0] {
+	if !seen[toolCallIdentity{choice: 0, index: 0}] {
 		t.Fatal("index 0 should be marked seen after first chunk")
 	}
 	if getFn(f0)["name"] != "lookup" {
@@ -211,7 +213,7 @@ func TestStripToolCallNames(t *testing.T) {
 	if getFn(f3)["name"] != "other" {
 		t.Errorf("index 1 first name=%v want other", getFn(f3)["name"])
 	}
-	if !seen[1] {
+	if !seen[toolCallIdentity{choice: 0, index: 1}] {
 		t.Error("index 1 should be marked seen")
 	}
 
@@ -560,9 +562,9 @@ func TestStreamNoIdFallsBackToSentinel(t *testing.T) {
 }
 
 func TestStreamDoneFallback(t *testing.T) {
-	// 上游流在无 [DONE] 时 EOF，Stream 必须兜底写一个 [DONE]
+	// 上游流正常结束（带 finish_reason）但在无 [DONE] 时 EOF，Stream 必须兜底写一个 [DONE]
 	rec := httptest.NewRecorder()
-	err := Stream(rec, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+	err := Stream(rec, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -578,6 +580,23 @@ func TestStreamDoneFallback(t *testing.T) {
 	}
 	if n := strings.Count(rec2.Body.String(), "data: [DONE]"); n != 1 {
 		t.Errorf("[DONE] count=%d want 1: %q", n, rec2.Body.String())
+	}
+}
+
+// TestStreamTruncatedPrematurely 上游流吐了一部分数据但无 finish_reason 且无 [DONE] 即 EOF（典型中途断流事故）：
+// 必须向客户端写出 stream_truncated 错误帧与 [DONE]，且函数返回 errStreamTruncated。
+func TestStreamTruncatedPrematurely(t *testing.T) {
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader("data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"))
+	if !IsStreamTruncatedError(err) {
+		t.Fatalf("err=%v want errStreamTruncated", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"code":"stream_truncated"`) {
+		t.Errorf("body missing stream_truncated frame: %q", body)
+	}
+	if !strings.HasSuffix(strings.TrimRight(body, "\n"), "data: [DONE]") {
+		t.Errorf("missing [DONE] ending: %q", body)
 	}
 }
 
@@ -756,7 +775,7 @@ func TestStreamNormalPassthroughRegression(t *testing.T) {
 		raw  string
 	}{
 		{"带 DONE 的正常流", sseFixture},
-		{"漏发 DONE 自动补", "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n\n"},
+		{"正常完成漏发 DONE 自动补", "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\n"},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -890,5 +909,486 @@ func TestCreditPackagesExpiryTimestamp(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("gift pack missing Unix-ms expiry: %+v", packs)
+	}
+}
+
+// TestAggregateTruncatedError 验证非流式 Aggregate 在中途断流（有有效帧但未见 finish_reason 和 [DONE]）
+// 时，拒绝伪造假 200，明确返回 errStreamTruncated。
+func TestAggregateTruncatedError(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello truncated\"}}]}\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if !IsStreamTruncatedError(err) {
+		t.Fatalf("err=%v want errStreamTruncated, resp=%v", err, resp)
+	}
+}
+
+// TestStreamInStreamErrorHandling 验证上游在流中下发 error 帧时，Stream 返回 errUpstreamInStreamError。
+func TestStreamInStreamErrorHandling(t *testing.T) {
+	rec := httptest.NewRecorder()
+	raw := "data: {\"error\":{\"message\":\"Rate limit exceeded\",\"code\":6004}}\n\ndata: [DONE]\n\n"
+	err := Stream(rec, strings.NewReader(raw))
+	if !IsUpstreamInStreamError(err) {
+		t.Fatalf("err=%v want errUpstreamInStreamError", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Rate limit exceeded") || !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("unexpected body: %q", body)
+	}
+}
+
+func TestStreamMultilineErrorIsValidClientEvent(t *testing.T) {
+	raw := "data: {\n" +
+		"data:  \"error\": {\n" +
+		"data:    \"message\": \"Rate limit exceeded\",\n" +
+		"data:    \"code\": 6004\n" +
+		"data:  }\n" +
+		"data: }\n\n" +
+		"data: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	err := StreamHint(rec, strings.NewReader(raw), func(string) string { return "retry with another account" })
+	if !IsUpstreamInStreamError(err) {
+		t.Fatalf("err=%v want upstream in-stream error", err)
+	}
+	reader := newSSEEventReader(strings.NewReader(rec.Body.String()))
+	payload, complete, err := reader.readDataEvent()
+	if err != nil || !complete {
+		t.Fatalf("client SSE event complete=%v err=%v body=%q", complete, err, rec.Body.String())
+	}
+	var event map[string]any
+	if err := json.Unmarshal([]byte(payload), &event); err != nil {
+		t.Fatalf("client received invalid assembled JSON payload %q: %v", payload, err)
+	}
+	errObj, ok := event["error"].(map[string]any)
+	if !ok || errObj["message"] != "Rate limit exceeded" || errObj["code"] != float64(6004) || errObj["gateway_hint"] != "retry with another account" {
+		t.Fatalf("error passthrough or hint was lost: %#v", event)
+	}
+}
+
+type errReader struct {
+	content string
+	readErr error
+	offset  int
+}
+
+func (r *errReader) Read(p []byte) (n int, err error) {
+	if r.offset < len(r.content) {
+		n = copy(p, r.content[r.offset:])
+		r.offset += n
+		return n, nil
+	}
+	return 0, r.readErr
+}
+
+// TestStreamFinishReasonWithDirtyDisconnect 验证上游带有 finish_reason 但连接非干净断开时，视作正常完成收尾。
+func TestStreamFinishReasonWithDirtyDisconnect(t *testing.T) {
+	rec := httptest.NewRecorder()
+	raw := "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}]}\n\n"
+	r := &errReader{
+		content: raw,
+		readErr: errors.New("read tcp: connection reset by peer"),
+	}
+	err := Stream(rec, r)
+	if err != nil {
+		t.Fatalf("unexpected err=%v, should tolerate dirty disconnect after finish_reason", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("body missing [DONE]: %q", body)
+	}
+}
+
+func TestStreamCancellationAfterFinishPreservesIdentity(t *testing.T) {
+	input := "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+	err := Stream(httptest.NewRecorder(), &errReader{content: input, readErr: context.Canceled})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v must preserve context.Canceled after finish", err)
+	}
+}
+
+func TestAggregateReadErrorPreservesCancellationIdentity(t *testing.T) {
+	input := "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n"
+	_, err := Aggregate(&errReader{content: input, readErr: context.Canceled})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v must preserve context.Canceled after finish", err)
+	}
+}
+
+func TestAggregateFinishReasonToleratesDirtyDisconnect(t *testing.T) {
+	input := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"complete\"},\"finish_reason\":\"stop\"}]}\n\n"
+	resp, err := Aggregate(&errReader{content: input, readErr: errors.New("connection reset")})
+	if err != nil {
+		t.Fatalf("verified primary finish should tolerate dirty disconnect: %v", err)
+	}
+	choice := resp["choices"].([]any)[0].(map[string]any)
+	if choice["finish_reason"] != "stop" {
+		t.Fatalf("finish_reason=%v want stop", choice["finish_reason"])
+	}
+}
+
+// TestStreamZeroFramesFailure 验证首帧之前读取失败，写入 upstream_parse 错误帧并返回 errEmptyStream。
+func TestStreamZeroFramesFailure(t *testing.T) {
+	rec := httptest.NewRecorder()
+	r := &errReader{
+		content: "",
+		readErr: errors.New("wsarecv: connection reset"),
+	}
+	err := Stream(rec, r)
+	if !IsEmptyStreamError(err) {
+		t.Fatalf("err=%v want errEmptyStream", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"code":"upstream_parse"`) || !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("unexpected body: %q", body)
+	}
+}
+
+// TestAggregateInStreamError 验证非流式 Aggregate 在上游下发 error 帧时直接返回错误。
+func TestAggregateInStreamError(t *testing.T) {
+	raw := "data: {\"error\":{\"message\":\"Rate limit exceeded\",\"code\":6004}}\n\ndata: [DONE]\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if !IsUpstreamInStreamError(err) {
+		t.Fatalf("err=%v want errUpstreamInStreamError, resp=%v", err, resp)
+	}
+}
+
+func TestStreamNullFrameAfterID(t *testing.T) {
+	raw := "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"}}]}\n\n" +
+		"data: null\n\ndata: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	if err := Stream(rec, strings.NewReader(raw)); err != nil {
+		t.Fatalf("Stream panicked or rejected valid frames around null: %v", err)
+	}
+}
+
+func TestStreamErrorDominatesFinishReason(t *testing.T) {
+	raw := "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" +
+		"data:{\"error\":{\"message\":\"late failure\"}}\n\ndata: [DONE]\n\n"
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader(raw))
+	if !IsUpstreamInStreamError(err) {
+		t.Fatalf("err=%v want in-stream error to dominate finish reason", err)
+	}
+}
+
+func TestDonePrefixGarbageDoesNotCompleteStream(t *testing.T) {
+	raw := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n" +
+		"data: [DONE]garbage\n\n"
+	if _, err := Aggregate(strings.NewReader(raw)); !IsStreamTruncatedError(err) {
+		t.Fatalf("Aggregate err=%v want truncated for malformed DONE", err)
+	}
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader(raw))
+	if !IsStreamTruncatedError(err) {
+		t.Fatalf("Stream err=%v want truncated for malformed DONE", err)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, `"code":"stream_truncated"`) || strings.Count(body, "data: [DONE]\n\n") != 1 {
+		t.Fatalf("missing truncation error or exactly one DONE: %q", body)
+	}
+	if strings.Contains(body, "[DONE]garbage") {
+		t.Fatalf("malformed DONE leaked to client: %q", body)
+	}
+}
+
+func TestStreamParsesMultilineDataAndRequiresEventBoundary(t *testing.T) {
+	// Legal SSE data syntax permits no space after the colon and joins multiple data
+	// lines with newlines. The valid JSON event is then intentionally cut before its
+	// blank-line boundary and must not be promoted to a complete chunk.
+	raw := "data:{\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"}}]}\n" +
+		"data: [DONE]"
+	rec := httptest.NewRecorder()
+	err := Stream(rec, strings.NewReader(raw))
+	if !IsEmptyStreamError(err) {
+		t.Fatalf("err=%v want incomplete event to be discarded", err)
+	}
+	if strings.Contains(rec.Body.String(), `"content":"hi"`) {
+		t.Fatalf("unterminated event was forwarded: %q", rec.Body.String())
+	}
+}
+
+func TestSSEParserSupportsCRLFAndCRSeparators(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		sep  string
+	}{
+		{name: "CRLF", sep: "\r\n"},
+		{name: "CR", sep: "\r"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := "event: message" + tc.sep + "id: event-id" + tc.sep +
+				"data:{\"choices\":[" + tc.sep +
+				"data: {\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}" + tc.sep +
+				"data: ]}" + tc.sep + tc.sep + "data: [DONE]" + tc.sep + tc.sep
+			rec := httptest.NewRecorder()
+			if err := Stream(rec, strings.NewReader(raw)); err != nil {
+				t.Fatalf("Stream returned error: %v", err)
+			}
+			if !strings.Contains(rec.Body.String(), `"content":"hi"`) {
+				t.Fatalf("multiline event was not parsed: %q", rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), "event: message") || strings.Contains(rec.Body.String(), "id: event-id") {
+				t.Fatalf("SSE metadata was forwarded as raw data: %q", rec.Body.String())
+			}
+			if strings.Count(rec.Body.String(), "data: [DONE]\n\n") != 1 {
+				t.Fatalf("expected exactly one DONE: %q", rec.Body.String())
+			}
+		})
+	}
+}
+
+type blockingAfterDataReader struct {
+	data    []byte
+	sent    bool
+	release <-chan struct{}
+}
+
+func (r *blockingAfterDataReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, r.data), nil
+	}
+	<-r.release
+	return 0, io.EOF
+}
+
+type signalWriter struct{ wrote chan struct{} }
+
+func (w signalWriter) Header() http.Header { return make(http.Header) }
+func (w signalWriter) Write(p []byte) (int, error) {
+	if strings.Contains(string(p), `"content":"hi"`) {
+		select {
+		case w.wrote <- struct{}{}:
+		default:
+		}
+	}
+	return len(p), nil
+}
+func (signalWriter) WriteHeader(int) {}
+func (signalWriter) Flush()          {}
+
+func TestCROnlyEventFlushesBeforeNextUpstreamByte(t *testing.T) {
+	release := make(chan struct{})
+	wrote := make(chan struct{}, 1)
+	input := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\r\r"
+	done := make(chan error, 1)
+	go func() {
+		done <- Stream(signalWriter{wrote: wrote}, &blockingAfterDataReader{data: []byte(input), release: release})
+	}()
+	select {
+	case <-wrote:
+		close(release)
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("CR-only SSE event was not delivered before the reader produced another byte")
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("Stream returned error after upstream EOF: %v", err)
+	}
+}
+
+func TestEmptyJSONFramesAreNotSuccessful(t *testing.T) {
+	invalid := []struct {
+		name    string
+		payload string
+	}{
+		{name: "empty object", payload: `{}`},
+		{name: "usage without a completion choice", payload: `{"usage":{"completion_tokens":4}}`},
+		{name: "usage without a completion choice", payload: `{"usage":{"completion_tokens":4}}`},
+		{name: "null choice", payload: `{"choices":[null]}`},
+		{name: "empty choice", payload: `{"choices":[{}]}`},
+		{name: "unsupported delta", payload: `{"choices":[{"index":0,"delta":{"garbage":true}}]}`},
+		{name: "invalid finish reason", payload: `{"choices":[{"index":0,"delta":{},"finish_reason":"finished"}]}`},
+		{name: "secondary-only finish", payload: `{"choices":[{"index":1,"delta":{},"finish_reason":"stop"}]}`},
+		{name: "empty function call", payload: `{"choices":[{"index":0,"delta":{"function_call":{"name":"","arguments":""}}}]}`},
+		{name: "unsupported function call", payload: `{"choices":[{"index":0,"delta":{"function_call":{"garbage":true}}}]}`},
+		{name: "invalid tool call item", payload: `{"choices":[{"index":0,"delta":{"tool_calls":[null]}}]}`},
+		{name: "empty tool call item", payload: `{"choices":[{"index":0,"delta":{"tool_calls":[{}]}}]}`},
+	}
+	for _, frame := range invalid {
+		for _, parse := range []struct {
+			name string
+			call func(string) error
+		}{
+			{name: "aggregate", call: func(raw string) error { _, err := Aggregate(strings.NewReader(raw)); return err }},
+			{name: "stream", call: func(raw string) error { return Stream(httptest.NewRecorder(), strings.NewReader(raw)) }},
+		} {
+			t.Run(frame.name+"/"+parse.name, func(t *testing.T) {
+				err := parse.call("data: " + frame.payload + "\n\ndata: [DONE]\n\n")
+				if err == nil {
+					t.Fatal("empty choice event plus DONE must fail")
+				}
+			})
+		}
+	}
+}
+
+func TestAggregateRequiresPrimaryChoiceFinishReason(t *testing.T) {
+	for _, reason := range []string{"finished"} {
+		raw := "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"" + reason + "\"}]}\n\n" + "data: [DONE]\n\n"
+		if _, err := Aggregate(strings.NewReader(raw)); err == nil {
+			t.Errorf("reason %q: expected invalid terminal frame to fail", reason)
+		}
+	}
+	raw := "data: {\"choices\":[{\"index\":1,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n" + "data: [DONE]\n\n"
+	if _, err := Aggregate(strings.NewReader(raw)); err == nil {
+		t.Errorf("non-primary choice finish: expected invalid terminal frame to fail")
+	}
+}
+
+func TestReorderedChoicesPreservePrimaryTerminalFinish(t *testing.T) {
+	terminal := `data: {"choices":[{"index":1,"delta":{},"finish_reason":"stop"},{"index":0,"delta":{},"finish_reason":"content_filter"}]}` + "\n\ndata: [DONE]\n\n"
+	resp, err := Aggregate(strings.NewReader(terminal))
+	if err != nil {
+		t.Fatalf("Aggregate rejected primary terminal choice after secondary: %v", err)
+	}
+	choices := resp["choices"].([]any)
+	if len(choices) != 2 {
+		t.Fatalf("choices=%#v want both choices", choices)
+	}
+	if got := choices[0].(map[string]any)["finish_reason"]; got != "content_filter" {
+		t.Fatalf("primary finish_reason=%v want content_filter", got)
+	}
+	if got := choices[1].(map[string]any)["finish_reason"]; got != "stop" {
+		t.Fatalf("secondary finish_reason=%v want stop", got)
+	}
+
+	withContent := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"}}]}\n\n" + terminal
+	resp, err = Aggregate(strings.NewReader(withContent))
+	if err != nil {
+		t.Fatalf("Aggregate rejected content followed by reordered terminal choices: %v", err)
+	}
+	choice := resp["choices"].([]any)[0].(map[string]any)
+	message := choice["message"].(map[string]any)
+	if message["content"] != "answer" || choice["finish_reason"] != "content_filter" {
+		t.Fatalf("primary aggregate lost content or terminal metadata: %#v", choice)
+	}
+
+	w := httptest.NewRecorder()
+	if err := Stream(w, strings.NewReader(withContent)); err != nil {
+		t.Fatalf("Stream rejected reordered terminal choices: %v", err)
+	}
+	if !strings.Contains(w.Body.String(), `"finish_reason":"content_filter"`) {
+		t.Fatalf("Stream dropped primary terminal metadata: %s", w.Body.String())
+	}
+}
+
+func TestAggregatePreservesTerminalMetadataAndRefusal(t *testing.T) {
+	for _, reason := range []string{"content_filter", "function_call"} {
+		raw := "data: {\"choices\":[{\"index\":0,\"delta\":{\"refusal\":\"no\",\"function_call\":{\"name\":\"lookup\",\"arguments\":\"{}\"}},\"finish_reason\":\"" + reason + "\"}]}\n\ndata: [DONE]\n\n"
+		resp, err := Aggregate(strings.NewReader(raw))
+		if err != nil {
+			t.Fatalf("finish_reason %q rejected with DONE: %v", reason, err)
+		}
+		choices := resp["choices"].([]any)
+		choice := choices[0].(map[string]any)
+		if choice["finish_reason"] != reason {
+			t.Errorf("finish_reason=%v want %q", choice["finish_reason"], reason)
+		}
+		message := choice["message"].(map[string]any)
+		if message["refusal"] != "no" {
+			t.Errorf("refusal=%v want no", message["refusal"])
+		}
+		if fc, ok := message["function_call"].(map[string]string); !ok || fc["name"] != "lookup" || fc["arguments"] != "{}" {
+			t.Errorf("function_call=%#v", message["function_call"])
+		}
+	}
+	for _, reason := range []string{"content_filter", "function_call"} {
+		raw := "data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"" + reason + "\"}]}\n\n"
+		if _, err := Aggregate(strings.NewReader(raw)); err == nil {
+			t.Errorf("%q without [DONE] must not serve as a truncation fallback", reason)
+		}
+	}
+}
+
+func TestAggregateNoDoneRequiresEveryChoiceTrustedFinish(t *testing.T) {
+	raw := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"primary\"},\"finish_reason\":\"stop\"},{\"index\":1,\"delta\":{\"content\":\"secondary\"}}]}\n\n"
+	if _, err := Aggregate(strings.NewReader(raw)); err == nil {
+		t.Fatal("primary finish must not hide an unfinished secondary choice at EOF")
+	}
+	raw = "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"primary\"},\"finish_reason\":\"stop\"},{\"index\":1,\"delta\":{\"content\":\"secondary\"},\"finish_reason\":\"stop\"}]}\n\n"
+	resp, err := Aggregate(strings.NewReader(raw))
+	if err != nil {
+		t.Fatalf("all choices finished should be accepted at EOF: %v", err)
+	}
+	choices := resp["choices"].([]any)
+	if len(choices) != 2 || choices[0].(map[string]any)["index"] != 0 || choices[1].(map[string]any)["index"] != 1 {
+		t.Fatalf("choice indexes were not preserved: %#v", choices)
+	}
+	if choices[0].(map[string]any)["message"].(map[string]any)["content"] != "primary" || choices[1].(map[string]any)["message"].(map[string]any)["content"] != "secondary" {
+		t.Fatalf("choice content was merged across indexes: %#v", choices)
+	}
+}
+
+func TestStreamNoDoneRequiresEveryChoiceTrustedFinish(t *testing.T) {
+	raw := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"primary\"},\"finish_reason\":\"stop\"},{\"index\":1,\"delta\":{\"content\":\"secondary\"}}]}\n\n"
+	err := Stream(httptest.NewRecorder(), strings.NewReader(raw))
+	if !IsStreamTruncatedError(err) {
+		t.Fatalf("unfinished secondary choice must be reported truncated, err=%v", err)
+	}
+}
+
+func TestStreamToolNameStateIsPerChoice(t *testing.T) {
+	raw := "data: {\"choices\":[" +
+		"{\"index\":0,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"first\"}}]}}," +
+		"{\"index\":1,\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"second\"}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"},{\"index\":1,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	w := httptest.NewRecorder()
+	if err := Stream(w, strings.NewReader(raw)); err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	if !strings.Contains(w.Body.String(), `"name":"first"`) || !strings.Contains(w.Body.String(), `"name":"second"`) {
+		t.Fatalf("per-choice tool names were not independently preserved: %s", w.Body.String())
+	}
+}
+
+func TestErrorNullIsIgnoredButNonNullErrorDominatesDone(t *testing.T) {
+	valid := "data: {\"error\":null,\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+	if _, err := Aggregate(strings.NewReader(valid)); err != nil {
+		t.Fatalf("error:null should be ignored: %v", err)
+	}
+	invalid := "data: {\"error\":{\"message\":\"denied\"},\"choices\":[{\"index\":0,\"delta\":{\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+	if _, err := Aggregate(strings.NewReader(invalid)); !IsUpstreamInStreamError(err) {
+		t.Fatalf("non-null error must dominate DONE, err=%v", err)
+	}
+	if err := Stream(httptest.NewRecorder(), strings.NewReader(valid)); err != nil {
+		t.Fatalf("stream error:null: %v", err)
+	}
+}
+
+type failOnWriteResponse struct {
+	writes int
+	failAt int
+	err    error
+}
+
+func (w *failOnWriteResponse) Header() http.Header { return make(http.Header) }
+func (w *failOnWriteResponse) Write(p []byte) (int, error) {
+	w.writes++
+	if w.writes == w.failAt {
+		return 0, w.err
+	}
+	return len(p), nil
+}
+func (*failOnWriteResponse) WriteHeader(int) {}
+func (*failOnWriteResponse) Flush()          {}
+
+func TestStreamReturnsDownstreamErrorWhenDoneWriteFails(t *testing.T) {
+	want := errors.New("downstream closed")
+	w := &failOnWriteResponse{failAt: 2, err: want}
+	raw := "data: {\"error\":{\"message\":\"upstream failed\"}}\n\ndata: [DONE]\n\n"
+	err := Stream(w, strings.NewReader(raw))
+	if !errors.Is(err, want) {
+		t.Fatalf("err=%v want downstream write error", err)
+	}
+}
+
+func TestStreamReturnsDownstreamErrorWhenGeneratedErrorWriteFails(t *testing.T) {
+	want := errors.New("downstream closed")
+	w := &failOnWriteResponse{failAt: 2, err: want}
+	raw := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial\"}}]}\n\n"
+	err := Stream(w, strings.NewReader(raw))
+	if !errors.Is(err, want) {
+		t.Fatalf("err=%v want downstream error-event write error", err)
 	}
 }

@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -20,6 +21,7 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/redisstore"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 	"github.com/linguo2625469/workbuddy2api-panel/internal/upstream"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/usage"
 )
 
 // TestMain 默认关闭聊天表格日志（chatLogEnabled=false），消除 go test 期间的 stdout 噪音。
@@ -59,6 +61,13 @@ func newFakeUpstream(t *testing.T, behavior func(auth string) (status int, body 
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type closeCountingRoundTripper struct {
+	roundTripFunc
+	closed int
+}
+
+func (r *closeCountingRoundTripper) CloseIdleConnections() { r.closed++ }
 
 // bindStore 记录粘性绑定镜像调用（不联网），供 D4 端到端断言绑定收敛到最终成功号。
 type bindStore struct {
@@ -1656,5 +1665,403 @@ func TestCustomModeFingerprintSanitizePreserved(t *testing.T) {
 	}
 	if systemCount != 1 {
 		t.Errorf("want exactly 1 system message, got %d (all=%v)", systemCount, msgs)
+	}
+}
+
+// TestChatStreamTruncatedHandling 验证流式传输在中途遭遇截断（无 finish_reason，无 DONE）时：
+// 1. 客户端收到包含 stream_truncated 错误帧和 [DONE] 结尾；
+// 2. 账号被记失败 NoteFailures；
+// 3. 原粘性绑定被解除 Unbind；
+// 4. 不记 NoteSuccess。
+func TestChatStreamTruncatedHandling(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:   time.Hour,
+		Store: st,
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	// 预先绑定
+	sess.Bind("conv-trunc", "u1")
+
+	// 上游返回 200，但 body 只有半截 delta，没有 finish_reason 也无 DONE
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, "data: {\"id\":\"chatcmpl-1\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"半截\"}}]}\n\n", true
+	})
+	h := NewHandler(Config{
+		Pool:     p,
+		Upstream: up,
+		Session:  sess,
+	})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}],"metadata":{"conversation_id":"conv-trunc"}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// 验证客户端收到的内容包含 stream_truncated
+	body := rec.Body.String()
+	if !strings.Contains(body, `"code":"stream_truncated"`) {
+		t.Errorf("body missing stream_truncated error frame: %s", body)
+	}
+	if !strings.Contains(body, "data: [DONE]") {
+		t.Errorf("body missing [DONE]: %s", body)
+	}
+
+	// 验证账号被记失败 NoteFailures
+	status, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if status.ConsecutiveFails < 1 {
+		t.Errorf("ConsecutiveFails=%d want >=1", status.ConsecutiveFails)
+	}
+
+	// 验证粘性绑定已被解除
+	if uid, ok := st.lastUID("conv-trunc"); ok && uid != "" {
+		t.Errorf("session binding should be unbound, got %s", uid)
+	}
+}
+
+// TestChatAggregateTruncatedHandling 验证非流式请求在上游中途断流时：
+// 1. 客户端收到 502 Bad Gateway upstream_parse；
+// 2. 账号被记失败 NoteFailures；
+// 3. 原粘性绑定被解除 Unbind；
+// 4. 不记 NoteSuccess。
+func TestChatAggregateTruncatedHandling(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:   time.Hour,
+		Store: st,
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	sess.Bind("conv-trunc-agg", "u1")
+
+	// 上游返回 200，但 body 只有半截数据，无 finish_reason 无 DONE
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, "data: {\"id\":\"chatcmpl-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"半截\"}}]}\n\n", true
+	})
+	h := NewHandler(Config{
+		Pool:     p,
+		Upstream: up,
+		Session:  sess,
+	})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"metadata":{"conversation_id":"conv-trunc-agg"}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("code=%d want 502", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "upstream_parse") {
+		t.Errorf("body=%s want upstream_parse", rec.Body.String())
+	}
+
+	// 验证账号失败记账与粘性解除
+	status, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if status.ConsecutiveFails < 1 {
+		t.Errorf("ConsecutiveFails=%d want >=1", status.ConsecutiveFails)
+	}
+	if uid, ok := st.lastUID("conv-trunc-agg"); ok && uid != "" {
+		t.Errorf("session binding should be unbound, got %s", uid)
+	}
+}
+
+// TestChatStreamClientCancellation 验证下游客户端主动取消时，网关不惩罚账号、不清除粘性绑定
+func TestChatStreamClientCancellation(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:   time.Hour,
+		Store: st,
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	sess.Bind("conv-cancel", "u1")
+
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 200, "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n", true
+	})
+	h := NewHandler(Config{
+		Pool:     p,
+		Upstream: up,
+		Session:  sess,
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	// 立即取消模拟客户端断开
+	cancel()
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}],"metadata":{"conversation_id":"conv-cancel"}}`))
+	req = req.WithContext(ctx)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// 客户端取消不应增加账号的连续失败计数
+	status, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if status.ConsecutiveFails > 0 {
+		t.Errorf("ConsecutiveFails=%d want 0 on client cancel", status.ConsecutiveFails)
+	}
+	// 粘性绑定不应被清除
+	if uid, ok := st.lastUID("conv-cancel"); !ok || uid != "u1" {
+		t.Errorf("session binding should remain intact, got uid=%s ok=%v", uid, ok)
+	}
+}
+
+type cancelAfterSSEWrite struct {
+	*httptest.ResponseRecorder
+	cancel context.CancelFunc
+	once   sync.Once
+}
+
+func (w *cancelAfterSSEWrite) Write(p []byte) (int, error) {
+	n, err := w.ResponseRecorder.Write(p)
+	if strings.Contains(string(p), `"content":"hello"`) {
+		w.once.Do(w.cancel)
+	}
+	return n, err
+}
+
+func (w *cancelAfterSSEWrite) WriteString(s string) (int, error) { return w.Write([]byte(s)) }
+
+func (w *cancelAfterSSEWrite) Flush() { w.ResponseRecorder.Flush() }
+
+type cancelAwareBody struct {
+	ctx  context.Context
+	data []byte
+	sent bool
+}
+
+func (b *cancelAwareBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, b.data), nil
+	}
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+
+func (b *cancelAwareBody) Close() error { return nil }
+
+type cancelAtEOFBody struct {
+	data   []byte
+	sent   bool
+	cancel context.CancelFunc
+}
+
+func (b *cancelAtEOFBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, b.data), nil
+	}
+	b.cancel()
+	return 0, io.EOF
+}
+
+func (b *cancelAtEOFBody) Close() error { return nil }
+
+type cancelAfterDataReadBody struct {
+	data   []byte
+	sent   bool
+	cancel context.CancelFunc
+}
+
+func (b *cancelAfterDataReadBody) Read(p []byte) (int, error) {
+	if !b.sent {
+		b.sent = true
+		return copy(p, b.data), nil
+	}
+	b.cancel()
+	return 0, context.Canceled
+}
+
+func (b *cancelAfterDataReadBody) Close() error { return nil }
+
+func degradedRecoveryProbe(b *ModelCircuitBreaker, model string) {
+	b.RecordDegraded(model, "fallback", time.Now().Add(time.Hour), "test")
+	b.mu.Lock()
+	b.models[model].degradedUntil = time.Now().Add(-time.Second)
+	b.mu.Unlock()
+}
+
+func TestChatStreamMidFlightCancellationDoesNotCountAsFailure(t *testing.T) {
+	store := newBindStore()
+	sess := session.New(session.Config{TTL: time.Hour, Store: store})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	sess.Bind("conv-mid-cancel", "u1")
+	h := NewHandler(Config{
+		Pool:    p,
+		Session: sess,
+		Upstream: &upstream.Client{
+			HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				body := "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"}}]}\n\n"
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       &cancelAwareBody{ctx: r.Context(), data: []byte(body)},
+				}, nil
+			})},
+			ChatBaseCN: "https://fake.example",
+		},
+	})
+	// A degraded state makes an accidental RecordSuccess observable as well.
+	h.modelBreaker = NewModelCircuitBreaker()
+	degradedRecoveryProbe(h.modelBreaker, "glm-5.2")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}],"metadata":{"conversation_id":"conv-mid-cancel"}}`)).WithContext(ctx)
+	rec := &cancelAfterSSEWrite{ResponseRecorder: httptest.NewRecorder(), cancel: cancel}
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status=%d want 200 after stream started", rec.Code)
+	}
+	status, ok := p.Status("u1")
+	if !ok || status.ConsecutiveFails != 0 {
+		t.Errorf("account failure count changed on client cancellation: %+v ok=%v", status, ok)
+	}
+	if uid, ok := store.lastUID("conv-mid-cancel"); !ok || uid != "u1" {
+		t.Errorf("session binding should remain intact, got uid=%s ok=%v", uid, ok)
+	}
+	if got := h.modelBreaker.Snapshot(); len(got) != 1 || got[0].Status != "probing" || got[0].Reason != "test" {
+		t.Errorf("client cancellation must not recover model breaker: %+v", got)
+	}
+}
+
+func TestChatAggregateCancellationAtCompletionDoesNotCountAsSuccess(t *testing.T) {
+	store := newBindStore()
+	sess := session.New(session.Config{TTL: time.Hour, Store: store})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	sess.Bind("conv-agg-cancel", "u1")
+	usageRecorder := usage.New("")
+	ctx, cancel := context.WithCancel(context.Background())
+	h := NewHandler(Config{
+		Pool:    p,
+		Session: sess,
+		Usage:   usageRecorder,
+		Upstream: &upstream.Client{
+			HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				body := "data: {\"id\":\"x1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hello\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":2,\"completion_tokens\":3,\"total_tokens\":5}}\n\n"
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+					Body:       &cancelAtEOFBody{data: []byte(body), cancel: cancel},
+				}, nil
+			})},
+			ChatBaseCN: "https://fake.example",
+		},
+	})
+	h.modelBreaker = NewModelCircuitBreaker()
+	degradedRecoveryProbe(h.modelBreaker, "glm-5.2")
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"metadata":{"conversation_id":"conv-agg-cancel"}}`)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	status, ok := p.Status("u1")
+	if !ok || status.ConsecutiveFails != 0 {
+		t.Errorf("account failure count changed on client cancellation: %+v ok=%v", status, ok)
+	}
+	if status.TokenUsage.RequestCount != 1 || status.TokenUsage.UsageCount != 1 || status.TokenUsage.TotalTokens != 5 {
+		t.Errorf("completed upstream usage should still be recorded on downstream cancellation: %+v", status.TokenUsage)
+	}
+	if got := usageRecorder.Snapshot(0, nil).Totals; got.Requests != 1 || got.TotalTokens != 5 {
+		t.Errorf("usage time series should retain completed upstream response: %+v", got)
+	}
+	if uid, ok := store.lastUID("conv-agg-cancel"); !ok || uid != "u1" {
+		t.Errorf("session binding should remain intact, got uid=%s ok=%v", uid, ok)
+	}
+	if got := h.modelBreaker.Snapshot(); len(got) != 1 || got[0].Status != "probing" || got[0].Reason != "test" {
+		t.Errorf("client cancellation must not recover model breaker: %+v", got)
+	}
+}
+
+func TestChatAggregateCancellationAfterObservedUsageKeepsUsageWithout502(t *testing.T) {
+	store := newBindStore()
+	sess := session.New(session.Config{TTL: time.Hour, Store: store})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	sess.Bind("conv-agg-read-cancel", "u1")
+	usageRecorder := usage.New("")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	body := `data: {"id":"x1","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5,"credit":0.25}}` + "\n\n"
+	h := NewHandler(Config{
+		Pool: p, Session: sess, Usage: usageRecorder,
+		Upstream: &upstream.Client{
+			HTTP: &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"text/event-stream"}}, Body: &cancelAfterDataReadBody{data: []byte(body), cancel: cancel}}, nil
+			})},
+			ChatBaseCN: "https://fake.example",
+		},
+	})
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}],"metadata":{"conversation_id":"conv-agg-read-cancel"}}`)).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	oldEnabled, oldOut := chatLogEnabled, chatLogOut
+	chatLogEnabled = true
+	var logOut strings.Builder
+	chatLogOut = &logOut
+	t.Cleanup(func() { chatLogEnabled, chatLogOut = oldEnabled, oldOut })
+	h.ServeHTTP(rec, req)
+	if rec.Body.Len() != 0 {
+		t.Fatalf("canceled request wrote a synthetic response: %q", rec.Body.String())
+	}
+	status, ok := p.Status("u1")
+	if !ok || status.ConsecutiveFails != 0 || status.TokenUsage.TotalTokens != 5 || status.TokenUsage.RequestCount != 1 {
+		t.Fatalf("cancelled usage/failure state=%+v ok=%v", status, ok)
+	}
+	if got := usageRecorder.Snapshot(0, nil).Totals; got.Requests != 1 || got.TotalTokens != 5 {
+		t.Fatalf("usage time series lost observed usage: %+v", got)
+	}
+	if uid, ok := store.lastUID("conv-agg-read-cancel"); !ok || uid != "u1" {
+		t.Fatalf("client cancellation removed binding: %q ok=%v", uid, ok)
+	}
+	if !strings.Contains(logOut.String(), "| 499 |") || !strings.Contains(logOut.String(), "client_cancelled=true response_committed=false") {
+		t.Fatalf("cancellation response state not logged accurately: %q", logOut.String())
+	}
+}
+
+// TestChatInStreamErrorHandling 验证上游在流中下发 error 帧时，触发失败处置，绝不记录成功
+func TestChatInStreamErrorHandling(t *testing.T) {
+	st := newBindStore()
+	sess := session.New(session.Config{
+		TTL:   time.Hour,
+		Store: st,
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	sess.Bind("conv-err", "u1")
+
+	rt := &closeCountingRoundTripper{roundTripFunc: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader("data: {\"error\":{\"message\":\"Rate limit exceeded\",\"code\":6004}}\n\ndata: [DONE]\n\n")),
+		}, nil
+	})}
+	up := &upstream.Client{HTTP: &http.Client{Transport: rt}, ChatBaseCN: "https://fake.example"}
+	h := NewHandler(Config{
+		Pool:     p,
+		Upstream: up,
+		Session:  sess,
+	})
+
+	req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}],"metadata":{"conversation_id":"conv-err"}}`))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// 验证账号被记失败
+	status, ok := p.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if status.ConsecutiveFails < 1 {
+		t.Errorf("ConsecutiveFails=%d want >=1 on in-stream error", status.ConsecutiveFails)
+	}
+	// 验证粘性绑定已被清除
+	if uid, ok := st.lastUID("conv-err"); ok && uid != "" {
+		t.Errorf("session binding should be unbound, got %s", uid)
+	}
+	if rt.closed != 1 {
+		t.Errorf("CloseIdleConnections calls=%d want 1 after upstream in-stream error", rt.closed)
 	}
 }
