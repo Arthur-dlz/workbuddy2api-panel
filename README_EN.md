@@ -28,6 +28,15 @@
 
 ---
 
+## 1.5.0 Changes
+
+- Preserve SSE terminal metadata, heartbeats, refusal and separate choices; reject incomplete or erroneous responses instead of recording success.
+- Preserve observed usage on cancellation, correct response logging, prevent stale session updates and retry failed persistence. Task failures retain partial progress; cancellation reaches upstream requests and normal shutdown joins background workers.
+- Stop if first-run configuration cannot be created, unless a nonempty `WB2A_API_KEY` is explicitly supplied. Save login credentials atomically with POSIX file mode `0600` and directory mode `0700`, without printing tokens.
+- Fix Windows clipboard failure handling and CI version extraction.
+
+**Version scope:** 1.5.0 applies to the current source. The precompiled executables already in the repository were not replaced by this source update. Build from the current source to use these fixes and check the panel overview's `version` field.
+
 ## 📖 Overview
 
 **WorkBuddy Gateway** wraps Tencent WorkBuddy (formerly CodeBuddy, official domains `copilot.tencent.com` / `workbuddy.cn`) accounts into standard OpenAI-compatible `/v1/chat/completions` endpoints.
@@ -71,9 +80,9 @@ The repository **already includes pre-compiled binaries** (`workbuddy-gateway.ex
 2. Double-click **`start.bat`**:
    - The gateway launches quietly in the background with a Windows taskbar tray icon.
    - Automatically opens the Web Console at `http://127.0.0.1:9527/panel/`.
-   - On the first run, a recommended `config.json` with a high-entropy random API key is created automatically.
+   - The current source creates a recommended `config.json` with a random API key on first run. If creation fails, startup stops unless a nonempty `WB2A_API_KEY` is explicitly supplied.
 3. For live debugging with real-time log streaming, double-click **`debug.bat`**.
-4. To gracefully stop the background gateway, double-click **`stop.bat`**.
+4. Use the tray's Exit command or foreground `Ctrl+C` for normal shutdown and task cleanup in the current source. **`stop.bat`** uses `taskkill /F`; forced termination cannot guarantee final persistence or task cleanup.
 
 ---
 
@@ -81,11 +90,13 @@ The repository **already includes pre-compiled binaries** (`workbuddy-gateway.ex
 
 ```bash
 # 1. Clone
-git clone https://github.com/linguo2625469/workbuddy2api-panel.git
+git clone https://github.com/Arthur-dlz/workbuddy2api-panel.git
 cd workbuddy2api-panel
 
 # 2. Prepare configuration
 cp config.example.json config.json
+# Edit config.json: port=7863, listen=":7863" to match the container mapping.
+# Set api_key explicitly; an empty value disables authentication and is not regenerated.
 
 # 3. Start containers
 docker compose up -d --build
@@ -98,13 +109,16 @@ docker compose up -d --build
 
 ### GHCR Container Image
 
+The repository's CI publishes images under its own GHCR namespace. Confirm that the image has been published successfully and is accessible before using this command.
+
 ```bash
 mkdir -p auths data && cp config.example.json config.json
+# Edit config.json: port=7863, listen=":7863", and set a nonempty api_key.
 
 docker run -d --name workbuddy2api \
   -p 7863:7863 -e TZ=Asia/Shanghai \
   -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
-  ghcr.io/linguo2625469/workbuddy2api-panel:latest
+  ghcr.io/arthur-dlz/workbuddy2api-panel:latest
 ```
 
 ---
@@ -126,6 +140,8 @@ go build -ldflags="-s -w -H windowsgui" -o workbuddy-gateway-tray.exe ./main.go
 ## ⚙️ Configuration
 
 Configuration is managed via `config.json` (see `config.example.json` for reference). Key settings can be modified live through the Web Panel:
+
+An explicitly empty `api_key` disables authentication; random key generation happens only when creating a missing first-run config. `login.sh` requires Python 3 and uses `scripts/write_auth.py` for atomic credential replacement. On POSIX, credential files use `0600` and both new and existing credential directories use `0700`; the login user must own the directory. Windows access control uses system ACLs.
 
 ```json
 {

@@ -27,6 +27,15 @@
 > 本项目源自并大幅扩展了 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) 的开源生态，全面重构了现代化可视化运维控制台、Windows 原生无黑框系统托盘（开箱即用免编译）、DeepSeek 风格日历用量与前缀缓存统计、官方 0.014 元/积分基准台账、模型级实测延迟与吞吐速率监控、工业级连接自愈与 $\pi$ 抖动调度体系，以及 17/18 成长任务纯 API 逆向自动化闭环。
 > 差异概览见 [与上游的差异](#-与上游的差异)；遵循 MIT 协议开源。
 
+## 1.5.0 更新
+
+- 修复 SSE 结束状态、心跳与用量统计，保留拒答和多 choice 独立结果；不完整或错误的响应不再被当作成功。
+- 修复取消后的记账和日志、会话绑定竞态及落盘失败重试；任务失败保留实际进度，取消会传递到上游请求，正常退出时等待后台任务结束。
+- 首次创建配置失败时停止启动，除非显式设置非空 `WB2A_API_KEY`；登录凭证原子写入，POSIX 文件权限为 `0600`、目录为 `0700`，不打印 token 内容。
+- 修复 Windows 托盘复制失败处理，以及 CI 版本提取。
+
+**版本范围**：本次 1.5.0 对应源码。仓库根目录已有的预编译 exe 未随本次源码修复替换；使用 1.5.0 请按下文从当前源码构建，并在面板 overview 的 `version` 字段确认版本。
+
 ## 项目简介
 
 WorkBuddy Gateway 是一个自托管的 **OpenAI 兼容反向代理网关**，将腾讯 WorkBuddy（原 CodeBuddy，官方域名 `copilot.tencent.com` / `workbuddy.cn`）账号包装为标准的 `/v1/chat/completions` 服务。
@@ -126,7 +135,7 @@ WorkBuddy Gateway 是一个自托管的 **OpenAI 兼容反向代理网关**，�
 | **浏览器内 OAuth 添加账号** | 面板「添加账号」按钮完成设备授权 → 凭证落盘 → **热加载进池（免重启）**，替代命令行 `login.sh` 流程 |
 | **在线配置编辑（热生效）** | 面板直接改 `config.json`：API 密钥 / `soft_rate` / 脱敏开关 / 池参数 / 任务排程**立即生效**；装配期字段（listen 等）保存后提示需重启。写入采用深合并 + 原子替换，保留未知键 |
 | **积分任务体系** | 任务列表 / 接受 / 领取接口 + 面板弹窗；「一键完成」覆盖 **17 个任务**（对话 / 领养 / 桌面行为链 / 模板 / 灵感案例 / 画布 / 专家召唤 / 技能尝鲜 / 主题 / 资料库 / 夜猫子等），推进进度、等待异步计分落定后**自动领奖**，纯 API 零客户端依赖 |
-| **首启自动生成配置** | 目录下无 `config.json` 时自动生成推荐配置（含 `crypto/rand` 随机 `api_key`），双击即开 |
+| **首启自动生成配置** | 目录下无 `config.json` 时生成推荐配置（含随机 `api_key`）；生成失败时停止启动，显式非空 `WB2A_API_KEY` 可使用环境配置 |
 | **粘性会话内容回退** | 客户端不发 `conversation_id` 时，用 `system + 首条 user` 哈希派生会话键（`d-` 前缀），通用 OpenAI 客户端也能享受粘性 |
 | **余额后台刷新** | `schedule.balance_refresh_minutes`（默认 5）周期查余额并更新池，冷却账号余额恢复自动解冻 |
 | **模型能力透出** | `/v1/models` 附带 `supported_efforts` / `default_effort` / 积分倍率 / 输入输出上限等上游真实字段 |
@@ -214,11 +223,12 @@ flowchart LR
 1. **一键后台静默运行（推荐）**：
    - 双击 **`start.bat`** 即可在后台静默启动（带原生 Windows 系统托盘图标，右键提供面板与 Key 快捷菜单）；
    - 自动在默认浏览器中打开控制台 **`http://127.0.0.1:9527/panel/`**；
-   - 首次启动若目录下无 `config.json`，会自动生成推荐配置（含高强随机生成的 `api_key`）。
+   - 当前源码首次启动若目录下无 `config.json`，会生成推荐配置（含随机 `api_key`）；无法创建时停止启动，除非显式设置非空 `WB2A_API_KEY`。
 2. **控制台调试模式**：
    - 双击 **`debug.bat`**，控制台窗口将实时滚屏输出请求明细与任务调度日志，便于排查链路；
-3. **一键安全停止**：
-   - 双击 **`stop.bat`** 即可安全优雅退出网关进程。
+3. **停止进程**：
+   - 当前源码可通过托盘「退出」或前台 `Ctrl+C` 正常退出并等待任务收尾。
+   - **`stop.bat`** 使用 `taskkill /F` 强制终止，不能保证任务收尾和最后落盘。
 
 如果需要自行从源码构建最新二进制：
 
@@ -238,12 +248,13 @@ exe 为**单文件自包含**（前端资源与静态资产已 embed 进二进�
 
 ```bash
 # 1. 克隆
-git clone https://github.com/linguo2625469/workbuddy2api-panel.git
+git clone https://github.com/Arthur-dlz/workbuddy2api-panel.git
 cd workbuddy2api-panel
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
 cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+#    编辑 config.json：port=7863、listen=":7863"，与下方容器端口一致
+#    设置 api_key；显式留空会关闭鉴权，不会自动生成密钥
 
 # 3. 启动（首次会构建镜像，约 1-2 分钟）
 docker compose up -d --build
@@ -267,18 +278,19 @@ docker compose down             # 停止并移除容器（数据在 ./auths 与 
 
 ### 方式三：GHCR 镜像（免克隆免构建）
 
-CI 会自动构建多架构镜像（`amd64` / `arm64`）并发布到 GHCR，`git clone` 之外的部署路径：
+本仓库 CI 会构建多架构镜像（`amd64` / `arm64`）并发布到 GHCR；确认相应镜像已成功发布且可访问后，可使用以下部署路径：
 
 ```bash
 # 1. 准备配置与数据目录
 mkdir -p auths data && cp config.example.json config.json
-#    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
+#    编辑 config.json：port=7863、listen=":7863"，与下方容器端口一致
+#    设置 api_key；显式留空会关闭鉴权，不会自动生成密钥
 
 # 2. 拉取并运行
 docker run -d --name workbuddy2api \
   -p 7863:7863 -e TZ=Asia/Shanghai \
   -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
-  ghcr.io/linguo2625469/workbuddy2api-panel:latest
+  ghcr.io/arthur-dlz/workbuddy2api-panel:latest
 
 # 3. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
@@ -588,7 +600,7 @@ http://127.0.0.1:9527/panel/
 
 | 端点 | 鉴权 | 说明 |
 |---|---|---|
-| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；请求体上限 8 MiB |
+| `POST /v1/chat/completions` | Bearer（`api_key` 非空时） | OpenAI 兼容补全；流式/非流式；网关无固定请求体大小上限，HTTP body 读取超时为 60 秒 |
 | `GET /v1/models` | Bearer（`api_key` 非空时） | 模型列表（纯动态拉取，缓存 1h；失败返回空列表 + 5min 负缓存）；每模型带 `context_length`/`max_output_tokens`（四级查找链：上游目录 → 内置知识表 → model.json 缓存 → models.dev）、`reasoning_supported_efforts`/`reasoning_default_effort` 思考档位及描述/标签/倍率等全字段（上游有返回时） |
 | `GET /status` | Bearer（`api_key` 非空时） | 账号状态汇总 + 每账号详情（积分/冷却/熔断/在途/粘性） |
 | `GET /healthz` | 无 | 健康检查：有 healthy 且未占满账号返回 200，否则 503；响应带身份标识（见下） |
@@ -672,7 +684,7 @@ http://127.0.0.1:9527/panel/
 
 多阶段镜像（`golang:1.23-alpine` 构建 → `alpine:3.20` 运行）一次编译全部四个二进制并随镜像分发：
 
-- **wb2api**（主服务）、**signin_bin**、**login**、**credit** + 脚本（`login.sh` / `signin.sh` / `credit.sh` / `scripts/probe_active.py`）
+- **wb2api**（主服务）、**signin_bin**、**login**、**credit** + 脚本（`login.sh` / `signin.sh` / `credit.sh` / `scripts/probe_active.py` / `scripts/write_auth.py`）
 - 以 `app` 用户（uid 10001）运行，`app/auths` 与 `app/data` 预建
 - 镜像内默认落 `config.example.json` 作为空配置（不含密钥），生产用挂载卷覆盖 `/app/config.json`
 - 内置 `HEALTHCHECK`（`wget /healthz`，30s 间隔）
@@ -730,7 +742,7 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 - **位置**：`./auths`（`auth_dir` 可配），文件名 `workbuddy-<uid>.json`
 - **内容**：明文 `accessToken` / `refreshToken` + 账号元信息（`account.uid` / `enterpriseId` / `nickname`）
-- **权限**：容器内以 `app` 用户（uid 10001）运行；token 刷新由 `SaveAtomic` 以 `0600` 原子写回（tmp + rename）；`login.sh` 首次落盘遵循登录 umask，建议手动 `chmod 600 auths/*.json`
+- **权限**：容器内以 `app` 用户（uid 10001）运行；token 刷新由 `SaveAtomic` 以 `0600` 原子写回（tmp + rename）；`login.sh` 通过 `scripts/write_auth.py` 原子保存凭证，POSIX 文件为 `0600`，新建及已有的凭证目录收紧为 `0700`。目录须由运行用户拥有；Windows 的访问权限由系统 ACL 管理。
 - **切勿提交 git**：`.gitignore` 已排除 `auths/`、`data/`、`backups/`、`config.json`、`*.key`、`*.pem`、`*.env`、`docs/` 及除 README 外的全部 `*.md` 工作文档
 
 ### 2. 网络暴露与日志敏感度

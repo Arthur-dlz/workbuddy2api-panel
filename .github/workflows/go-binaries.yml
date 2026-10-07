@@ -57,7 +57,13 @@ jobs:
 
       - name: 取源码版本号
         id: ver
-        run: echo "v=$(grep -oP 'appVersion = "\K[^"]+' cmd/server/main.go)" >> "$GITHUB_OUTPUT"
+        run: |
+          V=$(grep -oP 'const appVersion = "\K[^" ]+' internal/runner/runner.go || true)
+          if [[ -z "$V" ]]; then
+            echo "::error::could not extract non-empty appVersion from internal/runner/runner.go"
+            exit 1
+          fi
+          echo "v=$V" >> "$GITHUB_OUTPUT"
 
       - name: 构建（剥离符号，对齐本地发布口径）
         env:
@@ -70,6 +76,10 @@ jobs:
       - name: 断言二进制版本串
         run: |
           BIN="wb2api${{ matrix.goos == 'windows' && '.exe' || '' }}"
+          if [[ -z "${{ steps.ver.outputs.v }}" ]]; then
+            echo "::error::source version is empty; refusing a vacuous binary assertion"
+            exit 1
+          fi
           if ! grep -qa "${{ steps.ver.outputs.v }}" "$BIN"; then
             echo "::error::binary missing version string ${{ steps.ver.outputs.v }}"
             exit 1
@@ -111,7 +121,11 @@ jobs:
           fetch-depth: 0   # 取历史 tag 算 compare 链接
       - name: tag 与源码版本一致性断言
         run: |
-          SRC=$(grep -oP 'appVersion = "\K[^"]+' cmd/server/main.go)
+          SRC=$(grep -oP 'const appVersion = "\K[^" ]+' internal/runner/runner.go || true)
+          if [[ -z "$SRC" ]]; then
+            echo "::error::could not extract non-empty appVersion from internal/runner/runner.go"
+            exit 1
+          fi
           SRC="${SRC%-panel}"   # appVersion 带 -panel 后缀，比对前剥掉
           TAG="${GITHUB_REF_NAME#v}"
           if [[ "$GITHUB_REF_NAME" != *-ci ]]; then
