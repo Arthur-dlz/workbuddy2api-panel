@@ -10,6 +10,7 @@ import (
 	"log"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 
 	"sync"
@@ -1499,6 +1500,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 上游原文优先：透传 code/msg/requestId，不拼接本地前缀。
 			msg = s
 		}
+	}
+	// Retry-After：优先上游错误携带值；否则用池内最早恢复时刻。
+	// 该末端块本身就是 503/429 路径，无需额外条件。w.Header() 必须在
+	// writeOpenAIErrorHint 之前设置（其只 Set Content-Type，不清已设头）。
+	var ue2 *upstream.Error
+	if errors.As(lastErr, &ue2) && ue2.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(ue2.RetryAfter.Seconds())+1))
+	} else if rt, ok := h.cfg.Pool.EarliestRecovery(realm); ok && time.Until(rt) > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(int(time.Until(rt).Seconds())+1))
 	}
 	writeOpenAIErrorHint(w, status, code, msg, hint)
 	st.status = status

@@ -27,6 +27,8 @@ type Config struct {
 	Models      map[string]string     `json:"models"`                 // 模型别名字典 (如 deepseek-chat -> tencent-code-v3)
 	ModelRoutes []livecfg.ModelRoute  `json:"model_routes,omitempty"` // 中转站级模型路由规则
 	Tokens      []livecfg.TokenConfig `json:"tokens,omitempty"`       // 多 API 令牌配置
+	// MaxRotate 单请求最多换号次数（默认 3；0/负=默认）。重启生效。
+	MaxRotate int `json:"max_rotate,omitempty"`
 
 	Panel struct {
 		// PackageDetailLimit 积分构成页单账号默认展示的最近到期包数；<=0 回落 5。

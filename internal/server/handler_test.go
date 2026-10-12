@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2063,5 +2064,36 @@ func TestChatInStreamErrorHandling(t *testing.T) {
 	}
 	if rt.closed != 1 {
 		t.Errorf("CloseIdleConnections calls=%d want 1 after upstream in-stream error", rt.closed)
+	}
+}
+
+// TestPoolExhausted503CarriesRetryAfter 全池不可用（唯一账号 429 冷却后 MaxRotate=1
+// 耗尽）时，末端 503 必须携带 Retry-After 头——值取自池内最早恢复时刻（约等于注入的
+// SoftCooldown）。用现有 ServeHTTP 端到端 mock 驱动到末端 503 路径（不调内部函数伪造）。
+func TestPoolExhausted503CarriesRetryAfter(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		// 429 限流（无重置文案）→ 账号级 soft 冷却被写入，轮转耗尽后进末端块。
+		return 429, `{"code":1,"msg":"The model provider is rate-limiting requests. Please wait a moment and try again."}`, false
+	})
+	p := testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999})
+	const soft = 45 * time.Second
+	// MaxRotate=1：单账号 429 一轮即耗尽 → 必然落到末端错误块。
+	h := NewHandler(Config{Pool: p, Upstream: up, SoftCooldown: soft, MaxRotate: 1})
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 503 && rec.Code != 429 {
+		t.Fatalf("code=%d body=%s (want 503/429 exhausted)", rec.Code, rec.Body)
+	}
+	ra := rec.Header().Get("Retry-After")
+	if ra == "" {
+		t.Fatalf("Retry-After header missing on pool-exhausted response (code=%d)", rec.Code)
+	}
+	secs, err := strconv.Atoi(ra)
+	if err != nil || secs <= 0 {
+		t.Fatalf("Retry-After=%q not a positive integer", ra)
+	}
+	if secs > int(soft/time.Second)+5 {
+		t.Errorf("Retry-After=%ds exceeds expected ~%ds", secs, int(soft/time.Second))
 	}
 }

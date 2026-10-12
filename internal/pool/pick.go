@@ -336,6 +336,45 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string, minCredits in
 	return e.a
 }
 
+// EarliestRecovery 返回池内非禁用账号的最早预计恢复时刻：账号级
+// 冷却/熔断/降权（entry.expiry）与模型级冷却（modelCooldowns.Until）的并集
+// 取最早未来时刻；realm 非空时只统计该域。无在冷却账号返回 false。
+// 供 503/429 响应携带 Retry-After（对齐 CLIProxyAPI selector.go:353-362）。
+// 只读遍历，持读锁即可（entry 冷却字段均在 p.mu 写锁下写，读安全）。
+func (p *Pool) EarliestRecovery(realm string) (time.Time, bool) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	var best time.Time
+	found := false
+	for _, e := range p.byUID {
+		if e.disabled {
+			continue // 禁用账号不计入恢复时刻（等人工/签到，非自愈）
+		}
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		// 账号级：冷却/熔断/降权取最早生效截止。
+		if t := e.expiry(now); !t.IsZero() {
+			if !found || t.Before(best) {
+				best = t
+				found = true
+			}
+		}
+		// 模型级：任一模型级冷却未到期即计入（并集取最早未来时刻）。
+		for _, mc := range e.modelCooldowns {
+			if mc.Until.IsZero() || !now.Before(mc.Until) {
+				continue
+			}
+			if !found || mc.Until.Before(best) {
+				best = mc.Until
+				found = true
+			}
+		}
+	}
+	return best, found
+}
+
 // pickEarliestExpiryLocked 全冷却兜底：在非禁用的软冷却/熔断账号中选截止最早的一个。
 // 分级：disabled 永不参与；CoolHard（余额耗尽，等签到的号）同样排除——调了必 402，浪费轮换并产生噪音日志；
 // CoolSoft 与熔断号允许参与（可能已恢复，失败成本仅一轮换）。
@@ -380,8 +419,7 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	return best.a
 }
 
-// inFlightFull 报告账号是否已占满在途名额（上限按 realm 分档，见 inFlightLimit；
-// limit=0 不限 → 恒 false）。调用方需已持 p.mu（读锁或写锁均可，本方法只读上限）。
+// inFlightFull 报告账号是否已占满在途名额（上限按 realm 分档，见 inFlightLimit；// limit=0 不限 → 恒 false）。调用方需已持 p.mu（读锁或写锁均可，本方法只读上限）。
 func (p *Pool) inFlightFull(e *entry) bool {
 	limit := p.inFlightLimit(e)
 	if limit <= 0 {

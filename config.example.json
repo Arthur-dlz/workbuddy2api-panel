@@ -84,6 +84,7 @@
   ],
   "auth_dir": "./auths",
   "state_file": "./data/state.json",
+  "max_rotate": 3,
   "panel": {
     "package_detail_limit": 5
   },

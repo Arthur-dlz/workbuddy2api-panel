@@ -288,6 +288,7 @@ func Run() {
 		Pool:         p,
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
+		MaxRotate:    cfg.MaxRotate,
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
@@ -511,6 +512,9 @@ func restartRequiredFields(oldCfg, newCfg *Config) []string {
 	}
 	if oldCfg.StateFile != newCfg.StateFile {
 		out = append(out, "state_file")
+	}
+	if oldCfg.MaxRotate != newCfg.MaxRotate {
+		out = append(out, "max_rotate")
 	}
 	if oldCfg.Upstream.TimeoutSeconds != newCfg.Upstream.TimeoutSeconds {
 		out = append(out, "upstream.timeout_seconds")
