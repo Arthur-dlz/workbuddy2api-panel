@@ -106,6 +106,10 @@ type Status struct {
 	InFlight     int       `json:"in_flight"`
 	BreakerFails int       `json:"breaker_fails"`
 	BreakerUntil time.Time `json:"breaker_until,omitempty"`
+	// Priority / Weight 账号级静态调度覆盖的生效值（来自 config pool.accounts；
+	// 面板透出用）。default 0/0 缺省被 omitempty 省略，旧响应兼容。
+	Priority int     `json:"priority,omitempty"`
+	Weight   float64 `json:"weight,omitempty"`
 }
 
 // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
@@ -236,6 +240,11 @@ type entry struct {
 	inFlight atomic.Int64
 	// reservedCredits 在途乐观预占额度（运行态，不持久化）。由准入选号预占，流式结束释放。
 	reservedCredits float64
+	// priority / weight 静态调度覆盖生效值（来自 config pool.accounts）：
+	// priority 大者优先（pick 桶过滤）；weight 是加权抽签乘子（缺省 1，0=恒不抽中）。
+	// config 驱动的运行态，不持久化——重启后由启动装配 SetAccountOverrides 重新注入。
+	priority int
+	weight   float64
 }
 
 // ApparentEarliestRemaining 返回账号当前的视在最早到期剩余积分（扣除在途预占并四舍五入后钳 0）。

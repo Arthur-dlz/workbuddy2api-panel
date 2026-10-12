@@ -161,6 +161,9 @@ type Config struct {
 		// 错误策略）。默认 "30m"（≤48 次/天/模型）；"0" 关停（完全回到现状行为）；
 		// 空值回落默认。
 		CostExploreInterval string `json:"cost_explore_interval"`
+		// Accounts 账号级静态调度覆盖：key=uid。priority 大者优先（默认 0）。
+		// weight 语义见 pool.SetAccountOverrides 注释（nil=1，0=恒不抽中，负钳 0）。
+		Accounts map[string]AccountOverride `json:"accounts,omitempty"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -182,6 +185,15 @@ type Config struct {
 	ExpiringSoonDur        time.Duration `json:"-"`
 	// CostExploreIntervalDur 解析后的 costTier 探索窗口（issue #136）；0 = 关停。
 	CostExploreIntervalDur time.Duration `json:"-"`
+}
+
+// AccountOverride 账号级静态调度覆盖（config pool.accounts 的 value）。
+// priority 大者优先（桶过滤，默认 0 = 不过滤）；weight 是加权抽签乘子——
+// 用 *float64 区分「未设置」（nil=按 1）与「显式 0」（恒不抽中，但到期优先/
+// LRU/全冷却兜底路径仍可达）。钳制只在 pool.SetAccountOverrides 一处做。
+type AccountOverride struct {
+	Priority int      `json:"priority,omitempty"`
+	Weight   *float64 `json:"weight,omitempty"`
 }
 
 // Default 默认配置。

@@ -556,6 +556,11 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		InFlight:                 int(e.inFlight.Load()),
 		BreakerFails:             e.fails,
 		BreakerUntil:             e.breakerUntil,
+		// 静态调度覆盖生效值（config pool.accounts；面板透出）。缺省 0/0 被
+		// omitempty 省略，旧响应兼容。weight 缺省 1（无覆盖时透出会显示 weight:1，
+		// 语义正确——生效权重即 1）。
+		Priority: e.priority,
+		Weight:   e.weight,
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。

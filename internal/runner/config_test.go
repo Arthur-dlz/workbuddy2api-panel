@@ -930,3 +930,32 @@ func TestRestartRequiredFieldsPrecision(t *testing.T) {
 }
 
 
+
+// TestMergeConfigMapsPreservesUnsubmittedKeys 锁定面板保存链路的深合并语义：
+// 面板表单只提交它管理的键，未提交的兄弟键（含 pool.accounts 这类新字段）必须保留。
+// 这是 P1 依赖的关键机制（runner.saveConfig 用 mergeConfigMaps 合并 oldRaw+incoming）。
+func TestMergeConfigMapsPreservesUnsubmittedKeys(t *testing.T) {
+	cur := map[string]any{
+		"pool": map[string]any{
+			"max_in_flight": float64(3),
+			"accounts": map[string]any{
+				"uid1": map[string]any{"priority": float64(10)},
+			},
+		},
+	}
+	// incoming 只提交 pool.max_in_flight，不含 accounts。
+	incoming := map[string]any{
+		"pool": map[string]any{"max_in_flight": float64(5)},
+	}
+	merged := mergeConfigMaps(cur, incoming)
+	poolMap, ok := merged["pool"].(map[string]any)
+	if !ok {
+		t.Fatalf("merged pool not map: %#v", merged["pool"])
+	}
+	if poolMap["max_in_flight"] != float64(5) {
+		t.Errorf("submitted key not applied: %v", poolMap["max_in_flight"])
+	}
+	if _, ok := poolMap["accounts"]; !ok {
+		t.Errorf("unsubmitted sibling key pool.accounts was dropped: %#v", poolMap)
+	}
+}

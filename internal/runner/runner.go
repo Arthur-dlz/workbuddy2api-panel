@@ -112,6 +112,7 @@ func Run() {
 	p.SetCostExploreInterval(cfg.CostExploreIntervalDur) // costTier 探索窗口（issue #136，默认 30m；0 关停）
 	p.SetWeights(cfg.Pool.IdleWeightPerHour, cfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(cfg.Pool.PreferExpiring)
+	p.SetAccountOverrides(poolAccountOverrides(cfg.Pool.Accounts)) // 账号级 priority/weight 静态覆盖（启动装配）
 
 	// 会话粘性路由（可配关闭）。
 	var sessRouter *session.Router
@@ -478,6 +479,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	p.SetCostExploreInterval(newCfg.CostExploreIntervalDur) // costTier 探索窗口热生效（0 关停）
 	p.SetWeights(newCfg.Pool.IdleWeightPerHour, newCfg.Pool.IdleWeightMax)
 	p.SetPreferExpiring(newCfg.Pool.PreferExpiring)
+	p.SetAccountOverrides(poolAccountOverrides(newCfg.Pool.Accounts)) // 账号级 priority/weight 静态覆盖（面板保存热生效）
 	sch.SetExpiringSoonWindow(newCfg.ExpiringSoonDur)
 	sch.Reconfigure(
 		newCfg.Schedule.CheckinHours, newCfg.Schedule.TravelHours,
@@ -536,6 +538,20 @@ func restartRequiredFields(oldCfg, newCfg *Config) []string {
 	}
 	if oldCfg.Prompt.File != newCfg.Prompt.File {
 		out = append(out, "prompt.file")
+	}
+	return out
+}
+
+// poolAccountOverrides 把 config 层 AccountOverride（带 json tag）转换为 pool 层
+// 同名类型。两层类型刻意解耦：pool 不 import runner（避免反向依赖）。weight 指针
+// 语义原样透传（nil=未设置），钳制由 pool.SetAccountOverrides 单一负责。
+func poolAccountOverrides(m map[string]AccountOverride) map[string]pool.AccountOverride {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make(map[string]pool.AccountOverride, len(m))
+	for uid, o := range m {
+		out[uid] = pool.AccountOverride{Priority: o.Priority, Weight: o.Weight}
 	}
 	return out
 }

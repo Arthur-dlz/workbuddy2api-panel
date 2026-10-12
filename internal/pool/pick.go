@@ -90,6 +90,22 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string, minCredits in
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
 		return p.pickEarliestExpiryLocked(tried, now, realm)
 	}
+	// priority 桶过滤（对齐 CLIProxyAPI selector.go:552-611）：大者优先；
+	// 默认全 0 = 单桶不过滤 = 行为不变。静态意图优先于成本分层与派生权重。
+	// ★ kept 复用 cands 底层数组是有意为之（写索引<=读索引，安全），勿改新分配。
+	maxP := cands[0].priority
+	for _, e := range cands[1:] {
+		if e.priority > maxP {
+			maxP = e.priority
+		}
+	}
+	kept := cands[:0]
+	for _, e := range cands {
+		if e.priority == maxP {
+			kept = append(kept, e)
+		}
+	}
+	cands = kept
 	// top5 短名单按权重降序截断（而非 credits 单纯降序）：否则闲置补偿根本进不了
 	// 短名单决策，低 credits 但久置的账号会永远排不进 top5。
 	// maxCredits 统一用**全集口径**（tier 过滤前的全部 healthy 候选）：截断排序与
@@ -446,6 +462,7 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	// 3.（原「成功率 ×3」因子已删，对齐上游 success-ema-review：errTotal 是终身
 	// 累计、只增不减，成功率 = successCount/(successCount+errTotal) 会让早期出过错
 	// 的号被永久压权且永不恢复；瞬时健康信号已由冷却/熔断/连败降权承接。）
+	w *= e.weight // 静态权重乘子（生效值，缺省 1；0=加权抽签恒不中）
 	return w
 }
 

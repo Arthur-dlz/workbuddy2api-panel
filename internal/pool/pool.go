@@ -11,6 +11,16 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
 )
 
+// AccountOverride 账号级静态调度覆盖（config pool.accounts 的 value，与 runner
+// 侧同名类型解耦——pool 不依赖 runner）。见 SetAccountOverrides 的语义说明。
+type AccountOverride struct {
+	// Priority 调度优先级：大者优先（pick 桶过滤）。默认 0。
+	Priority int
+	// Weight 加权抽签乘子：nil=按 1；显式 0=恒不抽中（最早到期/LRU/兜底仍可达）；
+	// <0 钳为 0。指针区分「未设置」与「显式 0」。
+	Weight *float64
+}
+
 type Pool struct {
 	mu      sync.RWMutex
 	byUID   map[string]*entry
@@ -68,6 +78,9 @@ type Pool struct {
 	stopCh chan struct{}
 	// closeOnce 保证 Close 幂等（多次调用不重复 close channel）。
 	closeOnce sync.Once
+	// overrides 账号级静态调度覆盖（config pool.accounts；SetAccountOverrides 注入）。
+	// key=uid。运行态、不持久化：重启后由启动装配重新注入。
+	overrides map[string]AccountOverride
 }
 
 // defaultBreaker* 熔断器默认参数（FreeBuff2API 参考口径）。
@@ -179,6 +192,46 @@ func (p *Pool) SetPreferExpiring(enabled bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.preferExpiring = enabled
+}
+
+// SetAccountOverrides 注入账号级静态调度覆盖（main 从 config 注入；面板保存即热生效）。
+// 语义（全卡唯一权威定义，weight 零值语义在此）：
+//
+//	priority：原样应用（大者优先，pick 桶过滤；默认 0 = 不过滤）。
+//	weight：nil（未设置）→ 1；<0 → 钳为 0；否则取值。0 = 加权抽签恒不中
+//	        （到期优先/LRU/全冷却兜底路径不查 weight，仍可达——承诺语义非 bug）。
+//
+// ★ 硬契约：先把所有现存 entry 复位 priority=0/weight=1，再逐条应用 override。
+// entry 有多个创建点（upsertLocked、persist.go 的 load 恢复），只有「先全量复位
+// 再应用」才能覆盖全部（否则删除某 uid 的 override 后，旧 entry 会残留旧值）。
+// 深拷贝入参，调用方后续修改入参不影响池内状态。
+func (p *Pool) SetAccountOverrides(m map[string]AccountOverride) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	dst := make(map[string]AccountOverride, len(m))
+	for uid, o := range m {
+		var w *float64
+		if o.Weight != nil {
+			v := *o.Weight
+			if v < 0 {
+				v = 0 // 负钳 0（唯一钳制点）
+			}
+			w = &v
+		}
+		dst[uid] = AccountOverride{Priority: o.Priority, Weight: w}
+	}
+	p.overrides = dst
+	// 先全量复位，再应用。
+	for uid, e := range p.byUID {
+		e.priority = 0
+		e.weight = 1
+		if o, ok := dst[uid]; ok {
+			e.priority = o.Priority
+			if o.Weight != nil {
+				e.weight = *o.Weight
+			}
+		}
+	}
 }
 
 // SetDegrade 注入连败降权参数（main 从 config 解析后调用，issue #114）。
@@ -343,7 +396,15 @@ func (p *Pool) upsertLocked(a *auth.Auth) {
 		e.a = a // 保留 credits/cooling 状态
 		return
 	}
-	p.byUID[a.UID] = &entry{a: a}
+	e := &entry{a: a, weight: 1} // weight 缺省 1（生效值）
+	// 新 entry 建立后按覆盖表应用（priority 原样；weight nil→1/负钳 0/否则取值）。
+	if o, ok := p.overrides[a.UID]; ok {
+		e.priority = o.Priority
+		if o.Weight != nil {
+			e.weight = *o.Weight
+		}
+	}
+	p.byUID[a.UID] = e
 }
 
 // Pick 返回 healthy 中积分最高的账号；无可用返回 nil。
