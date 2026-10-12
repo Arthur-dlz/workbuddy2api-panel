@@ -7,8 +7,8 @@ import (
 )
 
 func TestAppVersionIsReleaseVersion(t *testing.T) {
-	if appVersion != "1.6.0" {
-		t.Fatalf("appVersion=%q, want 1.6.0", appVersion)
+	if appVersion != "1.7.0" {
+		t.Fatalf("appVersion=%q, want 1.7.0", appVersion)
 	}
 	if strings.TrimSpace(appVersion) == "" {
 		t.Fatal("appVersion must not be empty")

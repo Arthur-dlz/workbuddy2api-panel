@@ -28,13 +28,13 @@
 
 ---
 
-## 1.6.0 Changes
+## 1.7.0 Changes
 
 - Add per-account static scheduling overrides: `pool.accounts` supports `priority` (higher wins; primary/backup tiers) and `weight` (weighted-draw multiplier; 0 = reachable only via expiry-first/fallback paths). Empty by default with unchanged behavior; hot-applied on panel config save.
 - Pool-exhausted and rate-limited responses now carry a `Retry-After` header (earliest pool recovery time, preferring upstream-provided values) so clients can back off; `max_rotate` (per-request account rotation limit) is now configurable (default 3, restart required).
 - Add a per-account/model/time 429 rate-limit ledger (24h windowed count, total, last trigger/reset times); picks penalize accounts recently limited on the requested model; stats exposed via the status API.
 
-**Version scope:** 1.6.0 applies to the current source. The precompiled executables already in the repository were not replaced by this source update. Build from the current source to use these fixes and check the panel overview's `version` field.
+**Version scope:** 1.7.0 applies to the current source. The precompiled executables already in the repository were not replaced by this source update. Build from the current source to use these fixes and check the panel overview's `version` field.
 
 ## 1.5.0 Changes
 
