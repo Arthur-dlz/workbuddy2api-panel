@@ -210,6 +210,24 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 				e.modelCost[m] = modelCostEntry{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
 			}
 		}
+		// 429 台账：惰性过滤 LastAt 超 7 天的条目（陈旧统计不复活，同 modelCosts 口径）。
+		if len(s.ModelRateStats) > 0 {
+			for m, st := range s.ModelRateStats {
+				if st.LastAt.IsZero() || now.Sub(st.LastAt) > modelRateStatTTL {
+					continue
+				}
+				if e.modelRateStats == nil {
+					e.modelRateStats = map[string]modelRateStat{}
+				}
+				e.modelRateStats[m] = modelRateStat{
+					Total:       st.Total,
+					Count24h:    st.Count24h,
+					WindowStart: st.WindowStart,
+					LastAt:      st.LastAt,
+					LastResetAt: st.LastResetAt,
+				}
+			}
+		}
 		p.byUID[uid] = e
 	}
 }
@@ -338,6 +356,24 @@ func (p *Pool) stateOverviewLocked() stateFile {
 					s.ModelCosts = map[string]stateModelCost{}
 				}
 				s.ModelCosts[m] = stateModelCost{CostPer1k: mc.CostPer1k, LastSeen: mc.LastSeen, Samples: mc.Samples}
+			}
+		}
+		// 429 台账：惰性过滤 LastAt 超 7 天的条目（陈旧统计不复活，同 modelCosts 口径）。
+		if len(e.modelRateStats) > 0 {
+			for m, st := range e.modelRateStats {
+				if st.LastAt.IsZero() || now.Sub(st.LastAt) > modelRateStatTTL {
+					continue
+				}
+				if s.ModelRateStats == nil {
+					s.ModelRateStats = map[string]stateModelRateStat{}
+				}
+				s.ModelRateStats[m] = stateModelRateStat{
+					Total:       st.Total,
+					Count24h:    st.Count24h,
+					WindowStart: st.WindowStart,
+					LastAt:      st.LastAt,
+					LastResetAt: st.LastResetAt,
+				}
 			}
 		}
 		sf.Accounts[uid] = s

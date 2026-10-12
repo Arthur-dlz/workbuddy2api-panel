@@ -77,6 +77,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string, minCredits in
 		// status 只读遍历天然跳过过期项，但内存条目必须在此真正删除）。
 		e.pruneExpiredModelCooldowns(now)
 		e.pruneExpiredModelCosts(now)
+		e.pruneExpiredModelRateStats(now)
 		if !healthyOf(e) {
 			continue
 		}
@@ -180,7 +181,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string, minCredits in
 	for _, e := range cands {
 		ti, ci := costTier(e)
 		if ti == bestTier {
-			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, now), tier: ti, cost1k: ci})
+			ws = append(ws, weighted{e: e, w: p.weightOf(e, maxCredits, now, reqModel), tier: ti, cost1k: ci})
 		}
 	}
 	// 等权重洗牌：仅当存在权重相等且候选数超过 top5 时，才对 ws 做 Fisher-Yates
@@ -320,7 +321,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string, minCredits in
 				}
 			}
 		} else {
-			e = p.pickWeighted(eligible) // eligible 保序 = top5 降序子集
+			e = p.pickWeighted(eligible, reqModel) // eligible 保序 = top5 降序子集
 		}
 	}
 	if explored {
@@ -442,7 +443,7 @@ var minPickGap = 100 * time.Millisecond
 // credits 全 0 时仍按 idleWeight 加权（不退化均匀随机）。
 // 权重为浮点，用 int64 定点（×1e6）抽签可保持确定性随机源注入（randInt64N 语义不变）。
 // 随机源优先用 p.randInt64N（仅供测试注入确定性），nil 时回退 math/rand/v2 全局源。
-func (p *Pool) pickWeighted(cands []*entry) *entry {
+func (p *Pool) pickWeighted(cands []*entry, reqModel string) *entry {
 	now := time.Now()
 	var maxCredits int64
 	for _, e := range cands {
@@ -454,7 +455,7 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 	weights := make([]int64, len(cands))
 	var total int64
 	for i, e := range cands {
-		w := p.weightOf(e, maxCredits, now)
+		w := p.weightOf(e, maxCredits, now, reqModel)
 		weights[i] = int64(w * scale)
 		total += weights[i]
 	}
@@ -476,8 +477,8 @@ func (p *Pool) pickWeighted(cands []*entry) *entry {
 	return cands[len(cands)-1]
 }
 
-// weightOf 计算单个账号的普通加权分值。
-func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
+// weightOf 计算单个账号的普通加权分值。reqModel 非空时叠加 429 台账惩罚。
+func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time, reqModel string) float64 {
 	w := 1.0
 	// 1. credits 比例 ×10（会计入 mid-credit 锚点，避免全员 0 时 credits 项为 0）。
 	if maxCredits > 0 {
@@ -501,6 +502,18 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	// 累计、只增不减，成功率 = successCount/(successCount+errTotal) 会让早期出过错
 	// 的号被永久压权且永不恢复；瞬时健康信号已由冷却/熔断/连败降权承接。）
 	w *= e.weight // 静态权重乘子（生效值，缺省 1；0=加权抽签恒不中）
+	// 429 台账惩罚（账号×模型×时间）：同模型 24h 窗口内每多一次 429，
+	// 权重除数 +1（1 次减半、2 次变 1/3…）。窗口过期按 0 计（读侧判定，
+	// 不改台账）。与被删的"成功率因子"不同：这是模型维度的近期信号，
+	// 随窗口自动衰减，不会永久压权。
+	// 候选 >5 时受罚账号可能因排序掉出 Top5——属降权的强化表现，非 bug。
+	if reqModel != "" && len(e.modelRateStats) > 0 {
+		if st, ok := e.modelRateStats[reqModel]; ok &&
+			!st.WindowStart.IsZero() && now.Sub(st.WindowStart) < 24*time.Hour &&
+			st.Count24h > 0 {
+			w /= 1 + float64(st.Count24h)
+		}
+	}
 	return w
 }
 

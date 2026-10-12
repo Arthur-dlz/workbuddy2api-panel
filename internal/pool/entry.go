@@ -110,6 +110,20 @@ type Status struct {
 	// 面板透出用）。default 0/0 缺省被 omitempty 省略，旧响应兼容。
 	Priority int     `json:"priority,omitempty"`
 	Weight   float64 `json:"weight,omitempty"`
+	// ModelRateStats 429 限流台账（账号×模型×时间，Phase 4）：每模型一行。
+	// 无数据 = nil（零回归）；面板透出近期限流画像。
+	ModelRateStats []ModelRateStatStatus `json:"model_rate_stats,omitempty"`
+}
+
+// ModelRateStatStatus 单个 (账号, 模型) 的 429 限流台账行（json 全小写下划线）。
+// LastAt/LastResetAt 的 omitempty 对零值 time.Time 不生效（会序列化为
+// 0001-01-01T00:00:00Z）——与现有 Status.Until 同款风格，面板已容忍。
+type ModelRateStatStatus struct {
+	Model       string    `json:"model"`
+	Total       int       `json:"total"`
+	Count24h    int       `json:"count_24h"`
+	LastAt      time.Time `json:"last_at,omitempty"`
+	LastResetAt time.Time `json:"last_reset_at,omitempty"`
 }
 
 // ModelCostStatus 单个 (账号, 模型) 的成本台账行（P1-anti-monopoly 可观测性）。
@@ -138,6 +152,16 @@ type RateLimitedModel struct {
 	Reason string `json:"reason,omitempty"`
 }
 
+// modelRateStat (账号,模型) 的 429 限流事件台账：累计次数 + 24h 固定窗口
+// 计数（驱动选号惩罚）+ 最近一次触发/重置时刻（运维展示）。
+type modelRateStat struct {
+	Total       int
+	Count24h    int
+	WindowStart time.Time
+	LastAt      time.Time
+	LastResetAt time.Time
+}
+
 // modelCooldown 单个 (账号, 模型) 的模型级独立冷却记录。
 // 承载两种「该模型在此账号上不可用」语义：
 //   - 6004 模型级限流：Until 对齐上游重置墙钟；ResetAt 记录权威恢复时刻。
@@ -160,6 +184,11 @@ type modelCooldown struct {
 // 单次会话，又不至于让昨天的价格决定今天的选择——过期的免费观测若永久有效，
 // 白天会把已开始收费的号继续当成免费。
 const modelCostTTL = 6 * time.Hour
+
+// modelRateStatTTL 429 台账条目的保留期（惰性清理/落盘/恢复统一口径）。
+// 取 7 天：24h 窗口是选号惩罚的有效期，7 天是运维回溯窗口——超期条目在
+// prune/落盘/恢复三处一并过滤，陈旧统计不复活。
+const modelRateStatTTL = 7 * 24 * time.Hour
 
 // modelCostEntry 运行时成本账本（持久化镜像 stateModelCost 与其字段一一对应）。
 type modelCostEntry struct {
@@ -245,6 +274,11 @@ type entry struct {
 	// config 驱动的运行态，不持久化——重启后由启动装配 SetAccountOverrides 重新注入。
 	priority int
 	weight   float64
+	// modelRateStats (账号,模型) 的 429 限流事件台账（key=model；只在 6004 带重置
+	// 时间时记录）。选号时对「同模型 24h 内 429 过的账号」降权。
+	// 持久化（stateAccount.ModelRateStats）：跨重启保留统计，避免重启后对
+	// "配额紧张号"失忆；落盘/恢复均惰性过滤 LastAt 超 7 天的条目。
+	modelRateStats map[string]modelRateStat
 }
 
 // ApparentEarliestRemaining 返回账号当前的视在最早到期剩余积分（扣除在途预占并四舍五入后钳 0）。
@@ -363,8 +397,21 @@ func (e *entry) pruneExpiredModelCosts(now time.Time) {
 	}
 }
 
-// pruneExpiredModelCooldowns 删除 modelCooldowns 中已过期的条目（惰性清理）。
-// pick 写锁路径与 revive 调用，防止 map 无限膨胀；status 只读遍历天然跳过过期项，
+// pruneExpiredModelRateStats 删除 modelRateStats 中 LastAt 超 7 天的台账条目（与持久化
+// 惰性过滤同口径；条目上界=账号×限流过的模型数，量小，仅对齐既有模式）。
+// 调用方必须已持有 p.mu 写锁。
+func (e *entry) pruneExpiredModelRateStats(now time.Time) {
+	if len(e.modelRateStats) == 0 {
+		return
+	}
+	for m, st := range e.modelRateStats {
+		if st.LastAt.IsZero() || now.Sub(st.LastAt) > modelRateStatTTL {
+			delete(e.modelRateStats, m)
+		}
+	}
+}
+
+// pruneExpiredModelCooldowns 删除 modelCooldowns 中已过期的条目（惰性清理）。// pick 写锁路径与 revive 调用，防止 map 无限膨胀；status 只读遍历天然跳过过期项，
 // 无需清理。调用方必须已持有 p.mu 写锁。
 func (e *entry) pruneExpiredModelCooldowns(now time.Time) {
 	if len(e.modelCooldowns) == 0 {
@@ -466,6 +513,10 @@ type stateAccount struct {
 	// 重新付学费探测。落盘/恢复均按 modelCostTTL 惰性过滤（6h 外不写不恢复——
 	// 陈旧价格不复活）；恢复侧剔除非法值（负 per1k/零 LastSeen 的结构破损条目）。
 	ModelCosts map[string]stateModelCost `json:"model_costs,omitempty"`
+	// ModelRateStats 429 台账（账号×模型×时间）。持久化：跨重启保留统计，
+	// 避免重启后对"配额紧张号"失忆。落盘/恢复均惰性过滤：LastAt 超 7 天的
+	// 条目不写不恢复（陈旧统计不复活，同 modelCosts 口径）。
+	ModelRateStats map[string]stateModelRateStat `json:"model_rate_stats,omitempty"`
 }
 
 // stateModelCooldown 单个 (账号, 模型) 的模型级独立冷却持久化记录，与运行态
@@ -483,6 +534,16 @@ type stateModelCost struct {
 	CostPer1k float64   `json:"cost_per_1k"`
 	LastSeen  time.Time `json:"last_seen"`
 	Samples   int       `json:"samples,omitempty"`
+}
+
+// stateModelRateStat 单个 (账号, 模型) 的 429 限流台账持久化记录，与运行态
+// modelRateStat 同构（字段一一对应，json 小写下划线）。
+type stateModelRateStat struct {
+	Total       int       `json:"total"`
+	Count24h    int       `json:"count_24h"`
+	WindowStart time.Time `json:"window_start,omitempty"`
+	LastAt      time.Time `json:"last_at,omitempty"`
+	LastResetAt time.Time `json:"last_reset_at,omitempty"`
 }
 
 // stateFile 持久化格式。

@@ -134,6 +134,23 @@ func (p *Pool) CooldownSoftForModel(uid string, base time.Duration, resetAt time
 				ResetAt: resetAt,
 				Reason:  reason,
 			}
+			// 429 台账（账号×模型×时间）：24h 固定窗口滚动计数
+			// （读侧 pick/status 也做窗口有效性判定，双保险）。
+			// ★ 只在 resetAt 非零分支记录（6004 带模型+时间语义）；resetAt 零值的
+			// 账号级软冷却不记录（无模型归属语义，记了会污染台账）。
+			if e.modelRateStats == nil {
+				e.modelRateStats = map[string]modelRateStat{}
+			}
+			st := e.modelRateStats[model]
+			if st.WindowStart.IsZero() || now.Sub(st.WindowStart) >= 24*time.Hour {
+				st.WindowStart = now
+				st.Count24h = 0
+			}
+			st.Total++
+			st.Count24h++
+			st.LastAt = now
+			st.LastResetAt = resetAt
+			e.modelRateStats[model] = st
 		} else {
 			// 无解析时间（普通软冷却）：有界退避（base 起按 softStreak 翻倍、封顶
 			// softRateMax）。注意：**在软冷却中**（until 未到期）时不推进/不延长。

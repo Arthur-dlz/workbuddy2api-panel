@@ -1355,7 +1355,7 @@ func (p *Pool) entryWeight(uid string) float64 {
 			maxCredits = x.credits
 		}
 	}
-	return p.weightOf(e, maxCredits, time.Now())
+	return p.weightOf(e, maxCredits, time.Now(), "")
 }
 
 func TestWeightHighCreditsDominates(t *testing.T) {
@@ -1796,8 +1796,8 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	p.SetPreferExpiring(false)
 
 	p.mu.Lock()
-	wa := p.weightOf(p.byUID["a"], 100, now)
-	wb := p.weightOf(p.byUID["b"], 100, now)
+	wa := p.weightOf(p.byUID["a"], 100, now, "")
+	wb := p.weightOf(p.byUID["b"], 100, now, "")
 	p.mu.Unlock()
 	if wa != wb {
 		t.Fatalf("disabled expiring weights differ: %v/%v", wa, wb)

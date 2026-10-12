@@ -561,6 +561,8 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		// 语义正确——生效权重即 1）。
 		Priority: e.priority,
 		Weight:   e.weight,
+		// 429 限流台账（账号×模型×时间，Phase 4）。
+		ModelRateStats: p.modelRateStatsStatusLocked(e, now),
 	}
 	if st.Disabled {
 		// 禁用账号透出禁用原因（运维看不到为什么死）。
@@ -624,6 +626,44 @@ func (p *Pool) modelCostsStatusLocked(e *entry, now time.Time) []ModelCostStatus
 // ---------------------------------------------------------------------------
 // 持久化
 // ---------------------------------------------------------------------------
+
+// modelRateStatsStatusLocked 收集账号的 429 限流台账行（Phase 4，账号×模型×时间）。
+// 按 model 名稳定排序输出；读侧做 24h 窗口判定：窗口过期时 Count24h 按 0 透出。
+// LastAt 超 7 天的条目视为陈旧（与 prune/落盘同口径），不进台账。
+// 调用方必须已持有锁（statusOf 只读路径持 RLock，本函数只读不写）。
+func (p *Pool) modelRateStatsStatusLocked(e *entry, now time.Time) []ModelRateStatStatus {
+	if len(e.modelRateStats) == 0 {
+		return nil
+	}
+	models := make([]string, 0, len(e.modelRateStats))
+	for m := range e.modelRateStats {
+		models = append(models, m)
+	}
+	sort.Strings(models)
+	rows := make([]ModelRateStatStatus, 0, len(models))
+	for _, m := range models {
+		st := e.modelRateStats[m]
+		if st.LastAt.IsZero() || now.Sub(st.LastAt) > modelRateStatTTL {
+			continue // 陈旧条目：与 prune/落盘同口径，不进台账
+		}
+		// 读侧窗口判定：窗口过期时 Count24h 按 0 透出（不改台账）。
+		count := st.Count24h
+		if st.WindowStart.IsZero() || now.Sub(st.WindowStart) >= 24*time.Hour {
+			count = 0
+		}
+		rows = append(rows, ModelRateStatStatus{
+			Model:       m,
+			Total:       st.Total,
+			Count24h:    count,
+			LastAt:      st.LastAt,
+			LastResetAt: st.LastResetAt,
+		})
+	}
+	if len(rows) == 0 {
+		return nil
+	}
+	return rows
+}
 
 // rateLimitedModelsLocked 收集账号当前仍在限额的模型台账行（issue #36）。
 // modelCooldowns 未到期条目按模型名稳定排序输出；全部到期/空表返回 nil。
