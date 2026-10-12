@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -71,6 +72,29 @@ type Config struct {
 
 	// Models 初始模型别名字典 (如 deepseek-chat -> tencent-code-v3)
 	Models map[string]string
+
+	// ErrorRules 请求级可编程错误策略（config pool.error_rules；空 = 行为不变）。
+	// 由 runner 从 config 注入，NewHandler 编译为内部匹配表（正则预编译）。
+	ErrorRules []ErrorRule
+}
+
+// ErrorRule 请求级错误策略规则（server 侧注入类型，与 runner.ErrorRule 字段对齐）。
+// status 精确匹配；Match 子串大小写不敏感；MatchRegex 正则（编译失败 = 该条无效跳过）；
+// Action ∈ {stop, stop-and-cooldown, continue, continue-and-cooldown}。
+type ErrorRule struct {
+	Status     int
+	Match      string
+	MatchRegex string
+	Action     string
+}
+
+// compiledErrorRule matchErrorRule 使用的预编译规则（NewHandler 时一次性编译）。
+// match 已小写化（与 body 小写化后做子串比较）；re 为 nil 表示该规则无正则项。
+type compiledErrorRule struct {
+	status int
+	match  string
+	re     *regexp.Regexp
+	action string
 }
 
 // loadLive 返回当前运行期快照；Live 为 nil 时用静态字段合成。
@@ -145,6 +169,9 @@ type Handler struct {
 	wafIP        wafIPGate
 	limiter      *ModelLimiter
 	modelBreaker *ModelCircuitBreaker
+	// errorRules 请求级错误策略的只读编译表（NewHandler 从 cfg.ErrorRules 编译；
+	// nil/空 = 无规则 = 行为不变）。规则表启动后不变，运行期只读，无需加锁。
+	errorRules []compiledErrorRule
 }
 
 // NewHandler 构建 handler。
@@ -162,6 +189,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), limiter: newModelLimiter(), modelBreaker: cfg.ModelBreaker}
+	h.errorRules = compileErrorRules(cfg.ErrorRules)
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -1316,6 +1344,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// lastErr 携带完整 body（uerr.Msg 在 upstream 侧截断 200 字符，透传语义
 			// 要求原文全量）+ Kind/RetryAfter（末端映射与冷却时长共用）。
 			lastErr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody), RetryAfter: uerr.RetryAfter}
+			// 可编程错误策略（pool.error_rules）：命中则按 action 处置并跳过 applyErrorPolicy。
+			// 规则表默认空 / 未命中 → 走既有 applyErrorPolicy（零回归）。
+			//   stop*     → 终止轮转（lastErr 已记，break 走末端透传）；
+			//   continue* → 换号（与既有错误路径一致地退避后 continue）；
+			//   *cooldown → 额外对该账号施加账号级软冷却（基数为 softCooldown）。
+			if action, hit := h.matchErrorRule(status, string(respBody)); hit {
+				if strings.HasSuffix(action, "cooldown") {
+					h.cfg.Pool.CooldownSoftRate(acct.UID, h.softCooldown(), time.Time{}, "error_rule")
+				}
+				fail(acct.UID)
+				if strings.HasPrefix(action, "stop") {
+					break // 终止轮转，透传 lastErr（末端错误块）
+				}
+				if !rotateBackoff(i, r.Context()) {
+					break // ctx 取消：终止轮转
+				}
+				continue
+			}
 			h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
 			fail(acct.UID)
 			// WAF IP 级 fail-fast（优先于 rotateBackoff 退避——IP 级拦截时退避无意义）：
@@ -1580,6 +1626,65 @@ func rotateBackoff(i int, ctx context.Context) bool {
 		return false
 	}
 	return true
+}
+
+// compileErrorRules 把注入的规则编译为内部匹配表：match 小写化、match_regex 预编译。
+// 正则编译失败 = 该条无效跳过（记一条日志，不 panic）；Match 与 MatchRegex 皆空的
+// 条目同样跳过（normalize 已过滤，此处为防御性兜底）。
+func compileErrorRules(rules []ErrorRule) []compiledErrorRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]compiledErrorRule, 0, len(rules))
+	for _, r := range rules {
+		match := strings.TrimSpace(r.Match)
+		regex := strings.TrimSpace(r.MatchRegex)
+		if match == "" && regex == "" {
+			log.Printf("server: error_rule 跳过（match 与 match_regex 皆空, status=%d）", r.Status)
+			continue
+		}
+		cr := compiledErrorRule{status: r.Status, action: r.Action}
+		if match != "" {
+			cr.match = strings.ToLower(match)
+		}
+		if regex != "" {
+			re, err := regexp.Compile(regex)
+			if err != nil {
+				// 正则无效：该条失效跳过，不 panic（坏规则不应拖垮网关）。
+				log.Printf("server: error_rule 跳过（正则编译失败: %v, pattern=%q, status=%d）", err, regex, r.Status)
+				continue
+			}
+			cr.re = re
+		}
+		out = append(out, cr)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// matchErrorRule 按切片顺序查找首个匹配的规则（先命中先生效），返回其 action。
+// status 必须精确等于规则 status；match 子串大小写不敏感；match_regex 正则匹配。
+// 规则表为空/无命中返回 ok=false（调用方走既有 applyErrorPolicy）。
+func (h *Handler) matchErrorRule(status int, body string) (string, bool) {
+	if len(h.errorRules) == 0 {
+		return "", false
+	}
+	lowerBody := strings.ToLower(body)
+	for _, r := range h.errorRules {
+		if r.status != status {
+			continue
+		}
+		matched := r.match != "" && strings.Contains(lowerBody, r.match)
+		if !matched && r.re != nil && r.re.MatchString(body) {
+			matched = true
+		}
+		if matched {
+			return r.action, true
+		}
+	}
+	return "", false
 }
 
 // applyErrorPolicy 按错误分类对账号施加冷却/禁用/熔断策略（最终版状态机）。

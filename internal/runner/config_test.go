@@ -959,3 +959,64 @@ func TestMergeConfigMapsPreservesUnsubmittedKeys(t *testing.T) {
 		t.Errorf("unsubmitted sibling key pool.accounts was dropped: %#v", poolMap)
 	}
 }
+
+// TestErrorRulesNormalizeParse 校验 pool.error_rules 的解析与 normalize 过滤：
+// 合法规则保留；未知 action / match 与 match_regex 皆空 → 该条跳过（不报错拒启）。
+func TestErrorRulesNormalizeParse(t *testing.T) {
+	raw := []byte(`{
+		"pool": {
+			"error_rules": [
+				{"status":400,"match":"maximum_context_length","action":"stop"},
+				{"status":400,"match_regex":"rate.?limit","action":"continue-and-cooldown"},
+				{"status":500,"match":"boom","action":"continue"},
+				{"status":400,"match":"x","action":"bogus"},
+				{"status":400,"action":"stop"},
+				{"status":429,"match_regex":"limit","action":"stop-and-cooldown"}
+			]
+		}
+	}`)
+	cfg, err := ParseConfig(raw)
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	got := cfg.Pool.ErrorRules
+	if len(got) != 4 {
+		t.Fatalf("want 4 valid rules (2 invalid dropped), got %d: %+v", len(got), got)
+	}
+	want := []ErrorRule{
+		{Status: 400, Match: "maximum_context_length", Action: "stop"},
+		{Status: 400, MatchRegex: "rate.?limit", Action: "continue-and-cooldown"},
+		{Status: 500, Match: "boom", Action: "continue"},
+		{Status: 429, MatchRegex: "limit", Action: "stop-and-cooldown"},
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("rule[%d]=%+v want %+v", i, got[i], want[i])
+		}
+	}
+}
+
+// TestErrorRulesEmptyByDefault 默认（无 error_rules 键）→ 空表，行为不变。
+func TestErrorRulesEmptyByDefault(t *testing.T) {
+	cfg, err := ParseConfig([]byte(`{}`))
+	if err != nil {
+		t.Fatalf("ParseConfig: %v", err)
+	}
+	if len(cfg.Pool.ErrorRules) != 0 {
+		t.Errorf("default error_rules should be empty, got %+v", cfg.Pool.ErrorRules)
+	}
+}
+
+// TestValidErrorAction 四值判定。
+func TestValidErrorAction(t *testing.T) {
+	for _, a := range []string{"stop", "stop-and-cooldown", "continue", "continue-and-cooldown"} {
+		if !validErrorAction(a) {
+			t.Errorf("validErrorAction(%q)=false want true", a)
+		}
+	}
+	for _, a := range []string{"", "STOP", "stopcooldown", "halt", "continue-and-stop"} {
+		if validErrorAction(a) {
+			t.Errorf("validErrorAction(%q)=true want false", a)
+		}
+	}
+}

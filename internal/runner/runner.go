@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sync"
 	"syscall"
@@ -289,6 +290,7 @@ func Run() {
 		Upstream:     up,
 		APIKey:       cfg.APIKey,
 		MaxRotate:    cfg.MaxRotate,
+		ErrorRules:   errorRuleConfigs(cfg.Pool.ErrorRules),
 		Session:      sessRouter,
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
@@ -516,6 +518,10 @@ func restartRequiredFields(oldCfg, newCfg *Config) []string {
 	if oldCfg.MaxRotate != newCfg.MaxRotate {
 		out = append(out, "max_rotate")
 	}
+	// error_rules 热更新不可行（saveConfig 闭包拿不到 handler 引用）→ 重启生效。
+	if !reflect.DeepEqual(oldCfg.Pool.ErrorRules, newCfg.Pool.ErrorRules) {
+		out = append(out, "error_rules")
+	}
 	if oldCfg.Upstream.TimeoutSeconds != newCfg.Upstream.TimeoutSeconds {
 		out = append(out, "upstream.timeout_seconds")
 	}
@@ -556,6 +562,24 @@ func poolAccountOverrides(m map[string]AccountOverride) map[string]pool.AccountO
 	out := make(map[string]pool.AccountOverride, len(m))
 	for uid, o := range m {
 		out[uid] = pool.AccountOverride{Priority: o.Priority, Weight: o.Weight}
+	}
+	return out
+}
+
+// errorRuleConfigs 把 config 层 ErrorRule 转换为 server 层注入类型（字段对齐）。
+// 两层类型解耦：server 不 import runner（避免反向依赖）。空表返回 nil（行为不变）。
+func errorRuleConfigs(rules []ErrorRule) []server.ErrorRule {
+	if len(rules) == 0 {
+		return nil
+	}
+	out := make([]server.ErrorRule, 0, len(rules))
+	for _, r := range rules {
+		out = append(out, server.ErrorRule{
+			Status:     r.Status,
+			Match:      r.Match,
+			MatchRegex: r.MatchRegex,
+			Action:     r.Action,
+		})
 	}
 	return out
 }

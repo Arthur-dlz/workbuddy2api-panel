@@ -155,7 +155,19 @@
         "priority": 10,
         "weight": 2.0
       }
-    }
+    },
+    "error_rules": [
+      {
+        "status": 400,
+        "match": "maximum_context_length",
+        "action": "stop"
+      },
+      {
+        "status": 400,
+        "match_regex": "rate.?limit",
+        "action": "continue-and-cooldown"
+      }
+    ]
   },
   "session_sticky": {
     "enabled": true,

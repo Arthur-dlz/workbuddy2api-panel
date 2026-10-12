@@ -2097,3 +2097,229 @@ func TestPoolExhausted503CarriesRetryAfter(t *testing.T) {
 		t.Errorf("Retry-After=%ds exceeds expected ~%ds", secs, int(soft/time.Second))
 	}
 }
+
+// --- pool.error_rules 可编程错误策略端到端测试 ---
+// 统一用 400 + body 含 "maximum_context_length"（不在 upstream 11115 markers 内，
+// 会走通用错误路径 → 规则查表可达；若误归类为 ErrPromptTooLong 会命中 :1294 立即
+// return 分支而绕过规则表——这正是本组测试选词的用意）。
+
+// errorRuleBody 通用错误路径的测试 body（400 + 含规则匹配子串）。
+const errorRuleBody = `{"code":1234,"msg":"maximum_context_length exceeded"}`
+
+func TestErrorRuleStopTerminatesRotation(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 400, errorRuleBody, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "a1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "a2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("a1", 2000, 0) // 确定性源 r=0 → 先选 a1
+	p.SetCredits("a2", 1000, 0)
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, MaxRotate: 3,
+		ErrorRules: []ErrorRule{{Status: 400, Match: "maximum_context_length", Action: "stop"}},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 503 {
+		t.Fatalf("code=%d body=%s want 503 (stop→末端透传)", rec.Code, rec.Body)
+	}
+	if calls["Bearer at1"] != 1 || calls["Bearer at2"] != 0 {
+		t.Errorf("calls=%v want a1=1 a2=0 (stop terminates rotation)", calls)
+	}
+	if !strings.Contains(rec.Body.String(), "maximum_context_length") {
+		t.Errorf("503 body should carry upstream text: %s", rec.Body)
+	}
+	// action=stop（非 cooldown）不应冷却账号。
+	if st, _ := p.Status("a1"); st.Cooling {
+		t.Errorf("action=stop must NOT cooldown a1: %+v", st)
+	}
+}
+
+func TestErrorRuleStopAndCooldown(t *testing.T) {
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		return 400, errorRuleBody, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "a1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "a2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("a1", 2000, 0)
+	p.SetCredits("a2", 1000, 0)
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, MaxRotate: 3, SoftCooldown: 45 * time.Second,
+		ErrorRules: []ErrorRule{{Status: 400, Match: "maximum_context_length", Action: "stop-and-cooldown"}},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 503 {
+		t.Fatalf("code=%d body=%s want 503", rec.Code, rec.Body)
+	}
+	// stop-and-cooldown：终止轮转 + a1 进入软冷却。
+	if st, _ := p.Status("a1"); !st.Cooling || st.CoolKind != "soft_rate" {
+		t.Errorf("action=stop-and-cooldown must cooldown a1: %+v", st)
+	}
+}
+
+func TestErrorRuleContinueRotates(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if authz == "Bearer at1" {
+			return 400, errorRuleBody, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "a1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "a2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("a1", 2000, 0)
+	p.SetCredits("a2", 1000, 0)
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, MaxRotate: 3,
+		ErrorRules: []ErrorRule{{Status: 400, Match: "maximum_context_length", Action: "continue"}},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s want 200 (continue→换号到 a2)", rec.Code, rec.Body)
+	}
+	if calls["Bearer at1"] != 1 || calls["Bearer at2"] != 1 {
+		t.Errorf("calls=%v want a1=1 a2=1", calls)
+	}
+	// action=continue（非 cooldown）不应冷却 a1。
+	if st, _ := p.Status("a1"); st.Cooling {
+		t.Errorf("action=continue must NOT cooldown a1: %+v", st)
+	}
+}
+
+func TestErrorRuleContinueAndCooldown(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if authz == "Bearer at1" {
+			return 400, errorRuleBody, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "a1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "a2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("a1", 2000, 0)
+	p.SetCredits("a2", 1000, 0)
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, MaxRotate: 3, SoftCooldown: 45 * time.Second,
+		ErrorRules: []ErrorRule{{Status: 400, Match: "maximum_context_length", Action: "continue-and-cooldown"}},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s want 200", rec.Code, rec.Body)
+	}
+	if calls["Bearer at1"] != 1 || calls["Bearer at2"] != 1 {
+		t.Errorf("calls=%v want a1=1 a2=1", calls)
+	}
+	// continue-and-cooldown：换号成功，且 a1 被降温。
+	if st, _ := p.Status("a1"); !st.Cooling {
+		t.Errorf("action=continue-and-cooldown must cooldown a1: %+v", st)
+	}
+}
+
+// TestErrorRuleMatchPriority 锁定"先命中先生效"：两条同 status 且同匹配子串的规则，
+// 生效的是切片中靠前那条。用 stop vs continue 的可观测差异（上游调用次数）判别。
+func TestErrorRuleMatchPriority(t *testing.T) {
+	newCase := func(rules []ErrorRule) int {
+		calls := 0
+		up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+			calls++
+			return 400, errorRuleBody, false
+		})
+		p := testPoolWith(
+			&auth.Auth{UID: "a1", AccessToken: "at1", ExpiresAt: 9999999999},
+			&auth.Auth{UID: "a2", AccessToken: "at2", ExpiresAt: 9999999999},
+		)
+		p.SetCredits("a1", 2000, 0)
+		p.SetCredits("a2", 1000, 0)
+		h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 3, ErrorRules: rules})
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+		return calls
+	}
+	// 顺序 A：stop 在前 → 第一次即终止（1 次上游调用）。
+	if n := newCase([]ErrorRule{
+		{Status: 400, Match: "maximum_context_length", Action: "stop"},
+		{Status: 400, Match: "maximum_context_length", Action: "continue"},
+	}); n != 1 {
+		t.Errorf("stop-first: calls=%d want 1 (首条命中 stop)", n)
+	}
+	// 顺序 B：continue 在前 → 继续换号（尝试两个账号，2 次上游调用）。
+	if n := newCase([]ErrorRule{
+		{Status: 400, Match: "maximum_context_length", Action: "continue"},
+		{Status: 400, Match: "maximum_context_length", Action: "stop"},
+	}); n != 2 {
+		t.Errorf("continue-first: calls=%d want 2 (首条命中 continue)", n)
+	}
+}
+
+// TestErrorRuleEmptyTableNoop 空规则表零影响：body 虽匹配某规则形态，但表为空 →
+// 走既有 applyErrorPolicy（ErrClient default 分支只换号不终止）→ 全部账号被轮完。
+func TestErrorRuleEmptyTableNoop(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		return 400, errorRuleBody, false
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "a1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "a2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	h := NewHandler(Config{Pool: p, Upstream: up, MaxRotate: 3}) // 无 ErrorRules
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 503 {
+		t.Fatalf("code=%d body=%s want 503", rec.Code, rec.Body)
+	}
+	// 空表：无 stop 规则拦截 → 两个账号各尝试一次（既有轮转语义）。
+	if calls["Bearer at1"] != 1 || calls["Bearer at2"] != 1 {
+		t.Errorf("calls=%v want a1=1 a2=1 (empty table = 既有行为)", calls)
+	}
+}
+
+// TestErrorRuleInvalidRegexSkipped 无效正则规则被跳过：非法正则(stop) + 合法子串
+// (continue) 两条；若非法正则未被跳过会 stop 在 400，实际应 continue 到 a2 成功。
+func TestErrorRuleInvalidRegexSkipped(t *testing.T) {
+	calls := map[string]int{}
+	up := newFakeUpstream(t, func(authz string) (int, string, bool) {
+		calls[authz]++
+		if authz == "Bearer at1" {
+			return 400, errorRuleBody, false
+		}
+		return 200, sseOK, true
+	})
+	p := testPoolWith(
+		&auth.Auth{UID: "a1", AccessToken: "at1", ExpiresAt: 9999999999},
+		&auth.Auth{UID: "a2", AccessToken: "at2", ExpiresAt: 9999999999},
+	)
+	p.SetCredits("a1", 2000, 0)
+	p.SetCredits("a2", 1000, 0)
+	h := NewHandler(Config{
+		Pool: p, Upstream: up, MaxRotate: 3,
+		ErrorRules: []ErrorRule{
+			{Status: 400, MatchRegex: "(", Action: "stop"}, // 非法正则 → 跳过
+			{Status: 400, Match: "maximum_context_length", Action: "continue"},
+		},
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(`{"model":"glm-5.2","messages":[]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s want 200 (invalid-regex 规则应被跳过，合法规则 continue 生效)", rec.Code, rec.Body)
+	}
+	if calls["Bearer at1"] != 1 || calls["Bearer at2"] != 1 {
+		t.Errorf("calls=%v want a1=1 a2=1", calls)
+	}
+}

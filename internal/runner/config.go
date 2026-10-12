@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
@@ -166,6 +167,8 @@ type Config struct {
 		// Accounts 账号级静态调度覆盖：key=uid。priority 大者优先（默认 0）。
 		// weight 语义见 pool.SetAccountOverrides 注释（nil=1，0=恒不抽中，负钳 0）。
 		Accounts map[string]AccountOverride `json:"accounts,omitempty"`
+		// ErrorRules 可编程错误策略（默认空 = 行为不变）。重启生效。
+		ErrorRules []ErrorRule `json:"error_rules,omitempty"`
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -196,6 +199,29 @@ type Config struct {
 type AccountOverride struct {
 	Priority int      `json:"priority,omitempty"`
 	Weight   *float64 `json:"weight,omitempty"`
+}
+
+// ErrorRule 请求级错误策略规则（config pool.error_rules 的元素）。
+// 按切片顺序先命中先生效：status 精确匹配；match 子串大小写不敏感；
+// match_regex 正则（编译失败 = 该条无效跳过）。action 四值：
+// stop / stop-and-cooldown / continue / continue-and-cooldown。
+// 校验在 normalize()：action 非四值之一、或 match 与 match_regex 皆空 → 该条视为
+// 无效（跳过并告警），不报错拒启。默认空表 = 行为完全不变。
+type ErrorRule struct {
+	Status     int    `json:"status"`
+	Match      string `json:"match,omitempty"`
+	MatchRegex string `json:"match_regex,omitempty"`
+	Action     string `json:"action"`
+}
+
+// validErrorAction 报告 action 是否为四种合法值之一（stop/stop-and-cooldown/
+// continue/continue-and-cooldown）。
+func validErrorAction(a string) bool {
+	switch a {
+	case "stop", "stop-and-cooldown", "continue", "continue-and-cooldown":
+		return true
+	}
+	return false
 }
 
 // Default 默认配置。
@@ -502,6 +528,24 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.IdleWeightMax <= 0 {
 		c.Pool.IdleWeightMax = 5.0
+	}
+	// pool.error_rules 校验：action 非四值之一、或 match 与 match_regex 皆空 →
+	// 该条视为无效（跳过并告警），**不报错拒启**（坏规则只应自身失效，不应阻断启动）。
+	// 正则可编译性由 handler 编译期再验（编译失败同样跳过），此处只做 action/匹配项校验。
+	if n := len(c.Pool.ErrorRules); n > 0 {
+		valid := c.Pool.ErrorRules[:0]
+		for _, r := range c.Pool.ErrorRules {
+			if !validErrorAction(r.Action) {
+				log.Printf("config: pool.error_rules 跳过无效规则（未知 action=%q, status=%d）", r.Action, r.Status)
+				continue
+			}
+			if strings.TrimSpace(r.Match) == "" && strings.TrimSpace(r.MatchRegex) == "" {
+				log.Printf("config: pool.error_rules 跳过无效规则（match 与 match_regex 皆空, status=%d, action=%q）", r.Status, r.Action)
+				continue
+			}
+			valid = append(valid, r)
+		}
+		c.Pool.ErrorRules = valid
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
