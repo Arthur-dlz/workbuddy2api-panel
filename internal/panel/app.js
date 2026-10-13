@@ -87,6 +87,15 @@ function dur(sec) {
   const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60), s = sec % 60;
   return h ? h + '时' + String(m).padStart(2, '0') + '分' : m ? m + '分' + String(s).padStart(2, '0') + '秒' : s + '秒';
 }
+// RFC3339 → "HH:MM"；跨天时前缀 "M-d "（如 10-13 04:00）；无效日期返回 '?'。
+function fmtHM(iso) {
+  const d = new Date(iso);
+  if (!(d instanceof Date) || isNaN(d)) return '?';
+  const hm = d.toLocaleTimeString('zh-CN', { hour12: false, hour: '2-digit', minute: '2-digit' });
+  const now = new Date();
+  const sameDay = d.getFullYear() === now.getFullYear() && d.getMonth() === now.getMonth() && d.getDate() === now.getDate();
+  return sameDay ? hm : (d.getMonth() + 1) + '-' + d.getDate() + ' ' + hm;
+}
 
 function formatTokenCount(tokens) {
   if (tokens == null || tokens === '') return '—';
@@ -205,10 +214,31 @@ function renderAccounts(list) {
     const latency = formatLatency(tu.last_latency_ms);
     const rate = formatRate(tu.last_tokens_per_second);
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
+    // 429 悬停画像：限流中明细（rate_limited_models，仍在生效的 6004 模型级限流）
+    // + 近 24h 台账（model_rate_stats，账号×模型×时间，7 天惰性保留）。
+    // 数据缺省 → 无 title（零噪音）。悬停「可用」也能看到近 24h 画像——
+    // 化石标签虽消，画像仍可查，这正是「429 了哪些模型」的入口。
+    let rateTip = '';
+    const rl = (s.rate_limited_models || []).filter(m => m.model);
+    if (rl.length) {
+      // 按 until 升序；每行：模型：限流至 HH:MM（剩 X）
+      rateTip += '429 限流中（按恢复时间排序）：\n' + rl
+        .slice().sort((a, b) => new Date(a.until) - new Date(b.until))
+        .map(m => '  ' + m.model + '：限流至 ' + fmtHM(m.until) + '（剩 ' + dur(Math.max(0, (new Date(m.until) - Date.now()) / 1000 | 0)) + '）')
+        .join('\n');
+    }
+    const st = (s.model_rate_stats || []).filter(m => m.model && m.count_24h > 0);
+    if (st.length) {
+      // 按 count_24h 降序；每行：模型：24h×N / 累计M / 最近 HH:MM
+      rateTip += (rateTip ? '\n' : '') + '近 24h 429 画像：\n' + st
+        .slice().sort((a, b) => b.count_24h - a.count_24h)
+        .map(m => '  ' + m.model + '：24h×' + m.count_24h + ' / 累计 ' + m.total + ' / 最近 ' + fmtHM(m.last_at))
+        .join('\n');
+    }
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm"><span class="nm-text">' + (s.nickname ? esc(maskPhone(s.nickname)) : '<span style="color:var(--ink-3)">未命名</span>') + '</span>' + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '<button type="button" class="nick-edit-btn" data-a="edit-nick" data-u="' + esc(s.uid) + '" data-nick="' + esc(s.nickname || '') + '" title="修改名称/备注">✎</button></div><div class="id">' + esc(short) + '</div></td>' +
-      '<td>' + tag + note + '</td>' +
+      '<td' + (rateTip ? ' title="' + esc(rateTip) + '"' : '') + '>' + tag + note + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
       '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
