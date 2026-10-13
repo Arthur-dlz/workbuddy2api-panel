@@ -179,7 +179,11 @@ function renderAccounts(list) {
         : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
-    const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
+    // 化石标签修复：reason 在冷却结束后仍残留（后端 CoolSoft 到期无清 reason 路径），
+    // 加 cool > 0 门——冷却中照旧显示原因（含 "429 rate limit"/"waf 403 block"），
+    // 冷却一结束标签即消失。disabled 账号的 disabled_reason 是另一个字段，不受影响；
+    // 「余额不足」属 CoolHard，cooling 期间仍显示，正确。
+    const note = (cool > 0 && s.reason) ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
     const pct = s.credits_total > 0
